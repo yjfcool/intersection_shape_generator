@@ -1,0 +1,20 @@
+#pragma once
+
+#include "domain/generation_types.h"
+#include "generation/connectivity_generation_context.h"
+
+namespace isg {
+
+/// 检查普通直行/转向曲线的端点、控制轴、单段和单拱形态。
+ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
+                                       const CurveGenerationContext& context);
+
+/// 检查几何 U 型调头的三段式、平齐和首尾直行段。
+ConstraintResult evaluateUTurnShape(const BezierCurve& curve,
+                                    const CurveGenerationContext& context);
+
+/// 检查 U 型首尾跨越相关 Crosswalk 且中弧不侵入。
+ConstraintResult evaluateUTurnCrosswalk(const BezierCurve& curve,
+                                        const CurveGenerationContext& context);
+
+}  // 命名空间 isg
