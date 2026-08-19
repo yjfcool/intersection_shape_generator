@@ -5,6 +5,7 @@
 #include "initialization/uturn_curve_initializer.h"
 
 #include "curve/bezier.h"
+#include "curve/curve_utils.h"
 #include "preprocessing/uturn_family_builder.h"
 #include "utils.h"
 
@@ -37,6 +38,73 @@ BezierCurve FixedShapeInitializer::build(
 }
 
 // 普通曲线初始化：严格沿端点切向构造单段三次 Bezier 候选。
+BezierCurve OrdinaryCurveInitializer::buildPreferredSingleCubic(
+    const Vec2d& entry_point, const Vec2d& entry_tangent,
+    const Vec2d& exit_point, const Vec2d& exit_tangent) const {
+    BezierCurve curve;
+    const Vec2d chord = exit_point - entry_point;
+    const double chord_len = chord.norm();
+    if (chord_len < 1e-8)
+        return curve;
+
+    const OrdinarySingleCubicHandleBounds bounds =
+        ordinarySingleCubicHandleBounds(
+            entry_point, entry_tangent, exit_point, exit_tangent, true);
+    const Vec2d chord_dir = chord / chord_len;
+    const bool straight_like =
+        bounds.start_dir.dot(bounds.end_dir) > 0.90 &&
+        std::abs(cross2d(bounds.start_dir, bounds.end_dir)) < 0.25 &&
+        std::abs(cross2d(bounds.start_dir, chord_dir)) < 0.25;
+
+    // 直行把手采用等弦中点对应的统一长度；控制点仍分别落在
+    // 首、尾切线轴上，因此切线不一致时不强制 C1=C2。
+    double start_handle = chord_len / 2.0;
+    double end_handle = chord_len / 2.0;
+    const bool stable_turn_intersection =
+        !straight_like && bounds.has_direction_intersection &&
+        bounds.direction_intersection_start <= 1.5 * chord_len &&
+        bounds.direction_intersection_end <= 1.5 * chord_len;
+    if (stable_turn_intersection) {
+        start_handle = (2.0 / 3.0) *
+            bounds.direction_intersection_start;
+        end_handle = (2.0 / 3.0) *
+            bounds.direction_intersection_end;
+    } else if (!straight_like) {
+        // 平行、反向或过远交点不适合作为形态基准，回退到有界自然弧。
+        start_handle = 0.4 * chord_len;
+        end_handle = 0.4 * chord_len;
+    }
+
+    BezierSegment segment;
+    segment.ctrl[0] = entry_point;
+    segment.ctrl[1] = entry_point + bounds.start_dir * start_handle;
+    segment.ctrl[2] = exit_point - bounds.end_dir * end_handle;
+    segment.ctrl[3] = exit_point;
+    curve.segs.push_back(segment);
+    constrainOrdinarySingleCubicControls(
+        curve, entry_point, bounds.start_dir,
+        exit_point, bounds.end_dir, true);
+
+    // 2/3 交点升阶是首选形态而不是无条件硬编码。短急弯若直接采用
+    // 该比例可能产生过高曲率，回退到有界自然弧，后续仍可由候选搜索
+    // 在不破坏同簇和物理约束的前提下微调。
+    if (!straight_like) {
+        const double arc_chord = curve.arcLength() / chord_len;
+        const double max_curvature = curve.maxCurvature(40);
+        const double max_allowed_curvature = chord_len <= 10.0 ? 6.0 : 2.5;
+        if (arc_chord < 1.005 || arc_chord > 1.35 ||
+            max_curvature > max_allowed_curvature) {
+            curve.segs.front() = makeCubicG1(
+                entry_point, bounds.start_dir,
+                exit_point, bounds.end_dir, 0.4);
+            constrainOrdinarySingleCubicControls(
+                curve, entry_point, bounds.start_dir,
+                exit_point, bounds.end_dir, true);
+        }
+    }
+    return curve;
+}
+
 BezierCurve OrdinaryCurveInitializer::buildSingleCubic(
     const Vec2d& entry_point, const Vec2d& entry_tangent,
     const Vec2d& exit_point, const Vec2d& exit_tangent, double alpha) const {
@@ -265,9 +333,14 @@ std::vector<CurveCandidate> CurveInitializerRegistry::build(
         return candidates;
     }
 
-    const std::vector<BezierCurve> ordinary =
-        OrdinaryCurveInitializer().buildAlphaCandidates(
+    const OrdinaryCurveInitializer ordinary_initializer;
+    std::vector<BezierCurve> ordinary;
+    ordinary.push_back(ordinary_initializer.buildPreferredSingleCubic(
+        p0, t0, p1, t1));
+    const std::vector<BezierCurve> alpha_candidates =
+        ordinary_initializer.buildAlphaCandidates(
             p0, t0, p1, t1, options.ordinary_alphas);
+    ordinary.insert(ordinary.end(), alpha_candidates.begin(), alpha_candidates.end());
     candidates.reserve(ordinary.size());
     for (std::size_t i = 0; i < ordinary.size(); ++i) {
         CurveCandidate candidate;

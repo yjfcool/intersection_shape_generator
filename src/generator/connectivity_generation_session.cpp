@@ -54,21 +54,29 @@ static constexpr double kUTurnSharedLeadFanMinSeparation = 0.10;
 ////////////////////////////////////////////////////////////
 // 调试辅助函数: 当环境变量ISG_DEBUG_UTURN设置时返回true。
 ////////////////////////////////////////////////////////////
+// 返回是否启用 U-turn 初始生成和修复阶段的诊断输出。
+// 结果在进程生命周期内缓存；仅检查环境变量是否存在，不解析其内容。
 static bool isgDebugUTurn() {
     static bool v = (std::getenv("ISG_DEBUG_UTURN") != nullptr);
     return v;
 }
 
+// 返回是否启用 Boundary 候选搜索的详细诊断输出。
+// 该开关只影响 stderr 日志，不改变候选生成、约束判定或最终曲线。
 static bool isgDebugBoundaryRepair() {
     static bool v = (std::getenv("ISG_DEBUG_BOUNDARY_REPAIR") != nullptr);
     return v;
 }
 
+// 返回是否启用同簇成对修复的诊断输出。
+// 环境变量存在即开启，并通过静态缓存避免重复访问进程环境。
 static bool isgDebugPairRepair() {
     static bool v = (std::getenv("ISG_DEBUG_PAIR_REPAIR") != nullptr);
     return v;
 }
 
+// 返回是否启用阶段和单连接生成耗时统计。
+// 开启后仅增加 profile 日志，不改变算法选择和结果。
 static bool isgProfile() {
     static bool v = (std::getenv("ISG_PROFILE") != nullptr);
     return v;
@@ -78,7 +86,8 @@ static bool isgProfile() {
 ////////////////////////////////////////////////////////////
 // 编译辅助函数
 ////////////////////////////////////////////////////////////
-// 判别是否纯几何数据，不包含障碍物、人行横道等数据
+// 判别输入是否只包含连接、车道等几何数据，而不包含会触发物理约束的
+// 障碍物、边界、人行横道或停车线。纯几何输入使用更轻量的拓扑收口路径。
 static bool isPureGeometricInput(const IntersectionInput& input) {
     return input.obstacles.empty() && input.boundaries.empty() &&
            input.crosswalks.empty() && input.stop_lines.empty();
@@ -98,6 +107,8 @@ static bool isPureGeometricInput(const IntersectionInput& input) {
 // 端点/方向的分侧匹配（p0↔T0, p1↔T1）避免了将从退出点 p1 出发但沿进入方向
 // T0 延伸的 RoadEdge 误过滤（这类 boundary 可能是退出口横向 RoadEdge 的端点
 // 恰好与 p1 重合，方向却不沿 T1）。
+// 返回过滤后的边界副本；输入边界顺序和对象内容保持不变，仅移除满足上述
+// 端点粘连条件的边界。
 static std::vector<Boundary> filterEndpointAdherentBoundaries(
     const std::vector<Boundary>& boundaries, const Vec2d& p0, const Vec2d& t0,
     const Vec2d& p1, const Vec2d& t1, double pos_tol = 0.6, double dir_min_dot = 0.70) {
@@ -138,6 +149,8 @@ static std::vector<Boundary> filterEndpointAdherentBoundaries(
     return filtered;
 }
 
+// 使用 BoundarySafety 的道路中心和采样规则检查曲线是否穿越边界或越出道路边缘。
+// 空边界集合直接视为安全；返回值只表示物理边界风险，不包含障碍物或同簇风险。
 static bool curveIntersectsBoundaries(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries, const Vec2d& center) {
     if (boundaries.empty())
@@ -146,6 +159,9 @@ static bool curveIntersectsBoundaries(
     return safety.intersects || safety.outside_road_edge;
 }
 
+// 对曲线进行采样后的线段级边界相交检查。
+// 可选地只检查 RoadEdge，并忽略曲线端点和边界端点容差内的合法连接；
+// 返回 true 表示存在一个非端点真实穿越。
 static bool curveRawIntersectsBoundariesImpl(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
         bool road_edges_only, double curve_endpoint_tol, double boundary_endpoint_tol) {
@@ -185,6 +201,8 @@ static bool curveRawIntersectsBoundariesImpl(
     return false;
 }
 
+// 检查曲线是否与任意类型的边界发生非端点真实相交。
+// 这是通用包装器，保留端点容差语义并委托给线段级实现。
 static bool curveRawIntersectsAnyBoundary(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
         double curve_endpoint_tol, double boundary_endpoint_tol) {
@@ -195,6 +213,8 @@ static bool curveRawIntersectsAnyBoundary(
 // 三段式 U-turn 的首尾直行段可能位于短 RoadEdge 的中心反侧，但仍在
 // 合法进入/退出车道内。这里仅判真实非端点相交；RoadEdge 的 1m 净距
 // 由 roadEdgeClearanceViolation 独立检查，不能用短边延长线的 outside 判定替代真实穿越。
+// 对三段式 U-turn 使用真实线段穿越判定，对其它曲线复用常规 BoundarySafety
+// 规则；这样既允许合法首尾直行段，也不会放宽中间掉头弧的边界约束。
 static bool curveIntersectsBoundariesUTurn(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries, const Vec2d& center) {
     if (curve.numSegments() != 3)
@@ -205,6 +225,8 @@ static bool curveIntersectsBoundariesUTurn(
 ////////////////////////////////////////////////////////////
 // ConnectivityGenerationSession 成员函数
 ////////////////////////////////////////////////////////////
+// 初始化单路口生成会话，保存 LBFGS 求解器配置和方向归一化配置，供后续
+// 单曲线生成、物理修复、拓扑修复及最终审计共享。
 ConnectivityGenerationSession::ConnectivityGenerationSession(
     const LBFGSConfig& config, const ConnectivityDirectionConfig& direction_config)
     : solver_(config), direction_cfg_(direction_config) {}
@@ -271,6 +293,9 @@ std::vector<SiblingCurve> ConnectivityGenerationSession::buildSiblings(
 }
 
 /// 沿曲线自适应采样查询最小SDF值, 性能优化: 上限从320降至100, 不调用queryWithGrad(仅用query)
+// 沿曲线按弧长自适应采样并返回最小 signed distance field 值。
+// 采样数量限制在固定范围内，以在障碍物安全性和单连接生成耗时之间取得平衡；
+// 无效 SDF 返回正的大值，表示该检查无法发现障碍物穿透。
 static double minSDFAlongCurveAdaptive(const BezierCurve& curve, const SDFField& sdf) {
     if (!sdf.valid())
         return 1e18;
@@ -281,11 +306,15 @@ static double minSDFAlongCurveAdaptive(const BezierCurve& curve, const SDFField&
         m = std::min(m, sdf.queryWithGrad(pt).first);
     return m;
 }
+// 前置声明：使用障碍物硬几何检查曲线是否命中障碍物，并可返回命中点。
 static bool curveIntersectsObstacles(
     const BezierCurve& curve, const std::vector<Obstacle>& obstacles, Vec2d* out);
+// 前置声明：计算曲线相对当前 mode 的 RoadEdge 净距违规量。
 static double roadEdgeClearanceViolation(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries, int mode);
 
+// 汇总单条输出曲线的障碍物、围栏、边界、道路边缘、形态和自交状态，
+// 并通过 FinalCurveAuditor 写回统一的状态与违规原因。该函数只更新 cc 审计字段。
 void ConnectivityGenerationSession::validate(
     ConnectivityCurve& cc, const IntersectionInput& input, const SDFField& sdf) const {
     if (!cc.curve) return;
@@ -354,6 +383,8 @@ void ConnectivityGenerationSession::validate(
     FinalCurveAuditor().apply(audit, cc);
 }
 
+// 建立连接 ID 到结果数组下标的索引，供批量修复阶段稳定定位曲线。
+// 重复 ID 时后出现的结果覆盖先出现的结果。
 static std::unordered_map<ConnId, size_t> resultIndexById(
     const std::vector<ConnectivityCurve>& results) {
     std::unordered_map<ConnId, size_t> idx;
@@ -362,6 +393,8 @@ static std::unordered_map<ConnId, size_t> resultIndexById(
     return idx;
 }
 
+// 从已有结果提取非空曲线快照，形成连接 ID 到 Bezier 曲线的快速查询表。
+// 快照按值复制，后续候选替换不会反向修改 results。
 static std::unordered_map<ConnId, BezierCurve> curveMapFromResults(
     const std::vector<ConnectivityCurve>& results) {
     std::unordered_map<ConnId, BezierCurve> curves;
@@ -371,10 +404,14 @@ static std::unordered_map<ConnId, BezierCurve> curveMapFromResults(
     return curves;
 }
 
+// 判断连接是否携带至少两个点的固有几何形态，可用于构造固定形态曲线。
 static bool hasFixedGeometry(const Connectivity& conn) {
     return conn.geometry.points.size() >= 2;
 }
 
+/// 将固有形态转为BezierCurve
+// 将连接输入中的固有几何转换为输出曲线，并预先记录固定曲线的障碍物风险。
+// 固有几何本身保留在 geometry 字段；若转换失败则返回无曲线结果。
 static ConnectivityCurve makeFixedGeometryCurve(
     const Connectivity& conn, const IntersectionInput& input, const SDFField& sdf) {
     ConnectivityCurve cc;
@@ -402,6 +439,8 @@ static ConnectivityCurve makeFixedGeometryCurve(
     return cc;
 }
 
+// 构造固定几何的临时曲线并检查其是否穿越任一障碍物。
+// 用于决定该 fixed shape 是否必须降级为可重新生成的普通连接。
 static bool fixedGeometryHitsObstacle(
     const Connectivity& conn, const IntersectionInput& input) {
     if (!hasFixedGeometry(conn))
@@ -412,11 +451,15 @@ static bool fixedGeometryHitsObstacle(
     return curveIntersectsObstacles(curve, input.obstacles, nullptr);
 }
 
+// 前置声明：判断同簇交叉是否属于允许的 U-turn/左右转结构性交叉。
 static bool isAllowedSameClusterCrossing(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol);
+// 前置声明：判断两条曲线是否存在必须修复的同簇相交或贴合。
 static bool curvesHaveForbiddenSameClusterIntersection(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol);
 
+// 查找距离给定点最近的 RoadEdge 线段，并返回距离及该线段的单位方向。
+// 找不到有效 RoadEdge 时返回 false，并保留可用的默认方向。
 static bool nearestRoadEdgeDirectionLocal(
         const std::vector<Boundary>& boundaries, const Vec2d& pt,
         double& out_dist, Vec2d& out_dir) {
@@ -446,6 +489,8 @@ static bool nearestRoadEdgeDirectionLocal(
     return found;
 }
 
+// 以少量参数点检查 Bezier 段是否始终贴近某条 RoadEdge。
+// 该局部判定用于识别合法的端点贴行段，不替代完整边界相交检查。
 static bool segmentStaysNearRoadEdgeLocal(
         const BezierSegment& seg, const std::vector<Boundary>& boundaries,
         double tol = 0.14) {
@@ -460,6 +505,8 @@ static bool segmentStaysNearRoadEdgeLocal(
     return true;
 }
 
+// 判断曲线首段或尾段是否形成贴近 RoadEdge 的端点段。
+// 返回 true 表示曲线可能属于道路端点拟合场景，可采用专门的形态豁免。
 static bool curveHasRoadEdgeAdherentEndpointSectionLocal(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries) {
     if (curve.segs.empty())
@@ -471,6 +518,8 @@ static bool curveHasRoadEdgeAdherentEndpointSectionLocal(
     return false;
 }
 
+// 去除曲线首尾连续贴近 RoadEdge 的段，保留中间曲线副本用于交叉和形态审计。
+// 若没有可安全去除的段，则返回原曲线；若全曲线均贴边，则保留原曲线避免空结果。
 static BezierCurve curveWithoutRoadEdgeEndpointSectionsLocal(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries) {
     if (curve.segs.empty())
@@ -496,6 +545,8 @@ static BezierCurve curveWithoutRoadEdgeEndpointSectionsLocal(
 }
 
 
+// 判断点是否落在多边形外环任一线段的容差范围内。
+// 该结果与 polygonContains 组合使用，用于把障碍物边界视为硬几何区域。
 static bool pointOnPolygonBoundary(const Vec2d& pt, const Polygon2d& poly, double tol = 1e-6) {
     const auto& ring = poly.outer;
     if (ring.size() < 2)
@@ -509,10 +560,13 @@ static bool pointOnPolygonBoundary(const Vec2d& pt, const Polygon2d& poly, doubl
     return false;
 }
 
+// 判断点位于多边形内部或其边界上，统一处理内部点和边界点两种障碍物命中。
 static bool pointInsideOrOnPolygon(const Vec2d& pt, const Polygon2d& poly, double tol = 1e-6) {
     return polygonContains(poly, pt) || pointOnPolygonBoundary(pt, poly, tol);
 }
 
+// 检查线段是否与多边形外环相交，并可返回第一处相交点。
+// 只检查外环边，不负责判断线段完全位于多边形内部的情形。
 static bool polygonSegmentIntersects(
     const Vec2d& a, const Vec2d& b, const Polygon2d& poly, Vec2d* out = nullptr) {
     const auto& ring = poly.outer;
@@ -529,10 +583,14 @@ static bool polygonSegmentIntersects(
     return false;
 }
 
+// 返回障碍物的硬判定几何：优先使用原始 geometry，缺失时回退到 buffered_geometry。
+// 返回引用的生命周期由输入障碍物保证。
 static const Polygon2d& obstacleHardGeometry(const Obstacle& obs) {
     return obs.geometry.outer.empty() ? obs.buffered_geometry : obs.geometry;
 }
 
+// 通过曲线采样点和采样线段与障碍物硬多边形的相交，判断曲线是否进入障碍物。
+// 可选输出命中位置；端点不做特殊豁免，因为障碍物命中本身属于物理风险。
 static bool curveIntersectsObstacles(
     const BezierCurve& curve, const std::vector<Obstacle>& obstacles, Vec2d* out = nullptr) {
     if (obstacles.empty())
@@ -571,6 +629,7 @@ static bool curveIntersectsObstacles(
     return false;
 }
 
+// 返回点到两条采样曲线四个端点的最小距离，用于过滤共享连接点附近的合法相遇。
 static double distToSampledEndpoints(const Vec2d& pt, const SampledCurve& a, const SampledCurve& b) {
     double d = (pt - a.start).norm();
     d = std::min(d, (pt - a.end).norm());
@@ -579,6 +638,8 @@ static double distToSampledEndpoints(const Vec2d& pt, const SampledCurve& a, con
     return d;
 }
 
+// 对两条采样曲线执行带业务端点豁免的线段相交检查，并可选检测近距离平行贴合。
+// 返回 true 表示存在端点容差之外的交叉或重叠，并可写出冲突位置。
 static bool sampledCurvesIntersectBusiness(
     const SampledCurve& a, const SampledCurve& b, double endpoint_tol,
     Vec2d* out = nullptr, bool detect_near_overlap = false) {
@@ -620,6 +681,8 @@ static bool sampledCurvesIntersectBusiness(
     return false;
 }
 
+// 统计一条采样曲线与兄弟采样曲线的约束交叉数，可跳过结构性交叉豁免项。
+// detect_near_overlap 开启时把近距离同向贴合也计为冲突。
 static int sampledSiblingCrossCount(
     const SampledCurve& curve, const std::vector<SampledSiblingCurve>& siblings,
     bool constrained_only, double endpoint_tol = kClusterEndpointTol,
@@ -656,6 +719,8 @@ static int sampledSiblingCrossCount(
     return count;
 }
 
+// 统计候选曲线与固定形态兄弟之间的真实同簇冲突数。
+// 只计入非结构性交叉且 fixed_shape 为真的兄弟，用于保护固定几何优先级。
 static int rawFixedSiblingCrossCount(
     const BezierCurve& curve, const std::vector<SiblingCurve>& siblings,
         double endpoint_tol = kClusterEndpointTol) {
@@ -670,6 +735,8 @@ static int rawFixedSiblingCrossCount(
     return count;
 }
 
+// 量化共享端点曲线相对参考法线的侧向排序违反程度。
+// 只检查共享端点后有限距离内的采样点，返回值越大表示扇出顺序越不符合预期。
 static double sharedEndpointSideViolation(
     const SampledCurve& curve, const std::vector<SampledSiblingCurve>& siblings,
     double endpoint_tol = kClusterEndpointTol) {
@@ -723,9 +790,12 @@ static double sharedEndpointSideViolation(
     return violation;
 }
 
+// 前置声明：供种子影响闭包使用的同簇交叉豁免判定。
 static bool isAllowedSameClusterCrossing(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol);
 
+// 从 RepairImpactClosure 关联对中找出与指定种子相连且实际发生禁止交叉的连接。
+// 结果用于非纯几何场景的定向重生成，避免无关连接被纳入修复预算。
 static std::unordered_set<ConnId> crossingIdsTouchingSeeds(
     const std::vector<ConnectivityCurve>& results,
     const ClusterOrderSolver& cs, const std::unordered_set<ConnId>& seeds,
@@ -762,11 +832,15 @@ static std::unordered_set<ConnId> crossingIdsTouchingSeeds(
     return bad;
 }
 
+// 检查两条曲线是否在共享端点之外发生业务相交或重叠。
+// 与普通业务判定相比，该包装器明确表达“连接点外不得相遇”的调用意图。
 static bool curvesIntersectBeyondSharedEndpointOverlap(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol = 0.15) {
     return curvesIntersectBusiness(a, b, endpoint_tol);
 }
 
+// 根据弦线与入口切向的偏转判断曲线是否具有明显左右转形态。
+// U-turn 和近直线曲线返回 false，供结构性交叉豁免规则区分转向类型。
 static bool curveLooksLeftRightTurnForClusterExemption(const BezierCurve& curve) {
     if (curve.empty() || curveLooksUTurnForClusterExemption(curve))
         return false;
@@ -777,6 +851,8 @@ static bool curveLooksLeftRightTurnForClusterExemption(const BezierCurve& curve)
     return std::abs(cross2d(st.normalized(), chord.normalized())) > 0.35;
 }
 
+// 在采样线段层面检测两条曲线是否存在非端点的同向近距离贴合。
+// 该检查独立于真正的线段相交，用来禁止重叠、贴行和共享中段。
 static bool sampledCurvesHaveForbiddenAdherence(
         const SampledCurve& a, const SampledCurve& b,
         double endpoint_tol = 0.15, double adherent_tol = 0.18) {
@@ -824,6 +900,7 @@ static bool sampledCurvesHaveForbiddenAdherence(
     return false;
 }
 
+// 对 Bezier 曲线进行统一采样后检查非端点贴合，隐藏采样参数并复用采样实现。
 static bool curvesHaveForbiddenAdherence(
         const BezierCurve& a, const BezierCurve& b,
         double endpoint_tol = 0.15) {
@@ -834,6 +911,8 @@ static bool curvesHaveForbiddenAdherence(
 }
 
 // 左/右转和掉头的几何穿越可豁免；贴合/重叠仍禁止。
+// 判断同簇曲线之间的几何交叉是否属于允许的 U-turn 与左右转结构性交叉。
+// 任何非端点贴合优先判为禁止；两条曲线形态不满足豁免组合时也返回 false。
 static bool isAllowedSameClusterCrossing(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol = 0.15) {
     if (curvesHaveForbiddenAdherence(a, b, endpoint_tol))
@@ -847,6 +926,8 @@ static bool isAllowedSameClusterCrossing(
         : curveLooksLeftRightTurnForClusterExemption(a);
 }
 
+// 汇总同簇相交和贴合规则，返回是否存在必须修复的非豁免冲突。
+// 先排除允许的结构性交叉，再检查业务相交，因此是同簇约束的统一入口。
 static bool curvesHaveForbiddenSameClusterIntersection(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol = 0.15) {
     if (curvesHaveForbiddenAdherence(a, b, endpoint_tol))
@@ -856,6 +937,8 @@ static bool curvesHaveForbiddenSameClusterIntersection(
     return curvesIntersectBusiness(a, b, endpoint_tol);
 }
 
+// 扫描全部非结构性交叉约束，收集当前结果中发生禁止相交且未受固定形态保护的
+// 连接 ID。该集合是批量重生成阶段的冲突入口。
 static std::unordered_set<ConnId> allConstrainedCrossingIds(
     const std::vector<ConnectivityCurve>& results,
     const ClusterOrderSolver& cs,
@@ -892,6 +975,8 @@ static std::unordered_set<ConnId> allConstrainedCrossingIds(
     return bad;
 }
 
+// 对最终结果执行一次完整同簇审计，并把冲突位置、状态和原因写回输出结果。
+// 此函数用于最终标注，不负责重新生成曲线。
 static void annotateClusterCrossings(
     std::vector<ConnectivityCurve>& results,
     const ClusterOrderSolver& cs,
@@ -968,6 +1053,7 @@ static void annotateClusterCrossings(
     auditor.apply(auditor.audit(cs.pairs(), results, detector), results);
 }
 
+// 构造自然单段 G1 三次曲线，快速预判其是否会进入障碍物或 SDF 禁区。
 static bool naturalCubicHitsObstacle(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const SDFField& sdf, const std::vector<Obstacle>& obstacles) {
@@ -980,6 +1066,8 @@ static bool naturalCubicHitsObstacle(
     return sdf.valid() && minSDFAlongCurveAdaptive(trial, sdf) < 0.0;
 }
 
+// 采样曲线内部点并计算其到所有 RoadEdge 的最小距离。
+// 两端指定距离内的点被跳过，以避免合法连接端点影响道路边缘净距评估。
 static double minRoadEdgeDistanceAlongCurve(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries, double endpoint_skip = 0.75) {
     if (curve.empty() || boundaries.empty())
@@ -1002,6 +1090,8 @@ static double minRoadEdgeDistanceAlongCurve(
     return min_edge_dist;
 }
 
+// 将曲线到 RoadEdge 的最小距离转换为当前 mode 下的净距违规量。
+// 无需净距约束或没有有效边界时返回零。
 static double roadEdgeClearanceViolation(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries, int mode) {
     double clearance = roadEdgeAvoidanceClearanceForMode(mode);
@@ -1013,6 +1103,8 @@ static double roadEdgeClearanceViolation(
     return std::max(0.0, clearance - min_edge_dist);
 }
 
+// 计算候选曲线的边界避让代价，合并道路边缘净距和真实边界穿越惩罚。
+// 该值供 U-turn 搜索器排序使用，不直接修改曲线。
 static double boundaryAvoidancePenalty(
     const BezierCurve& curve, const IntersectionInput& input) {
     double penalty = roadEdgeClearanceViolation(curve, input.boundaries, input.mode);
@@ -1024,6 +1116,7 @@ static double boundaryAvoidancePenalty(
     return penalty;
 }
 
+// 仅检查曲线与 RoadEdge 的非端点真实相交，忽略其它 Boundary 类型。
 static bool curveRawIntersectsRoadEdge(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries,
     double curve_endpoint_tol = 0.15, double boundary_endpoint_tol = 0.10) {
@@ -1031,6 +1124,7 @@ static bool curveRawIntersectsRoadEdge(
         curve, boundaries, true, curve_endpoint_tol, boundary_endpoint_tol);
 }
 
+// 检查一条直线段是否真实穿越 RoadEdge，并忽略两端合法端点相交。
 static bool segmentRawIntersectsRoadEdge(
     const Vec2d& a, const Vec2d& b, const std::vector<Boundary>& boundaries,
     double endpoint_tol = 0.15, double boundary_endpoint_tol = 0.10) {
@@ -1056,6 +1150,8 @@ static bool segmentRawIntersectsRoadEdge(
     return false;
 }
 
+// 判断线段及其指定宽度走廊是否触碰 RoadEdge。
+// 用于在自然弦线本身未相交但候选搜索可能撞边时提前识别修复需求。
 static bool segmentCorridorTouchesRoadEdge(
     const Vec2d& a, const Vec2d& b, const std::vector<Boundary>& boundaries,
     double corridor_tol = 1.20) {
@@ -1086,6 +1182,8 @@ static bool segmentCorridorTouchesRoadEdge(
     return false;
 }
 
+// 采样检查曲线内部点是否离开围栏多边形，并允许小的数值边界误差。
+// 空围栏不产生风险。
 static bool curveLeavesFence(const BezierCurve& curve, const Polygon2d& fence) {
     if (fence.outer.empty())
         return false;
@@ -1098,6 +1196,8 @@ static bool curveLeavesFence(const BezierCurve& curve, const Polygon2d& fence) {
     return false;
 }
 
+// 检测曲线离散曲率符号是否发生有效翻转，以识别不期望的 S 形路径。
+// 小于 eps 的曲率视为数值噪声，不参与符号判断。
 static bool curveHasCurvatureSignFlip(const BezierCurve& curve, double eps = 0.10) {
     int sign = 0;
     for (const auto& seg : curve.segs) {
@@ -1120,6 +1220,8 @@ static bool curveHasCurvatureSignFlip(const BezierCurve& curve, double eps = 0.1
     return false;
 }
 
+// 校验非 U-turn 单段转向的弧长、曲率和曲率符号约束。
+// 短急弯采用受限例外；其它转向必须保持可见单拱形态且不能形成尖钩或 S 弯。
 static bool isNonUTurnTurnShapeAcceptable(
     const BezierCurve& curve, double chord_len, double turn_strength) {
     if (chord_len < 1e-6 || turn_strength <= 0.35)
@@ -1142,6 +1244,8 @@ static bool isNonUTurnTurnShapeAcceptable(
     return !curveHasCurvatureSignFlip(curve);
 }
 
+// 校验非 U-turn 多段转向是否仍是首尾直行、单中弧的连续拱形。
+// 除首尾段直线性和 G1 方向外，还要求中弧具有有效曲率且全曲线无符号翻转。
 static bool isNonUTurnArchShapeAcceptable(
     const BezierCurve& curve, double chord_len, double turn_strength,
     const Vec2d& entry_tan, const Vec2d& exit_tan) {
@@ -1167,6 +1271,8 @@ static bool isNonUTurnArchShapeAcceptable(
     return true;
 }
 
+// 计算曲线采样点相对端点弦线的最大横向偏移与弦长之比。
+// 结果用于区分直行样式和明显偏转样式。
 static double maxLateralChordDeviationRatio(
     const BezierCurve& curve, double chord_len) {
     if (chord_len < 1e-6 || curve.empty())
@@ -1182,6 +1288,7 @@ static double maxLateralChordDeviationRatio(
     return max_dev / chord_len;
 }
 
+// 判断曲线是否满足宽松直行形态，包括弧弦比、横向偏移和最大曲率限制。
 static bool isStraightLikeShapeAcceptable(
     const BezierCurve& curve, double chord_len) {
     if (chord_len < 1e-6 || curve.empty())
@@ -1192,6 +1299,8 @@ static bool isStraightLikeShapeAcceptable(
            curve.maxCurvature(40) <= 3.0;
 }
 
+// 判断曲线是否满足基础直行的严格形态限制。
+// 在宽松直行判定之上进一步限制弧弦比和最大曲率，供自然直行恢复使用。
 static bool isStrictStraightBaseShapeAcceptable(
     const BezierCurve& curve, double chord_len) {
     if (!isStraightLikeShapeAcceptable(curve, chord_len))
@@ -1200,6 +1309,8 @@ static bool isStrictStraightBaseShapeAcceptable(
            curve.maxCurvature(40) < 0.10;
 }
 
+// 判断含 RoadEdge 端点贴行段的候选是否具备可接受的中段形态。
+// 该检查允许端点贴边，但要求去除端点段后的中段不穿越道路边缘。
 static bool roadEdgeEndpointFitShapeAcceptableLocal(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries,
     double full_chord_len, double turn_strength) {
@@ -1222,6 +1333,8 @@ static bool roadEdgeEndpointFitShapeAcceptableLocal(
         middle, middle_chord_len, turn_strength);
 }
 
+// 判断非 U-turn 曲线是否存在需要形态恢复的风险，而不是简单判断是否不合格。
+// 返回 true 表示弧长不足、曲率过高或曲率符号翻转等高风险情形。
 static bool isNonUTurnTurnShapeRisk(
     const BezierCurve& curve, double chord_len, double turn_strength) {
     if (chord_len < 1e-6 || turn_strength <= 0.35)
@@ -1234,6 +1347,7 @@ static bool isNonUTurnTurnShapeRisk(
            curveHasCurvatureSignFlip(curve);
 }
 
+// 将二维向量绕原点旋转指定弧度并返回旋转后的向量。
 static Vec2d rotateVec(const Vec2d& v, double radians) {
     double c = std::cos(radians);
     double s = std::sin(radians);
@@ -1246,11 +1360,15 @@ struct CurveRisk {
     bool fence = false;
     int sibling_crosses = 0;
 
+    // 返回是否存在至少一种物理风险：障碍物、边界或围栏违规。
+    // 同簇交叉不属于 physical，单独由 sibling_crosses 表示。
     bool physical() const {
         return obstacle || boundary || fence;
     }
 };
 
+// 将 Bezier 曲线写入 ConnectivityCurve，并按弧长重新生成输出折线几何。
+// 提供固定几何时保留该几何，否则清空旧 geometry 后从曲线采样填充。
 static void setConnectivityCurveGeometry(
     ConnectivityCurve& cc, const BezierCurve& curve, const LineString2d* fixed_geometry = nullptr) {
     cc.curve = std::make_shared<BezierCurve>(curve);
@@ -1265,6 +1383,8 @@ static void setConnectivityCurveGeometry(
     }
 }
 
+// 统一评估候选曲线的障碍物、边界、围栏和同簇交叉风险。
+// U-turn 使用专门边界规则；include_fence 控制围栏检查，结果仅描述风险不修改曲线。
 static CurveRisk assessCurveRisk(
     const BezierCurve& curve, const IntersectionInput& input, const SDFField& sdf,
     const std::vector<SampledSiblingCurve>& sampled_siblings, bool include_fence = true,
@@ -1293,6 +1413,9 @@ static CurveRisk assessCurveRisk(
     return risk;
 }
 
+// 当当前曲线存在物理风险时，在有限把手长度集合中寻找安全的单段 G1 三次曲线。
+// 候选必须消除障碍物、边界和围栏风险，并在 U-turn 拓扑场景下保持同簇无交叉；
+// 成功时原地替换 curve，失败时保持输入不变并返回 false。
 static bool tryPhysicalSafeSingleCubic(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -1339,6 +1462,8 @@ static bool tryPhysicalSafeSingleCubic(
     return true;
 }
 
+// 当单段曲线形态发散、曲率过高或弧长异常时，搜索满足控制点轴向和形态约束的
+// 单段候选。候选还需保持物理风险不变差以及同簇交叉数不增加。
 static bool tryShapeSafeSingleCubic(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -1367,23 +1492,21 @@ static bool tryShapeSafeSingleCubic(
     double best_score = 1000.0 * best_risk.sibling_crosses + best.maxCurvature(20) + 0.02 * best.arcLength();
     bool improved = false;
 
-    // 从常用把手长度到短把手递减搜索，优先恢复单段自然形态。
-    std::vector<double> alphas = {0.50, 0.42, 0.34, 0.26, 0.22, 0.18, 0.14, 0.12};
     const OrdinaryCurveInitializer ordinary_initializer;
-    for (double alpha : alphas) {
-        BezierCurve candidate = ordinary_initializer.buildSingleCubic(
-            p0, T0, p1, T1, alpha);
+    auto consider_candidate = [&](const BezierCurve& candidate) {
+        if (candidate.empty())
+            return;
         if (curveSelfIntersectsBusiness(candidate, 1.0))
-            continue;
+            return;
         if (!ordinarySingleCubicControlsValid(
                 candidate, p0, T0, p1, T1, 1e-5, true))
-            continue;
+            return;
         if (turn_strength > 0.35 &&
             !isNonUTurnTurnShapeAcceptable(candidate, chord_len, turn_strength))
-            continue;
+            return;
         CurveRisk risk = assessCurveRisk(candidate, input, sdf, sampled_siblings, include_fence);
         if (!severely_divergent && risk.physical())
-            continue;
+            return;
         double penalty = severely_divergent ? 0.0 : 1000.0;
         double score = penalty * risk.sibling_crosses + candidate.maxCurvature(20) + 0.02 * candidate.arcLength();
         // 发散曲线没有保留价值，首个可用单段候选即可作为改进。
@@ -1391,15 +1514,55 @@ static bool tryShapeSafeSingleCubic(
             best = candidate;
             best_score = score;
             improved = true;
-            continue;
+            return;
         }
         if (score + 1e-6 < best_score) {
             best = candidate;
             best_score = score;
             improved = true;
             if (risk.sibling_crosses == 0 && candidate.maxCurvature(20) < 1.0)
-                break;
+                return;
         }
+    };
+
+    // 先尝试方向交点 2/3 升阶候选，允许首尾把手不对称；这是短急弯
+    // 在方向交点很近时仍保持单拱形态的关键候选。
+    consider_candidate(ordinary_initializer.buildPreferredSingleCubic(
+        p0, T0, p1, T1));
+    // 短急弯常出现一侧方向交点很近、另一侧仍有充足把手空间。
+    // 对称 alpha 无法表达这种几何，补充有界的非对称首尾组合。
+    const OrdinarySingleCubicHandleBounds handle_bounds =
+        ordinarySingleCubicHandleBounds(p0, T0, p1, T1, true);
+    const double preferred_start = handle_bounds.has_direction_intersection
+        ? (2.0 / 3.0) * handle_bounds.direction_intersection_start
+        : chord_len / 3.0;
+    const double preferred_end = handle_bounds.has_direction_intersection
+        ? (2.0 / 3.0) * handle_bounds.direction_intersection_end
+        : chord_len / 3.0;
+    const std::vector<double> start_handles = {
+        std::min(handle_bounds.start_max, preferred_start),
+        handle_bounds.start_max};
+    const std::vector<double> end_handles = {
+        std::min(handle_bounds.end_max, preferred_end),
+        0.80 * handle_bounds.end_max, handle_bounds.end_max};
+    for (double start_handle : start_handles) {
+        for (double end_handle : end_handles) {
+            BezierSegment segment;
+            segment.ctrl[0] = p0;
+            segment.ctrl[1] = p0 + T0 * std::max(
+                handle_bounds.start_min, start_handle);
+            segment.ctrl[2] = p1 - T1 * std::max(
+                handle_bounds.end_min, end_handle);
+            segment.ctrl[3] = p1;
+            BezierCurve asymmetric;
+            asymmetric.segs.push_back(segment);
+            consider_candidate(asymmetric);
+        }
+    }
+    // 再从常用把手长度到短把手递减搜索，作为有界回退。
+    for (double alpha : {0.50, 0.42, 0.34, 0.26, 0.22, 0.18, 0.14, 0.12}) {
+        consider_candidate(ordinary_initializer.buildSingleCubic(
+            p0, T0, p1, T1, alpha));
     }
 
     if (!improved)
@@ -1410,6 +1573,8 @@ static bool tryShapeSafeSingleCubic(
 
 // 普通左右转在无固定形态且单段候选无物理风险时，统一恢复为
 // 单段自然弧；同簇风险只参与排序，不再作为保留多段S弯的豁免理由。
+// 尝试把无固定形态的多段普通转向恢复为自然单段 G1 三次曲线。
+// 仅在非 U-turn、无物理风险且转向明显时执行，并选择不增加同簇风险的最佳把手长度。
 static bool tryNaturalSingleCubicIfSafe(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -1471,6 +1636,8 @@ static bool tryNaturalSingleCubicIfSafe(
     return true;
 }
 
+// 尝试把直行或近直行曲线恢复为严格直行样式的自然单段三次曲线。
+// 候选必须满足端点切向、严格直行形态、物理安全和同簇交叉不恶化条件。
 static bool tryNaturalStraightSingleCubicIfSafe(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -1571,6 +1738,9 @@ static bool tryNaturalStraightSingleCubicIfSafe(
     return true;
 }
 
+// 针对已确认的 Boundary 违规曲线执行有界候选搜索。
+// 搜索包含端点开口、保守折点和边界侧方候选；每个候选均经过形态、物理风险、
+// 同簇交叉和真实边界相交门禁，成功后写回 curve。
 static bool tryBoundarySafeCandidate(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -2145,6 +2315,8 @@ static bool tryBoundarySafeCandidate(
     return true;
 }
 
+// 根据连接入口切向与端点弦线计算带符号的转向强度。
+// 正负表示左右转方向，绝对值表示偏转程度；连接或弦线无效时返回零。
 static double signedTurnStrengthOfConnId(const SceneView& scene, const ConnId& id) {
     const Connectivity* conn = scene.connectivity(id);
     if (!conn)
@@ -2160,6 +2332,8 @@ static double signedTurnStrengthOfConnId(const SceneView& scene, const ConnId& i
     return cross2d(T0, chord.normalized());
 }
 
+// 为当前已有结果建立同簇约束邻接表，过滤掉没有曲线的连接。
+// 该表供交叉计数和局部修复快速查找可能影响当前连接的兄弟曲线。
 static std::unordered_map<ConnId, std::vector<ConnId>> constrainedNeighborMap(
     const std::vector<ConnectivityCurve>& results, const ClusterOrderSolver& cs) {
     std::unordered_set<ConnId> available_ids;
@@ -2169,6 +2343,8 @@ static std::unordered_map<ConnId, std::vector<ConnId>> constrainedNeighborMap(
     return RepairImpactClosureBuilder().neighbors(cs.pairs(), available_ids);
 }
 
+// 统计指定连接候选曲线与其所有约束邻居的禁止相交数量。
+// 结构性交叉已由邻接构建规则排除，端点容差用于允许真实连接点相遇。
 static int constrainedCrossCountForId(
     const ConnId& id, const BezierCurve& curve,
     const std::vector<ConnectivityCurve>& results,
@@ -2193,6 +2369,8 @@ static int constrainedCrossCountForId(
     return count;
 }
 
+// 统计候选曲线与约束邻居中固定形态曲线的禁止相交数量。
+// 该计数用于候选排序和固定形态保护，不改变邻居曲线。
 static int constrainedFixedCrossCountForId(
     const ConnId& id, const BezierCurve& curve,
     const std::vector<ConnectivityCurve>& results,
@@ -2217,6 +2395,8 @@ static int constrainedFixedCrossCountForId(
     return count;
 }
 
+// 只统计候选曲线与共享端点约束邻居的禁止相交数量。
+// 结构性交叉不计入，适合判断共享入口/出口的局部扇出冲突。
 static int constrainedSharedEndpointCrossCountForId(
     const ConnId& id, const BezierCurve& curve,
     const std::vector<ConnectivityCurve>& results,
@@ -2245,6 +2425,8 @@ static int constrainedSharedEndpointCrossCountForId(
     return count;
 }
 
+// 从当前连接的冲突邻居中提取第一个有效的主导横向参考法线。
+// 无冲突或没有有效参考轴时返回零向量，供定向偏移修复决定是否放弃搜索。
 static Vec2d dominantConstrainedRefPerpForId(
     const ConnId& id, const BezierCurve& curve,
     const std::vector<ConnectivityCurve>& results,
@@ -2271,6 +2453,8 @@ static Vec2d dominantConstrainedRefPerpForId(
     return Vec2d(0, 0);
 }
 
+// 收集纯几何场景中需要重修的连接 ID：仅包括非结构性交叉且未被固定形态保护的
+// 一方或双方，确保后续拓扑修复预算只作用于真实冲突集合。
 static std::unordered_set<ConnId> collectPureGeometryRepairIds(
     const std::vector<ConnectivityCurve>& results, const ClusterOrderSolver& cs,
     const std::unordered_set<ConnId>& preserved_fixed_ids, double endpoint_tol = kClusterEndpointTol) {
@@ -2304,6 +2488,8 @@ static std::unordered_set<ConnId> collectPureGeometryRepairIds(
     return repair_ids;
 }
 
+// 找出彼此冲突的固定形态连接，并按端点弦长保留较长者、移除较短者的保护资格。
+// 该策略为自然曲线恢复释放必要的修复空间。
 static std::unordered_set<ConnId> collectConflictingPreservedFixedIds(
     const std::vector<ConnectivityCurve>& results, const ClusterOrderSolver& cs,
     const std::unordered_set<ConnId>& preserved_fixed_ids,
@@ -2334,6 +2520,8 @@ static std::unordered_set<ConnId> collectConflictingPreservedFixedIds(
     return drop_ids;
 }
 
+// 为普通非 U-turn 连接构造不依赖环境约束的自然单段候选。
+// 仅返回切向有效、无自交且弧长形态合理的候选，供固定形态阻塞预判使用。
 static bool naturalSingleSegmentCandidate(
     const Connectivity& conn, const IntersectionInput& input, BezierCurve& out_curve) {
     if (hasFixedGeometry(conn))
@@ -2382,6 +2570,8 @@ static bool naturalSingleSegmentCandidate(
     return true;
 }
 
+// 检查固定形态是否会阻塞其它连接的自然单段形态，并收集需要取消保护的固定 ID。
+// 只处理非结构性交叉，且不会直接修改结果数组。
 static std::unordered_set<ConnId> collectFixedIdsBlockingNaturalShapes(
     const IntersectionInput& input, const std::vector<ConnectivityCurve>& fixed_results,
     const ClusterOrderSolver& cs, const std::unordered_set<ConnId>& preserved_fixed_ids,
@@ -2414,14 +2604,19 @@ static std::unordered_set<ConnId> collectFixedIdsBlockingNaturalShapes(
     return drop_ids;
 }
 
+// 根据输入连接和入口/出口方向判断其是否为几何意义上的 U-turn。
+// 该判断独立于 turn_type 字段，用于选择三段式调头生成路径。
 static bool isGeometricUTurnConn(const Connectivity& conn, const IntersectionInput& input) {
     return UTurnFamilyBuilder().isGeometricUTurn(conn, input);
 }
 
+// 返回 U-turn 家族排序所用的几何半径键，半径越大表示应越偏向外层深拱。
 static double uturnRadiusKey(const Connectivity& conn, const IntersectionInput& input) {
     return UTurnFamilyBuilder().radiusKey(conn, input);
 }
 
+// 根据 U-turn 家族排名计算共享入口或出口平齐点的横向错开量。
+// 家族不足两条时返回零；较大的半径排名获得更大的错开，以避免中弧贴合。
 static double uturnSharedEndpointStagger(
     const Connectivity& conn, const IntersectionInput& input,
     const ClusterOrderSolver& cs, UTurnAlignmentScope scope) {
@@ -2444,6 +2639,8 @@ static double uturnSharedEndpointStagger(
 
 // 纯几何形态恢复：当直行/普通转向被固有形态或拓扑修复拉成异常多段、
 // 过短弧或S形时，搜索更自然的单段/少段候选，并确保同簇交叉不变差。
+// 在纯几何拓扑修复后，为异常多段或 S 形普通转向搜索自然形态恢复候选。
+// 录取候选必须保持当前同簇交叉和固定形态交叉不增加，并满足转向弧形约束。
 static bool tryPureGeometryShapeRestore(
     const Connectivity& conn, const IntersectionInput& input,
     const std::vector<ConnectivityCurve>& results,
@@ -2558,6 +2755,7 @@ static bool tryPureGeometryShapeRestore(
     return true;
 }
 
+// 判断端点弦线是否进入障碍物硬多边形，包括中点在内部和与外环相交两种情况。
 static bool chordIntersectsObstacle(
     const Vec2d& p0, const Vec2d& p1, const Obstacle& obs) {
     const Polygon2d& poly = obstacleHardGeometry(obs);
@@ -2568,6 +2766,8 @@ static bool chordIntersectsObstacle(
     return polygonSegmentIntersects(p0, p1, poly);
 }
 
+// 围绕阻塞端点弦线的障碍物生成有限路点绕行候选。
+// 候选按障碍物两侧、净距和同簇交叉排序，并必须通过物理风险及 U-turn 拓扑门禁。
 static bool tryObstacleBypassCandidate(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -2674,6 +2874,8 @@ static bool tryObstacleBypassCandidate(
     return true;
 }
 
+// 使用有界 U-turn 搜索器寻找相对 reference 的安全调头候选。
+// auditor 统一检查物理风险和兄弟交叉，min_lead 参数约束首尾直行段最小长度。
 static bool tryBoundedUTurnCandidate(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -2694,6 +2896,8 @@ static bool tryBoundedUTurnCandidate(
         min_lead0, min_lead1);
 }
 
+// 为 U-turn 多约束搜索器组装采样、同簇交叉、障碍物、边界和共享端点侧向惩罚回调。
+// 返回的后端捕获当前输入和 SDF，只读服务于候选评分。
 static UTurnSearchBackend makeUTurnSearchBackend(
     const IntersectionInput& input, const SDFField& sdf,
     const std::vector<SampledSiblingCurve>& sampled_siblings) {
@@ -2725,6 +2929,8 @@ static UTurnSearchBackend makeUTurnSearchBackend(
     return backend;
 }
 
+// 创建三段式 U-turn 候选审计器，统一执行物理风险和同簇交叉检查。
+// include_fence 由调用阶段决定是否把围栏纳入硬门禁。
 static SegmentedUTurnAuditor makeSegmentedUTurnAuditor(
     const IntersectionInput& input, const SDFField& sdf,
     const std::vector<SampledSiblingCurve>& sampled_siblings) {
@@ -2748,6 +2954,8 @@ public:
         : solver_(solver), cluster_solver_(cluster_solver),
           direction_cfg_(direction_config), validator_(validator) {}
 
+    // 按连接类型选择初始曲线、候选修复、优化器和最终审计，生成一条完整输出曲线。
+    // siblings 提供已生成兄弟约束；out_physical_risk 报告最终是否仍有物理风险。
     ConnectivityCurve run(
         const CurveGenerationContext& context, const std::vector<SiblingCurve>& siblings, bool* out_physical_risk);
 
@@ -2762,6 +2970,8 @@ private:
     Validator validator_;
 };
 
+// 执行单连接生成流水线：解析端点与 U-turn 家族约束，构造初解，按物理/拓扑/形态
+// 风险选择修复或优化路径，最后写入几何并完成统一审计。该函数不修改其它连接结果。
 ConnectivityCurve SingleCurveGenerationPipeline::run(
     const CurveGenerationContext& context, const std::vector<SiblingCurve>& siblings, bool* out_physical_risk) {
     if (out_physical_risk)
@@ -3656,6 +3866,8 @@ ConnectivityCurve SingleCurveGenerationPipeline::run(
     return cc;
 }
 
+// 构造单曲线流水线并生成指定连接，注入会话级求解器、簇排序器和审计器。
+// 这是 run 内部批量生成单条连接的统一入口。
 ConnectivityCurve ConnectivityGenerationSession::generateOne(
     const CurveGenerationContext& context, const std::vector<SiblingCurve>& siblings, bool* out_physical_risk) {
     const SingleCurveGenerationPipeline::Validator validator =
@@ -3666,6 +3878,9 @@ ConnectivityCurve ConnectivityGenerationSession::generateOne(
             context, siblings, out_physical_risk);
 }
 
+// 运行完整路口曲线生成流程：规范化输入，构建簇拓扑和 U-turn 家族快照，按计划
+// 生成连接，处理固定形态、物理风险、同簇交叉、形态恢复及最终标注，并返回结果。
+// out_ms 可选接收总耗时；函数不修改调用者传入的 raw_input 和 SDF 对象内容。
 std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
     const IntersectionInput& raw_input, SDFField& sdf, double* out_ms) {
     auto t0 = std::chrono::steady_clock::now();
@@ -5617,10 +5832,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
         }
         repairSharedEndpointTurnPairs(repair_budget.shared_endpoint_pair_repairs);
 
-        // mode=2 的共享端点通用修复为控制运行时间会被跳过；但同一进入
-        // 车道的右转仍需保持扇出顺序。出口位于外侧的曲线必须使用更长
-        // 的首句柄，否则会先切向内侧并在中段穿过相邻右转。
-        if (input.mode == 2) {
+        // 无固定形态、无物理避让的普通单段曲线，按同侧转向分别维持
+        // 共享进入端点的扇出把手顺序。左转与右转不放进同一排序组；
+        // 左/右转与掉头的 StructuralCross 豁免也不会在这里被强行排序。
+        {
             result_idx = resultIndexById(results);
             auto ordered_neighbors = constrainedNeighborMap(results, cluster_solver_);
             for (const auto& pair : cluster_solver_.pairs()) {
@@ -5632,18 +5847,27 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     continue;
                 auto& ca = results[ia->second];
                 auto& cb = results[ib->second];
-                if (!ca.curve || !cb.curve || ca.curve->numSegments() != 1 ||
+                if (preserved_fixed_ids.count(ca.id) ||
+                    preserved_fixed_ids.count(cb.id) ||
+                    !ca.curve || !cb.curve || ca.curve->numSegments() != 1 ||
                     cb.curve->numSegments() != 1)
                     continue;
                 const Connectivity* cna = scene.view.connectivity(ca.id);
                 const Connectivity* cnb = scene.view.connectivity(cb.id);
-                if (!cna || !cnb || cna->entry_lane_id != cnb->entry_lane_id ||
-                    cna->turn_type != ConnTurnType::TurnRight ||
-                    cnb->turn_type != ConnTurnType::TurnRight)
+                if (!cna || !cnb || cna->entry_lane_id != cnb->entry_lane_id)
                     continue;
-                if ((ca.curve->startPt() - cb.curve->startPt()).norm() > 0.30 ||
-                    !curvesIntersectBeyondSharedEndpointOverlap(
-                        *ca.curve, *cb.curve, kClusterEndpointTol))
+                if (isGeometricUTurnConn(*cna, input) ||
+                    isGeometricUTurnConn(*cnb, input))
+                    continue;
+                const double signed_turn_a =
+                    signedTurnStrengthOfConnId(scene.view, ca.id);
+                const double signed_turn_b =
+                    signedTurnStrengthOfConnId(scene.view, cb.id);
+                if (std::abs(signed_turn_a) < 0.25 ||
+                    std::abs(signed_turn_b) < 0.25 ||
+                    signed_turn_a * signed_turn_b <= 0.0)
+                    continue;
+                if ((ca.curve->startPt() - cb.curve->startPt()).norm() > 0.30)
                     continue;
 
                 auto entry = scene.view.entryFrame(cna->entry_lane_id);
@@ -5656,8 +5880,13 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     ? entry.second.normalized() : fallback.normalized();
                 Vec2d ref_perp = pair.ref_perp.norm() > 1e-8
                     ? pair.ref_perp.normalized() : Vec2d(-t0.y(), t0.x());
-                const bool a_is_outer =
-                    exit_a.first.dot(ref_perp) > exit_b.first.dot(ref_perp);
+                const double lateral_a =
+                    (exit_a.first - entry.first).dot(ref_perp);
+                const double lateral_b =
+                    (exit_b.first - entry.first).dot(ref_perp);
+                // 同侧组内离入口扇区中心更远者为外侧；该定义同时适用于
+                // 左转和右转，避免把左右转混成一个全局方向。
+                const bool a_is_outer = std::abs(lateral_a) > std::abs(lateral_b);
                 auto& outer = a_is_outer ? ca : cb;
                 auto& inner = a_is_outer ? cb : ca;
                 const Connectivity* outer_conn = a_is_outer ? cna : cnb;
@@ -5760,6 +5989,134 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     validate(inner, input, sdf);
                 }
                 setConnectivityCurveGeometry(outer, best);
+                validate(outer, input, sdf);
+                result_idx = resultIndexById(results);
+                ordered_neighbors = constrainedNeighborMap(results, cluster_solver_);
+            }
+        }
+
+        // 共享退出端点采用与入口扇出对称的尾把手排序：同侧曲线中，
+        // 入口位置更靠外者使用更长的尾把手。该处理只作用于普通单段
+        // 曲线，且候选必须不增加全局同簇交叉或固定形态交叉。
+        {
+            result_idx = resultIndexById(results);
+            auto ordered_neighbors = constrainedNeighborMap(results, cluster_solver_);
+            for (const auto& pair : cluster_solver_.pairs()) {
+                if (!pair.shared_endpoint ||
+                    pair.exempt == CrossExemption::StructuralCross)
+                    continue;
+                auto ia = result_idx.find(pair.id_a);
+                auto ib = result_idx.find(pair.id_b);
+                if (ia == result_idx.end() || ib == result_idx.end())
+                    continue;
+                auto& ca = results[ia->second];
+                auto& cb = results[ib->second];
+                if (preserved_fixed_ids.count(ca.id) ||
+                    preserved_fixed_ids.count(cb.id) ||
+                    !ca.curve || !cb.curve ||
+                    ca.curve->numSegments() != 1 ||
+                    cb.curve->numSegments() != 1)
+                    continue;
+                const Connectivity* cna = scene.view.connectivity(ca.id);
+                const Connectivity* cnb = scene.view.connectivity(cb.id);
+                if (!cna || !cnb || cna->exit_lane_id != cnb->exit_lane_id ||
+                    cna->entry_lane_id == cnb->entry_lane_id)
+                    continue;
+                if (isGeometricUTurnConn(*cna, input) ||
+                    isGeometricUTurnConn(*cnb, input))
+                    continue;
+                // 共享出口在没有实际中段交叉时保留原始形态；尾把手
+                // 只作为交叉后的最小修复自由度，避免无辜压短急弯。
+                if (!curvesIntersectBeyondSharedEndpointOverlap(
+                        *ca.curve, *cb.curve, kClusterEndpointTol))
+                    continue;
+
+                const double signed_turn_a =
+                    signedTurnStrengthOfConnId(scene.view, ca.id);
+                const double signed_turn_b =
+                    signedTurnStrengthOfConnId(scene.view, cb.id);
+                if (std::abs(signed_turn_a) < 0.25 ||
+                    std::abs(signed_turn_b) < 0.25 ||
+                    signed_turn_a * signed_turn_b <= 0.0)
+                    continue;
+
+                auto exit_frame = scene.view.exitFrame(cna->exit_lane_id);
+                Vec2d fallback_a = exit_frame.first -
+                    scene.view.entryFrame(cna->entry_lane_id).first;
+                Vec2d fallback_b = exit_frame.first -
+                    scene.view.entryFrame(cnb->entry_lane_id).first;
+                if (fallback_a.norm() < 1e-8 || fallback_b.norm() < 1e-8)
+                    continue;
+                Vec2d t1 = exit_frame.second.norm() > 1e-8
+                    ? exit_frame.second.normalized() : fallback_a.normalized();
+                Vec2d ref_perp = pair.ref_perp.norm() > 1e-8
+                    ? pair.ref_perp.normalized() : Vec2d(-t1.y(), t1.x());
+                auto entry_a = scene.view.entryFrame(cna->entry_lane_id);
+                auto entry_b = scene.view.entryFrame(cnb->entry_lane_id);
+                const double lateral_a =
+                    (entry_a.first - exit_frame.first).dot(ref_perp);
+                const double lateral_b =
+                    (entry_b.first - exit_frame.first).dot(ref_perp);
+                const bool a_is_outer = std::abs(lateral_a) > std::abs(lateral_b);
+                auto& outer = a_is_outer ? ca : cb;
+                auto& inner = a_is_outer ? cb : ca;
+                const Connectivity* outer_conn = a_is_outer ? cna : cnb;
+                auto outer_entry = scene.view.entryFrame(
+                    outer_conn->entry_lane_id);
+                Vec2d outer_chord = exit_frame.first - outer_entry.first;
+                double chord_len = outer_chord.norm();
+                if (chord_len < 1e-8)
+                    continue;
+                double inner_handle =
+                    (exit_frame.first - inner.curve->segs.front().ctrl[2]).dot(t1);
+                double outer_handle =
+                    (exit_frame.first - outer.curve->segs.front().ctrl[2]).dot(t1);
+                constexpr double kHandleOrderMargin = 0.25;
+                if (outer_handle >= inner_handle + kHandleOrderMargin)
+                    continue;
+
+                const auto bounds = ordinarySingleCubicHandleBounds(
+                    outer_entry.first, outer_entry.second,
+                    exit_frame.first, exit_frame.second, true);
+                const double target_handle = std::min(
+                    bounds.end_max, inner_handle + kHandleOrderMargin);
+                if (target_handle <= outer_handle + 1e-6 ||
+                    target_handle < bounds.end_min - 1e-6)
+                    continue;
+
+                BezierCurve candidate = *outer.curve;
+                candidate.segs.front().ctrl[2] =
+                    exit_frame.first - t1 * target_handle;
+                if (!ordinarySingleCubicControlsValid(
+                        candidate, outer_entry.first, outer_entry.second,
+                        exit_frame.first, exit_frame.second, 1e-5, true) ||
+                    curveSelfIntersectsBusiness(candidate, 1.0) ||
+                    !isNonUTurnTurnShapeAcceptable(
+                        candidate, chord_len,
+                        std::abs(cross2d(
+                            outer_entry.second.normalized(),
+                            outer_chord.normalized()))) ||
+                    assessCurveRisk(candidate, input, sdf, {}, true).physical() ||
+                    curvesIntersectBeyondSharedEndpointOverlap(
+                        candidate, *inner.curve, kClusterEndpointTol))
+                    continue;
+
+                const int current_cross = constrainedCrossCountForId(
+                    outer.id, *outer.curve, results, result_idx,
+                    ordered_neighbors, kClusterEndpointTol);
+                const int candidate_cross = constrainedCrossCountForId(
+                    outer.id, candidate, results, result_idx,
+                    ordered_neighbors, kClusterEndpointTol);
+                const int current_fixed = constrainedFixedCrossCountForId(
+                    outer.id, *outer.curve, results, result_idx,
+                    ordered_neighbors, kClusterEndpointTol);
+                const int candidate_fixed = constrainedFixedCrossCountForId(
+                    outer.id, candidate, results, result_idx,
+                    ordered_neighbors, kClusterEndpointTol);
+                if (candidate_cross > current_cross ||
+                    candidate_fixed > current_fixed)
+                    continue;
+                setConnectivityCurveGeometry(outer, candidate);
                 validate(outer, input, sdf);
                 result_idx = resultIndexById(results);
                 ordered_neighbors = constrainedNeighborMap(results, cluster_solver_);
@@ -6546,6 +6903,58 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         "[ISG_PROFILE] shared-entry U-turn family %s size=%zu arc_alpha=%.2f\n",
                         family_item.first.c_str(), family.size(), accepted_alpha);
             }
+        }
+    }
+
+    // 最终普通曲线形态审计：前面的同簇修复可能压短某条共享端点
+    // 曲线的尾把手，导致短急弯曲率超过允许上限。此处只对无固定形态、
+    // 非掉头的单段普通曲线做受约束重建，避免把保序修复留下非法形态。
+    {
+        auto final_idx = resultIndexById(results);
+        auto final_curves = curveMapFromResults(results);
+        for (auto& result : results) {
+            if (preserved_fixed_ids.count(result.id) || !result.curve)
+                continue;
+            const Connectivity* conn = scene.view.connectivity(result.id);
+            if (!conn || isGeometricUTurnConn(*conn, input))
+                continue;
+            auto entry = scene.view.entryFrame(conn->entry_lane_id);
+            auto exit_ = scene.view.exitFrame(conn->exit_lane_id);
+            Vec2d chord = exit_.first - entry.first;
+            if (chord.norm() < 1e-8 || entry.second.norm() < 1e-8)
+                continue;
+            const double turn_strength = std::abs(cross2d(
+                entry.second.normalized(), chord.normalized()));
+            if (turn_strength <= 0.35 ||
+                isNonUTurnTurnShapeAcceptable(
+                    *result.curve, chord.norm(), turn_strength))
+                continue;
+            auto siblings = buildSiblings(
+                result.id, final_curves, cluster_solver_,
+                input.connectivities, true, &preserved_fixed_ids);
+            auto sampled = sampleSiblingsForIntersections(siblings);
+            BezierCurve repaired = *result.curve;
+            if (!tryShapeSafeSingleCubic(
+                    entry.first, entry.second, exit_.first, exit_.second,
+                    input, sdf, sampled, true, repaired) ||
+                !isNonUTurnTurnShapeAcceptable(
+                    repaired, chord.norm(), turn_strength) ||
+                assessCurveRisk(repaired, input, sdf, sampled, true).physical())
+                continue;
+            const int old_cross = constrainedCrossCountForId(
+                result.id, *result.curve, results, final_idx,
+                constrainedNeighborMap(results, cluster_solver_),
+                kClusterEndpointTol);
+            const int new_cross = constrainedCrossCountForId(
+                result.id, repaired, results, final_idx,
+                constrainedNeighborMap(results, cluster_solver_),
+                kClusterEndpointTol);
+            if (new_cross > old_cross)
+                continue;
+            setConnectivityCurveGeometry(result, repaired);
+            validate(result, input, sdf);
+            final_curves[result.id] = repaired;
+            final_idx = resultIndexById(results);
         }
     }
 

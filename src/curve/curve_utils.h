@@ -5,6 +5,20 @@ namespace isg {
 
 struct SDFField;
 
+/// 普通单段三次 Bezier 的端点方向轴及把手有效范围。
+/// direction_intersection_* 仅在两条前向方向射线存在稳定交点时有效。
+struct OrdinarySingleCubicHandleBounds {
+    Vec2d start_dir{1, 0};
+    Vec2d end_dir{1, 0};
+    double start_min = 0.05;
+    double end_min = 0.05;
+    double start_max = 0.05;
+    double end_max = 0.05;
+    bool has_direction_intersection = false;
+    double direction_intersection_start = 0.0;
+    double direction_intersection_end = 0.0;
+};
+
 /// 三点局部曲率（基于外接圆半径倒数）
 double localCurvature(const Vec2d& a, const Vec2d& b, const Vec2d& c);
 
@@ -55,6 +69,12 @@ bool curvesIntersectBusiness(const BezierCurve&, const BezierCurve&, double ep =
 
 /// 曲线自身相交判定：排除首尾相接的情况
 bool curveSelfIntersectsBusiness(const BezierCurve&, double ep = 0.01);
+
+/// 计算普通单段曲线的端点方向和把手上下界。
+OrdinarySingleCubicHandleBounds ordinarySingleCubicHandleBounds(
+    const Vec2d& p0, const Vec2d& start_tan,
+    const Vec2d& p1, const Vec2d& end_tan,
+    bool cap_at_direction_intersection = true);
 
 /// 将普通单段三次Bezier的两个内部控制点限制在端点切向轴的有效范围内。
 /// U型调头和物理避让候选由调用方显式跳过本约束。

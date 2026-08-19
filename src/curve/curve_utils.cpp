@@ -308,18 +308,11 @@ bool curveSelfIntersectsBusiness(const BezierCurve& c, double ep) {
 
 namespace {
 
-struct SingleCubicHandleBounds {
-    Vec2d start_dir{1, 0};
-    Vec2d end_dir{1, 0};
-    double start_max = 0.0;
-    double end_max = 0.0;
-};
-
-static SingleCubicHandleBounds singleCubicHandleBounds(
+OrdinarySingleCubicHandleBounds makeOrdinarySingleCubicHandleBounds(
     const Vec2d& p0, const Vec2d& start_tan,
     const Vec2d& p1, const Vec2d& end_tan,
     bool cap_at_direction_intersection) {
-    SingleCubicHandleBounds bounds;
+    OrdinarySingleCubicHandleBounds bounds;
     Vec2d chord = p1 - p0;
     double chord_len = chord.norm();
     bounds.start_dir = start_tan.norm() > 1e-8
@@ -348,6 +341,9 @@ static SingleCubicHandleBounds singleCubicHandleBounds(
     double start_station = cross2d(delta, exit_back) / den;
     double end_station = cross2d(delta, bounds.start_dir) / den;
     if (start_station > 0.05 && end_station > 0.05) {
+        bounds.has_direction_intersection = true;
+        bounds.direction_intersection_start = start_station;
+        bounds.direction_intersection_end = end_station;
         bounds.start_max = std::min(bounds.start_max, start_station);
         bounds.end_max = std::min(bounds.end_max, end_station);
     }
@@ -361,6 +357,14 @@ static double startHandleStation(
 
 } // namespace
 
+OrdinarySingleCubicHandleBounds ordinarySingleCubicHandleBounds(
+    const Vec2d& p0, const Vec2d& start_tan,
+    const Vec2d& p1, const Vec2d& end_tan,
+    bool cap_at_direction_intersection) {
+    return makeOrdinarySingleCubicHandleBounds(
+        p0, start_tan, p1, end_tan, cap_at_direction_intersection);
+}
+
 void constrainOrdinarySingleCubicControls(
     BezierCurve& curve, const Vec2d& p0, const Vec2d& start_tan,
     const Vec2d& p1, const Vec2d& end_tan,
@@ -368,7 +372,7 @@ void constrainOrdinarySingleCubicControls(
     if (curve.numSegments() != 1)
         return;
 
-    const SingleCubicHandleBounds bounds = singleCubicHandleBounds(
+    const OrdinarySingleCubicHandleBounds bounds = ordinarySingleCubicHandleBounds(
         p0, start_tan, p1, end_tan, cap_at_direction_intersection);
     BezierSegment& seg = curve.segs.front();
     seg.ctrl[0] = p0;
@@ -391,7 +395,7 @@ bool ordinarySingleCubicControlsValid(
     if (curve.numSegments() != 1)
         return true;
 
-    const SingleCubicHandleBounds bounds = singleCubicHandleBounds(
+    const OrdinarySingleCubicHandleBounds bounds = ordinarySingleCubicHandleBounds(
         p0, start_tan, p1, end_tan, cap_at_direction_intersection);
     const BezierSegment& seg = curve.segs.front();
     if ((seg.ctrl[0] - p0).norm() > tol || (seg.ctrl[3] - p1).norm() > tol)

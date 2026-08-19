@@ -18,17 +18,14 @@ struct CrosswalkClearanceResult {
 /// 沿给定射线选择最近 Crosswalk 并计算完整远边投影。
 class CrosswalkClearanceCalculator {
 public:
-    CrosswalkClearanceResult alongRay(const Vec2d& origin,
-                                      const Vec2d& direction,
-                                      const IntersectionInput& input) const;
+    CrosswalkClearanceResult alongRay(
+            const Vec2d& origin, const Vec2d& direction, const IntersectionInput& input) const;
 
-    CrosswalkClearanceResult ahead(const Vec2d& origin,
-                                   const Vec2d& tangent,
-                                   const IntersectionInput& input) const;
+    CrosswalkClearanceResult ahead(
+            const Vec2d& origin, const Vec2d& tangent, const IntersectionInput& input) const;
 
-    CrosswalkClearanceResult behind(const Vec2d& endpoint,
-                                    const Vec2d& tangent,
-                                    const IntersectionInput& input) const;
+    CrosswalkClearanceResult behind(
+            const Vec2d& endpoint, const Vec2d& tangent, const IntersectionInput& input) const;
 };
 
 }  // 命名空间 isg

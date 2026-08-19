@@ -3,6 +3,7 @@
 #include "constraints/constraint_evaluator.h"
 #include "constraints/uturn_envelope_constraint.h"
 #include "curve/bezier.h"
+#include "curve/curve_utils.h"
 #include "domain/scene_view.h"
 #include "io/iodata_json.h"
 #include "initialization/fixed_shape_initializer.h"
@@ -139,6 +140,43 @@ TEST_CASE("OrdinaryCurveInitializer keeps alpha order and tangent fallbacks") {
             candidates[2].segs.front().ctrl[1].x());
 }
 
+TEST_CASE("OrdinaryCurveInitializer uses quadratic elevation for ordinary turns") {
+    const isg::OrdinaryCurveInitializer initializer;
+    const isg::BezierCurve turn = initializer.buildPreferredSingleCubic(
+        isg::Vec2d(0, 0), isg::Vec2d(1, 0),
+        isg::Vec2d(10, 10), isg::Vec2d(0, 1));
+    REQUIRE(turn.numSegments() == 1);
+    CHECK(turn.segs.front().ctrl[1].isApprox(
+        isg::Vec2d(20.0 / 3.0, 0.0), 1e-9));
+    CHECK(turn.segs.front().ctrl[2].isApprox(
+        isg::Vec2d(10.0, 10.0 / 3.0), 1e-9));
+
+    const isg::BezierCurve straight = initializer.buildPreferredSingleCubic(
+        isg::Vec2d(0, 0), isg::Vec2d(1, 0),
+        isg::Vec2d(12, 0), isg::Vec2d(1, 0));
+    REQUIRE(straight.numSegments() == 1);
+    CHECK(straight.segs.front().ctrl[1].isApprox(isg::Vec2d(6, 0), 1e-9));
+    CHECK(straight.segs.front().ctrl[2].isApprox(isg::Vec2d(6, 0), 1e-9));
+    CHECK(straight.segs.front().ctrl[1].isApprox(
+        straight.segs.front().ctrl[2], 1e-12));
+    CHECK(std::abs(straight.arcLength() - 12.0) < 1e-8);
+
+    const isg::BezierCurve skewed_straight =
+        initializer.buildPreferredSingleCubic(
+            isg::Vec2d(0, 0), isg::Vec2d(1, 0.1),
+            isg::Vec2d(12, 0), isg::Vec2d(1, -0.1));
+    REQUIRE(skewed_straight.numSegments() == 1);
+    CHECK((skewed_straight.segs.front().ctrl[1] -
+           skewed_straight.segs.front().ctrl[0]).norm() ==
+          (skewed_straight.segs.front().ctrl[3] -
+           skewed_straight.segs.front().ctrl[2]).norm());
+    CHECK_FALSE(skewed_straight.segs.front().ctrl[1].isApprox(
+        skewed_straight.segs.front().ctrl[2], 1e-9));
+    CHECK(isg::ordinarySingleCubicControlsValid(
+        skewed_straight, isg::Vec2d(0, 0), isg::Vec2d(1, 0.1),
+        isg::Vec2d(12, 0), isg::Vec2d(1, -0.1), 1e-6, true));
+}
+
 TEST_CASE("UTurnCurveInitializer builds aligned and segmented shapes") {
     const isg::UTurnCurveInitializer initializer;
     const isg::Vec2d p0(0, 0);
@@ -256,7 +294,7 @@ TEST_CASE("CurveInitializerRegistry applies U-turn fixed and ordinary priority")
     options.allow_fixed_shape = false;
     options.ordinary_alphas = {0.4, 0.3};
     candidates = registry.build(context, options);
-    REQUIRE(candidates.size() == 2);
+    REQUIRE(candidates.size() == 3);
     REQUIRE(candidates[0].origin == isg::CandidateOrigin::NaturalSingleCubic);
     REQUIRE(candidates[1].quality_score > candidates[0].quality_score);
     REQUIRE_FALSE(candidates[0].hasCurrentReport());

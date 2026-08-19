@@ -7,10 +7,9 @@
 namespace isg {
 namespace {
 
-void considerPolyline(const std::vector<Vec2d>& points,
-                      const Vec2d& origin, const Vec2d& forward,
-                      const Vec2d& lateral,
-                      CrosswalkClearanceResult& candidate) {
+void considerPolyline(
+        const std::vector<Vec2d>& points, const Vec2d& origin,
+        const Vec2d& forward, const Vec2d& lateral, CrosswalkClearanceResult& candidate) {
     for (size_t i = 1; i < points.size(); ++i) {
         const Vec2d& a = points[i - 1];
         const Vec2d& b = points[i];
@@ -32,9 +31,9 @@ void considerPolyline(const std::vector<Vec2d>& points,
     }
 }
 
-void considerPolygon(const Polygon2d& polygon, const Vec2d& origin,
-                     const Vec2d& forward, const Vec2d& lateral,
-                     CrosswalkClearanceResult& candidate) {
+void considerPolygon(
+        const Polygon2d& polygon, const Vec2d& origin,
+        const Vec2d& forward, const Vec2d& lateral, CrosswalkClearanceResult& candidate) {
     if (polygon.outer.size() >= 2)
         considerPolyline(toVec2dArray(polygon.outer), origin, forward, lateral, candidate);
     for (const auto& hole : polygon.holes)
@@ -67,8 +66,7 @@ CrosswalkClearanceResult CrosswalkClearanceCalculator::alongRay(
 }
 
 CrosswalkClearanceResult CrosswalkClearanceCalculator::ahead(
-    const Vec2d& origin, const Vec2d& tangent,
-    const IntersectionInput& input) const {
+    const Vec2d& origin, const Vec2d& tangent, const IntersectionInput& input) const {
     return alongRay(origin, tangent, input);
 }
 

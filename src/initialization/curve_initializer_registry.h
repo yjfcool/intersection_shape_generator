@@ -31,10 +31,8 @@ struct CurveInitializationOptions {
 /// 场景相关参数由调用方提供，约束报告必须随后由 ConstraintEvaluator 写入。
 class CurveInitializerRegistry {
 public:
-    std::vector<CurveCandidate> build(
-        const CurveGenerationContext& context,
-        const CurveInitializationOptions& options =
-            CurveInitializationOptions()) const;
+    std::vector<CurveCandidate> build(const CurveGenerationContext& context,
+        const CurveInitializationOptions& options = CurveInitializationOptions()) const;
 };
 
 }  // 命名空间 isg
