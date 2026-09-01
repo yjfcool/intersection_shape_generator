@@ -7,6 +7,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include "utils/clipper.hpp"
 
 #include "utils/shapefile.hpp"
 
@@ -352,6 +353,54 @@ private:
         }
         pushUnique(out, pointAtStation(pts, s1));
         return out;
+    }
+
+    // 闭合 RoadEdge 链的两个缩扩命中点之间有两条拓扑弧。分别以各自
+    // 首尾弦线为基准，计算折线段中点向路口中心侧的带权偏移；选择凹向
+    // 路口内的一弧，不使用弧长作为业务判据。
+    std::vector<Vec3d> subInwardClosedPolylineByStation(
+        const std::vector<Vec3d>& pts, double s0, double s1,
+        const Vec2d& center) const {
+        const double total = polylineLength(pts);
+        if (pts.size() < 3 || total <= 1e-9 || dist(pts.front(), pts.back()) > 0.03)
+            return subPolylineByStation(pts, s0, s1);
+        s0 = std::max(0.0, std::min(total, s0));
+        s1 = std::max(0.0, std::min(total, s1));
+        if (s1 < s0)
+            std::swap(s0, s1);
+        std::vector<Vec3d> direct = subPolylineByStation(pts, s0, s1);
+        std::vector<Vec3d> wrapped = subPolylineByStation(pts, s1, total);
+        std::vector<Vec3d> head = subPolylineByStation(pts, 0.0, s0);
+        for (const auto& pt : head)
+            pushUnique(wrapped, pt);
+
+        auto inwardScore = [&](const std::vector<Vec3d>& arc) {
+            if (arc.size() < 2)
+                return -std::numeric_limits<double>::infinity();
+            Vec2d chord = xyOf(arc.back()) - xyOf(arc.front());
+            if (chord.norm() < 1e-9)
+                return -std::numeric_limits<double>::infinity();
+            chord.normalize();
+            double center_side = cross2d(chord, center - xyOf(arc.front()));
+            const bool center_on_chord = std::abs(center_side) < 1e-9;
+            const double side = center_side >= 0.0 ? 1.0 : -1.0;
+            double weighted_offset = 0.0;
+            double length = 0.0;
+            for (int i = 0; i + 1 < (int)arc.size(); ++i) {
+                const double segment_length = dist(arc[i], arc[i + 1]);
+                if (segment_length < 1e-9)
+                    continue;
+                const Vec2d midpoint = 0.5 * (xyOf(arc[i]) + xyOf(arc[i + 1]));
+                weighted_offset += (center_on_chord
+                    ? -dist(midpoint, center)
+                    : side * cross2d(chord, midpoint - xyOf(arc.front()))) * segment_length;
+                length += segment_length;
+            }
+            return length > 1e-9
+                ? weighted_offset / length
+                : -std::numeric_limits<double>::infinity();
+        };
+        return inwardScore(wrapped) > inwardScore(direct) ? wrapped : direct;
     }
 
     void pushUnique(std::vector<Vec3d>& out, const Vec3d& pt, double tol = 0.03) const {
@@ -1577,6 +1626,14 @@ private:
             std::vector<BoundaryHit> last_hits = boundaryHitsByBoundary(groupid,
                 last_probe, boundary_lines, cut.back(), group_dir, false, last_probe_offset);
             std::vector<SelectedBoundaryHit> selected_hits;
+            auto hitMatchesCurrentGroupEdge = [&](const BoundaryHit& hit) {
+                if (!hit.found || hit.boundary_index < 0 ||
+                    hit.boundary_index >= (int)boundary_lines.size() ||
+                    cut_index >= (int)cut_group_edge_ids.size())
+                    return false;
+                return boundaryMatchesSourceIds(
+                    boundary_lines[hit.boundary_index], cut_group_edge_ids[cut_index]);
+            };
             auto selectNearestHitForBoundary = [&](const BoundaryHit& hit, bool from_first_endpoint) {
                 if (!hit.found)
                     return;
@@ -1617,13 +1674,17 @@ private:
             };
             double first_trim_station = first_hit.cut_station;
             double last_trim_station = last_hit.cut_station;
-            if (first_hit.found &&
-                endpointSource(true) == AreaSourceKind::LaneEdge &&
-                first_hit.distance > 1.0)
+            // 当前组自己的 LaneEdge 既是缩扩点来源，又可能作为 RoadEdge
+            // 链参与对齐。命中这类同源边缘时，组切线已经在正确的端点
+            // 处生成，不能再被内部边缘的交点截短，否则会丢掉相邻车道
+            // 的连续缩扩折线（100000536 的 43112504 即此情形）。
+            if (first_hit.found && first_hit.distance > 1.0 &&
+                (endpointSource(true) == AreaSourceKind::LaneEdge ||
+                 hitMatchesCurrentGroupEdge(first_hit)))
                 first_trim_station = front_original_station;
-            if (last_hit.found &&
-                endpointSource(false) == AreaSourceKind::LaneEdge &&
-                last_hit.distance > 1.0)
+            if (last_hit.found && last_hit.distance > 1.0 &&
+                (endpointSource(false) == AreaSourceKind::LaneEdge ||
+                 hitMatchesCurrentGroupEdge(last_hit)))
                 last_trim_station = back_original_station;
             if (first_hit.found && last_hit.found) {
                 double s0 = std::min(first_trim_station, last_trim_station);
@@ -1635,7 +1696,15 @@ private:
                 cut = subPolylineByStation(extended, front_original_station, last_trim_station);
             }
             for (const auto& hit : selected_hits) {
-                if (boundaryHitMatchesGroupDir(hit.hit, group_dir)) {
+                // 首/尾探针包含“外延段 + 第一个原始 cut 线段”。当第二个
+                // cut 形点本身来自当前组 LaneEdge 时，会在离端点较远处
+                // 命中同源 RoadEdge。该命中只用于禁止 cut 被截短，不能再
+                // 写成 RoadEdge 裁剪 station，否则同一几何会以 cut 和
+                // RoadEdge 两种身份入环并形成折返副环。
+                const bool internal_same_group_hit =
+                    hit.hit.distance > 1.0 && hitMatchesCurrentGroupEdge(hit.hit);
+                if (!internal_same_group_hit &&
+                    boundaryHitMatchesGroupDir(hit.hit, group_dir)) {
                     addBoundaryHitStation(hit_stations, hit.hit, cut_index, cut_role);
                 }
             }
@@ -1679,11 +1748,16 @@ private:
                     cuts.push_back(s1);
                     std::sort(cuts.begin(), cuts.end());
                     std::vector<Vec3d> clipped;
-                    for (int k = 0; k + 1 < (int)cuts.size(); ++k) {
-                        std::vector<Vec3d> part = subPolylineByStation(
-                            boundary_lines[i].pts, cuts[k], cuts[k + 1]);
-                        for (const auto& pt : part)
-                            pushUnique(clipped, pt);
+                    if (cuts.size() == 2) {
+                        clipped = subInwardClosedPolylineByStation(
+                            boundary_lines[i].pts, cuts.front(), cuts.back(), center);
+                    } else {
+                        for (int k = 0; k + 1 < (int)cuts.size(); ++k) {
+                            std::vector<Vec3d> part = subPolylineByStation(
+                                boundary_lines[i].pts, cuts[k], cuts[k + 1]);
+                            for (const auto& pt : part)
+                                pushUnique(clipped, pt);
+                        }
                     }
                     result.boundary_lines.push_back(std::move(clipped));
                 }
@@ -1750,16 +1824,135 @@ private:
         int n = (int)ring.size();
         if (n < 4)
             return n >= 3;
+        auto onSegment = [](const Vec2d& a, const Vec2d& b, const Vec2d& p) {
+            return std::abs(cross2d(b - a, p - a)) <= 1e-8 &&
+                   p.x() >= std::min(a.x(), b.x()) - 1e-8 &&
+                   p.x() <= std::max(a.x(), b.x()) + 1e-8 &&
+                   p.y() >= std::min(a.y(), b.y()) - 1e-8 &&
+                   p.y() <= std::max(a.y(), b.y()) + 1e-8;
+        };
+        auto intersectsInclusive = [&](const Vec3d& a3, const Vec3d& b3,
+                                        const Vec3d& c3, const Vec3d& d3) {
+            const Vec2d a = xyOf(a3), b = xyOf(b3), c = xyOf(c3), d = xyOf(d3);
+            const Vec2d ab = b - a, cd = d - c;
+            const double o1 = cross2d(ab, c - a);
+            const double o2 = cross2d(ab, d - a);
+            const double o3 = cross2d(cd, a - c);
+            const double o4 = cross2d(cd, b - c);
+            auto opposite = [](double x, double y) {
+                return (x > 1e-8 && y < -1e-8) || (x < -1e-8 && y > 1e-8);
+            };
+            if (opposite(o1, o2) && opposite(o3, o4))
+                return true;
+            return (std::abs(o1) <= 1e-8 && onSegment(a, b, c)) ||
+                   (std::abs(o2) <= 1e-8 && onSegment(a, b, d)) ||
+                   (std::abs(o3) <= 1e-8 && onSegment(c, d, a)) ||
+                   (std::abs(o4) <= 1e-8 && onSegment(c, d, b));
+        };
         for (int i = 0; i < n; ++i) {
             for (int j = i + 2; j < n; ++j) {
                 if (i == 0 && j == n - 1)
                     continue;
-                if (segmentsIntersectStrict(ring[i], ring[(i + 1) % n],
-                                            ring[j], ring[(j + 1) % n]))
+                if (intersectsInclusive(ring[i], ring[(i + 1) % n],
+                                         ring[j], ring[(j + 1) % n]))
                     return false;
             }
         }
         return true;
+    }
+
+    // 将连接图产生的自接触环按偶奇规则拆成简单环。连接图中的人工闭合边
+    // 可能把一条端点折返 RoadEdge 围成一个很小的副环；直接返回原环会把
+    // 非相邻端点接触漏过。Clipper 只负责 XY 拆环，Z 从最近的原始点继承。
+    std::vector<Vec3d> simplifyNonSimpleRing(
+        const std::vector<Vec3d>& raw, const Vec2d& center) const {
+        const std::vector<Vec3d> ring = openRing(raw);
+        if (ring.size() < 3)
+            return {};
+        ClipperLib::Path path;
+        path.reserve(ring.size());
+        const double scale = 1e6;
+        for (const auto& p : ring)
+            path.emplace_back((ClipperLib::cInt)std::llround(p.x() * scale),
+                              (ClipperLib::cInt)std::llround(p.y() * scale));
+        ClipperLib::Paths split;
+        ClipperLib::SimplifyPolygon(path, split, ClipperLib::pftEvenOdd);
+        if (split.empty())
+            return {};
+
+        // 记录原始环中由非相邻边相碰形成的顶点。Clipper 拆环后这类
+        // 连接锚点可能仍留在外环上；它们只是自接触副环的分叉点，
+        // 不应继续作为路口面顶点输出。
+        std::vector<Vec2d> touch_vertices;
+        auto onSegment = [](const Vec2d& a, const Vec2d& b, const Vec2d& p) {
+            return std::abs(cross2d(b - a, p - a)) <= 1e-8 &&
+                   p.x() >= std::min(a.x(), b.x()) - 1e-8 &&
+                   p.x() <= std::max(a.x(), b.x()) + 1e-8 &&
+                   p.y() >= std::min(a.y(), b.y()) - 1e-8 &&
+                   p.y() <= std::max(a.y(), b.y()) + 1e-8;
+        };
+        for (int i = 0; i < (int)ring.size(); ++i) {
+            const Vec2d vertex = xyOf(ring[i]);
+            for (int j = i + 2; j < (int)ring.size(); ++j) {
+                if (i == 0 && j == (int)ring.size() - 1)
+                    continue;
+                const Vec2d other_vertex = xyOf(ring[j]);
+                if (onSegment(xyOf(ring[j]), xyOf(ring[(j + 1) % ring.size()]), vertex) ||
+                    onSegment(xyOf(ring[i]), xyOf(ring[(i + 1) % ring.size()]), other_vertex)) {
+                    touch_vertices.push_back(vertex);
+                    if (dist(other_vertex, xyOf(ring[i])) > 1e-8 &&
+                        dist(other_vertex, xyOf(ring[(i + 1) % ring.size()])) > 1e-8)
+                        touch_vertices.push_back(other_vertex);
+                    break;
+                }
+            }
+        }
+
+        int selected = -1;
+        double selected_area = -1.0;
+        const ClipperLib::IntPoint center_i(
+            (ClipperLib::cInt)std::llround(center.x() * scale),
+            (ClipperLib::cInt)std::llround(center.y() * scale));
+        for (int i = 0; i < (int)split.size(); ++i) {
+            const double area = std::abs(ClipperLib::Area(split[i]));
+            const bool contains = ClipperLib::PointInPolygon(center_i, split[i]) != 0;
+            const bool selected_contains = selected >= 0 &&
+                ClipperLib::PointInPolygon(center_i, split[selected]) != 0;
+            if (selected < 0 ||
+                (contains && !selected_contains) ||
+                (contains == selected_contains && area > selected_area)) {
+                selected = i;
+                selected_area = area;
+            }
+        }
+        if (selected < 0 || split[selected].size() < 3)
+            return {};
+
+        std::vector<Vec3d> result;
+        result.reserve(split[selected].size() + 1);
+        for (const auto& ip : split[selected]) {
+            const Vec2d xy(ip.X / scale, ip.Y / scale);
+            bool is_touch_vertex = false;
+            for (const auto& touch : touch_vertices) {
+                if (dist(touch, xy) <= 1e-6) {
+                    is_touch_vertex = true;
+                    break;
+                }
+            }
+            if (is_touch_vertex)
+                continue;
+            int nearest = 0;
+            double nearest_d = 1e18;
+            for (int i = 0; i < (int)ring.size(); ++i) {
+                const double d = dist(ring[i], xy);
+                if (d < nearest_d) {
+                    nearest_d = d;
+                    nearest = i;
+                }
+            }
+            result.emplace_back(xy, ring[nearest].z());
+        }
+        return repairPolygon(result, center);
     }
 
     struct RingCandidate {
@@ -2145,6 +2338,12 @@ private:
             parts.boundary_lines, parts.cut_lines, center, prefer_center_containment);
         std::vector<Vec3d> angular = buildPolygonByAngularChains(
             parts.boundary_lines, parts.cut_lines, center);
+        // 先按包含非相邻端点接触的严格口径验环。历史连接图在人工闭合边
+        // 参与时可能生成自接触环；仅在候选不简单时拆分，避免改变正常凹环。
+        if (!isSimpleRing(connected))
+            connected = simplifyNonSimpleRing(connected, center);
+        if (!isSimpleRing(angular))
+            angular = simplifyNonSimpleRing(angular, center);
         if (connected.size() >= 4 && angular.size() >= 4 && isSimpleRing(angular)) {
             int connected_boundary_count = usedBoundarySegmentCount(connected, parts.boundary_lines);
             int angular_boundary_count = usedBoundarySegmentCount(angular, parts.boundary_lines);

@@ -2206,6 +2206,117 @@ TEST_CASE("110000741-u fine area does not use far lane-edge orientation endpoint
                                     Vec2d(-71.773072630, 10.994317701), 0.08));
 }
 
+TEST_CASE("100000536 fine area remains simple and preserves the complete group cut",
+          "[regression][area][100000536]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000536.json";
+    IntersectionInput input = loadInputOrSkip(path);
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+    REQUIRE_FALSE(output.area.geometry.outer.empty());
+    INFO("The generated fine area must reject the non-adjacent endpoint touch near "
+         "(4.914,-8.482).");
+    CHECK(isSimplePolygon(output.area.geometry));
+
+    const std::vector<Vec2d> expected_group_cut = {
+        Vec2d(2.554057415, -7.546168668), // 43113994 tail
+        Vec2d(4.487086314, -8.255476890), // 43111812 tail
+        Vec2d(4.912182688, -8.403150781)  // 43111792 tail
+    };
+    const std::vector<Vec2d> polygon_xy = toVec2dArray(output.area.geometry.outer);
+    for (const auto& expected : expected_group_cut) {
+        INFO("the complete 43112504 group cut must stay on the area outline, expected="
+             << expected.transpose());
+        CHECK(pointToPolyline(expected, polygon_xy) <= 0.12);
+    }
+
+    const Vec2d remote_43111792(2.900809791, -13.385279093);
+    INFO("the remote first endpoint of RoadEdge 43111792 must not become an area vertex");
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, remote_43111792, 0.08));
+}
+
+TEST_CASE("100000547 fine area preserves local RoadEdge chain shapes",
+          "[regression][area][road-edge-chain][100000547]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000547.json";
+    IntersectionInput input = loadInputOrSkip(path);
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(gen.generate(input, output));
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    INFO("100000547 generation elapsed_ms=" << elapsed_ms);
+    INFO("100000547 area generation elapsed_ms=" << output.perf.area_gen_ms);
+    REQUIRE(output.perf.area_gen_ms < 1000.0);
+    REQUIRE_FALSE(output.area.geometry.outer.empty());
+    REQUIRE(isSimplePolygon(output.area.geometry));
+
+    for (const auto& id : std::vector<std::string>{"43111758", "43111759", "43111786"}) {
+        const Boundary* edge = findBoundary(input, id);
+        REQUIRE(edge);
+        INFO("the local RoadEdge shape must be retained, id=" << id);
+        CHECK(polygonUsesBoundarySegment(output.area.geometry.outer, *edge));
+        for (const auto& shape_point : edge->geometry.points)
+            CHECK(hasPolygonPointNear(output.area.geometry.outer, shape_point, 0.08));
+    }
+
+    for (const auto& id : std::vector<std::string>{
+             "43111824", "43111912", "43111950", "43111787"}) {
+        const Boundary* edge = findBoundary(input, id);
+        REQUIRE(edge);
+        INFO("the cut-adjacent part of the connected RoadEdge must be retained, id=" << id);
+        CHECK(polygonUsesBoundarySegment(output.area.geometry.outer, *edge, 0.08, 0.03));
+    }
+
+    for (const auto& id : std::vector<std::string>{
+             "43111824", "43111912", "43111950", "43111787"}) {
+        const Boundary* edge = findBoundary(input, id);
+        REQUIRE(edge);
+        const Vec3d& remote = dist(edge->geometry.points.front(), outputCenter(output)) >
+                dist(edge->geometry.points.back(), outputCenter(output))
+            ? edge->geometry.points.front() : edge->geometry.points.back();
+        INFO("the remote road endpoint must remain outside the fine area, id=" << id);
+        CHECK_FALSE(hasPolygonPointNear(output.area.geometry.outer, remote, 0.08));
+    }
+
+    Boundary* edge11950 = nullptr;
+    Boundary* edge11787 = nullptr;
+    for (auto& boundary : input.boundaries) {
+        if (boundary.id == "43111950")
+            edge11950 = &boundary;
+        else if (boundary.id == "43111787")
+            edge11787 = &boundary;
+    }
+    REQUIRE(edge11950);
+    REQUIRE(edge11787);
+    REQUIRE(edge11950->geometry.points.size() >= 2);
+    REQUIRE(edge11787->geometry.points.size() >= 2);
+
+    // 把外凸弧压缩到比 43111786 更短，确保裁决依据是“凹向路口内”
+    // 而非最短路径。两条边的原始方向和与 43111786 的连接端保持不变。
+    const Vec3d outer_tip(-7.15, -1.82, edge11950->geometry.points.front().z());
+    const Vec3d edge11950_inner = edge11950->geometry.points.back();
+    const Vec3d edge11787_inner = edge11787->geometry.points.front();
+    edge11950->geometry.points = {outer_tip, edge11950_inner};
+    edge11787->geometry.points = {edge11787_inner, outer_tip};
+
+    const Boundary* edge11786 = findBoundary(input, "43111786");
+    REQUIRE(edge11786);
+    const double outer_arc_length =
+        dist(edge11950_inner, outer_tip) + dist(outer_tip, edge11787_inner);
+    REQUIRE(outer_arc_length < boundaryLengthForTest(*edge11786));
+
+    IntersectionAreaBuilder builder(intersectionAreaExtendDistance(input.mode), 4.0);
+    IntersectionArea synthetic_area = builder.build(input, output.connectivity_curves, {});
+    REQUIRE(isSimplePolygon(synthetic_area.geometry));
+    CHECK(polygonUsesBoundarySegment(synthetic_area.geometry.outer, *edge11786));
+    for (const auto& shape_point : edge11786->geometry.points)
+        CHECK(hasPolygonPointNear(synthetic_area.geometry.outer, shape_point, 0.08));
+    CHECK_FALSE(hasPolygonPointNear(synthetic_area.geometry.outer, outer_tip, 1e-6));
+}
+
 TEST_CASE("100000610 fine area clips merged RoadEdges toward the intersection",
           "[regression][area][shared-edge][100000610]") {
     const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000610.json";
@@ -2239,16 +2350,18 @@ TEST_CASE("100000610 fine area clips merged RoadEdges toward the intersection",
         input, "43120543", GroupRole::Entry, center, 0.05);
     Vec2d edge43_exit = expectedLaneEdgeCutPoint(
         input, "43120543", GroupRole::Exit, center, 0.05);
-    INFO("shared LaneEdge 43120543 keeps only its entry-direction cut");
+    INFO("shared LaneEdge 43120543 entry and exit roles resolve to the same "
+         "physical cut point");
+    CHECK(dist(edge43_entry, edge43_exit) <= 1e-8);
     CHECK(hasPolygonPointNear(output.area.geometry.outer, edge43_entry, 0.08));
-    CHECK_FALSE(hasPolygonPointNear(output.area.geometry.outer, edge43_exit, 0.08));
 
     Vec2d edge95_entry = expectedLaneEdgeCutPoint(
         input, "43120595", GroupRole::Entry, center, 0.05);
     Vec2d edge95_exit = expectedLaneEdgeCutPoint(
         input, "43120595", GroupRole::Exit, center, 0.05);
-    INFO("shared LaneEdge 43120595 keeps only its exit-direction cut");
-    CHECK_FALSE(hasPolygonPointNear(output.area.geometry.outer, edge95_entry, 0.08));
+    INFO("shared LaneEdge 43120595 entry and exit roles resolve to the same "
+         "physical cut point");
+    CHECK(dist(edge95_entry, edge95_exit) <= 1e-8);
     CHECK(hasPolygonPointNear(output.area.geometry.outer, edge95_exit, 0.08));
 }
 
@@ -2311,51 +2424,51 @@ TEST_CASE("110002137 exit group road edge uses only the cut-line valid span",
     const Boundary* edge1006810 = findBoundary(input, "1006810");
     REQUIRE(edge1006810);
     REQUIRE(edge1006810->geometry.points.size() >= 4);
-    CHECK(polygonUsesBoundarySegment(output.area.geometry.outer, *edge1006810));
+    CHECK(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *edge1006810, 0.08, 0.03));
 
     Vec2d center = outputCenter(output);
+    const double group_cut_offset = intersectionAreaExtendDistance(input.mode);
     Vec2d duplicate_edge_cut = expectedLaneEdgeCutPoint(
-        input, "1006810", GroupRole::Exit, center);
+        input, "1006810", GroupRole::Exit, center, group_cut_offset);
     INFO("LaneEdge 1006810 must still create its own group cut point even when "
          "a RoadEdge has the same id "
          << duplicate_edge_cut.transpose());
     CHECK(hasPolygonPointNear(output.area.geometry.outer, duplicate_edge_cut, 0.08));
 
     Vec2d duplicate_lane_cut = expectedLaneCutPoint(
-        input, output, "1011002", GroupRole::Exit, center);
+        input, output, "1011002", GroupRole::Exit, center, group_cut_offset);
     INFO("Lane 1011002 and LaneEdge 1006810 belong to different source categories; "
          "the lane cut point must not be filtered by laneedge geometry "
          << duplicate_lane_cut.transpose());
     CHECK(hasPolygonPointNear(output.area.geometry.outer, duplicate_lane_cut, 0.08));
 
     Vec2d mode2_entry_edge_cut = expectedLaneEdgeCutPoint(
-        input, "1006892", GroupRole::Entry, center);
+        input, "1006892", GroupRole::Entry, center, group_cut_offset);
     INFO("Mode=2 entry LaneEdge 1006892 should expand from its tail tangent, "
          "not from the flipped tail extension "
          << mode2_entry_edge_cut.transpose());
     CHECK(hasPolygonPointNear(output.area.geometry.outer, mode2_entry_edge_cut, 0.08));
-    CHECK(dist(mode2_entry_edge_cut, Vec2d(-16.4858, 29.1412)) < 0.40);
+    CHECK(dist(mode2_entry_edge_cut, Vec2d(-16.8480, 29.0229)) < 0.08);
     CHECK_FALSE(hasPolygonPointNear(
         output.area.geometry.outer, Vec2d(-17.3919, 29.1048), 0.08));
 
     Vec2d shared_entry_edge_cut = expectedLaneEdgeCutPoint(
-        input, "1005432", GroupRole::Entry, center);
+        input, "1005432", GroupRole::Entry, center, group_cut_offset);
     Vec2d shared_exit_edge_cut = expectedLaneEdgeCutPoint(
-        input, "1005432", GroupRole::Exit, center);
-    INFO("Shared LaneEdge 1005432 should keep the cut point whose vectorized "
-         "direction matches the group direction " << shared_entry_edge_cut.transpose());
+        input, "1005432", GroupRole::Exit, center, group_cut_offset);
+    INFO("Shared LaneEdge 1005432 entry and exit roles resolve to the same "
+         "physical cut point " << shared_entry_edge_cut.transpose());
+    CHECK(dist(shared_entry_edge_cut, shared_exit_edge_cut) <= 1e-8);
     CHECK(hasPolygonPointNear(output.area.geometry.outer, shared_entry_edge_cut, 0.08));
-    INFO("Shared LaneEdge 1005432 should ignore the opposite-direction exit cut "
-         << shared_exit_edge_cut.transpose());
-    CHECK_FALSE(hasPolygonPointNear(output.area.geometry.outer, shared_exit_edge_cut, 0.08));
 
     INFO("LaneEdge 1006810 exit cut point should stay on the edge near its start "
          << duplicate_edge_cut.transpose());
-    CHECK(dist(duplicate_edge_cut, Vec2d(1.3339, -24.7504)) < 0.40);
+    CHECK(dist(duplicate_edge_cut, Vec2d(0.9616, -25.0030)) < 0.08);
 
     Vec2d old_tail_extension_cut =
         xyOf(edge1006810->geometry.points.back()) +
-        0.5 * modeShiftDirForTest(
+        group_cut_offset * modeShiftDirForTest(
             GroupRole::Exit,
             centerSideEndpointDirForTest(edge1006810->geometry.points, GroupRole::Exit, center),
             input.mode);
