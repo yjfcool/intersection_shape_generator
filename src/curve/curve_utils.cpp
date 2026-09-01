@@ -4,6 +4,8 @@
 #include "utils.h"
 #include <cmath>
 #include <algorithm>
+#include <limits>
+#include <vector>
 
 namespace isg {
 
@@ -264,6 +266,13 @@ std::vector<Vec2d> curveCrossings(const BezierCurve& a, const BezierCurve& b, do
 }
 
 bool curvesIntersectBusiness(const BezierCurve& a, const BezierCurve& b, double ep) {
+    return curvesIntersectBusinessOutsideBalls(a, b, ep, std::vector<Vec2d>(), 0.0);
+}
+
+bool curvesIntersectBusinessOutsideBalls(const BezierCurve& a,
+                                        const BezierCurve& b, double ep,
+                                        const std::vector<Vec2d>& centers,
+                                        double radius) {
     if (!bboxOverlap(a, b))
         return false;
     auto adaptiveSample = [](const BezierCurve& c) {
@@ -278,7 +287,16 @@ bool curvesIntersectBusiness(const BezierCurve& a, const BezierCurve& b, double 
             Vec2d isect;
             if (!segmentsIntersect(pa[i], pa[i + 1], pb[j], pb[j + 1], &isect))
                 continue;
-            if (distToAllEndpoints(isect, a, b) > ep)
+            if (distToAllEndpoints(isect, a, b) <= ep)
+                continue;
+            bool in_ball = false;
+            for (const Vec2d& c : centers) {
+                if ((isect - c).norm() <= radius) {
+                    in_ball = true;
+                    break;
+                }
+            }
+            if (!in_ball)
                 return true;
         }
     }
@@ -410,6 +428,184 @@ bool ordinarySingleCubicControlsValid(
     return start_lateral <= tol && end_lateral <= tol &&
            lambda >= 0.05 - tol && lambda <= bounds.start_max + tol &&
            mu >= 0.05 - tol && mu <= bounds.end_max + tol;
+}
+
+bool sharedEndpointMidControlSegmentsCross(
+    const BezierCurve& a, const BezierCurve& b) {
+    if (a.numSegments() != 1 || b.numSegments() != 1)
+        return false;
+    const std::array<Vec2d, 4>& ga = a.segs.front().ctrl;
+    const std::array<Vec2d, 4>& gb = b.segs.front().ctrl;
+    return segmentsIntersect(ga[1], ga[2], gb[1], gb[2]);
+}
+
+bool sharedEndpointControlPolylinesCross(
+    const BezierCurve& a, const BezierCurve& b, double ctrl_tol) {
+    if (a.numSegments() != 1 || b.numSegments() != 1)
+        return false;
+    const std::array<Vec2d, 4>& ga = a.segs.front().ctrl;
+    const std::array<Vec2d, 4>& gb = b.segs.front().ctrl;
+    const double tol = std::max(1e-9, ctrl_tol);
+    for (int i = 0; i + 1 < 4; ++i) {
+        for (int j = 0; j + 1 < 4; ++j) {
+            Vec2d r = ga[i + 1] - ga[i];
+            Vec2d s = gb[j + 1] - gb[j];
+            const double rn = r.norm(), sn = s.norm();
+            // 退化把手（控制点重合）不构成折线段。
+            if (rn < tol || sn < tol)
+                continue;
+            // 共线/平行视为重合接触，不算违约：共享端点侧的首把手沿同一
+            // 切向天然共线重叠。
+            if (std::abs(cross2d(r, s)) <= 1e-9 * rn * sn)
+                continue;
+            Vec2d ipt;
+            if (!segmentsIntersect(ga[i], ga[i + 1], gb[j], gb[j + 1], &ipt))
+                continue;
+            // 落在任一控制点邻域内的相接是合法的（共享端点即属此类）。
+            bool at_control_point = false;
+            for (int k = 0; k < 4 && !at_control_point; ++k) {
+                if ((ipt - ga[k]).norm() <= tol || (ipt - gb[k]).norm() <= tol)
+                    at_control_point = true;
+            }
+            if (at_control_point)
+                continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+double singleCubicSignedEndCurvature(const BezierCurve& c, bool at_start) {
+    if (c.empty())
+        return 0.0;
+    const std::array<Vec2d, 4>& g = at_start
+        ? c.segs.front().ctrl : c.segs.back().ctrl;
+    // 端点处的有符号曲率 kappa = 2/3 * cross(d1, d2) / |d1|^3，
+    // 其中 d1 是端点方向的把手向量，d2 是相邻的控制点差向量。
+    // 尾端点侧把方向整体反向（沿曲线倒序看），叉积随之取反，
+    // 保证"值越大越偏向该端点切向的左侧"这一语义在两端一致。
+    const Vec2d d1 = at_start ? (g[1] - g[0]) : (g[2] - g[3]);
+    const Vec2d d2 = at_start ? (g[2] - g[1]) : (g[1] - g[2]);
+    const double h = d1.norm();
+    if (h < 1e-9)
+        return 0.0;
+    return (2.0 / 3.0) * cross2d(d1, d2) / (h * h * h);
+}
+
+namespace {
+
+// 采样折线上点到另一条折线的最近距离。
+double distToPolyline(const Vec2d& p, const std::vector<Vec2d>& poly) {
+    double best = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1 < poly.size(); ++i) {
+        const Vec2d ab = poly[i + 1] - poly[i];
+        const double len2 = ab.squaredNorm();
+        double t = len2 > 1e-18 ? (p - poly[i]).dot(ab) / len2 : 0.0;
+        t = std::max(0.0, std::min(1.0, t));
+        best = std::min(best, (p - (poly[i] + t * ab)).norm());
+    }
+    return best;
+}
+
+// 自 `poly` 的一端（`from_start` 决定哪一端）沿弧长前进，累计"到 other 的距离
+// 始终 < band"的长度；一旦超出 band 立即停止并返回已累计长度（截断到 cap）。
+double funnelRunFrom(const std::vector<Vec2d>& poly,
+                     const std::vector<Vec2d>& other,
+                     bool from_start, double band, double cap) {
+    double run = 0.0;
+    const std::size_t n = poly.size();
+    for (std::size_t k = 0; k + 1 < n; ++k) {
+        const std::size_t i = from_start ? k : n - 1 - k;
+        const std::size_t j = from_start ? k + 1 : n - 2 - k;
+        if (distToPolyline(poly[j], other) >= band)
+            break;
+        run += (poly[j] - poly[i]).norm();
+        if (run >= cap)
+            return cap;
+    }
+    return run;
+}
+
+}  // namespace
+
+std::vector<Vec2d> sharedEndpointsOf(const BezierCurve& a, const BezierCurve& b,
+                                     double endpoint_tol) {
+    std::vector<Vec2d> shared;
+    if (a.empty() || b.empty())
+        return shared;
+    const Vec2d ends_a[2] = {a.startPt(), a.endPt()};
+    const Vec2d ends_b[2] = {b.startPt(), b.endPt()};
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            if ((ends_a[i] - ends_b[j]).norm() > endpoint_tol)
+                continue;
+            const Vec2d mid = 0.5 * (ends_a[i] + ends_b[j]);
+            bool dup = false;
+            for (const Vec2d& s : shared)
+                if ((s - mid).norm() <= endpoint_tol)
+                    dup = true;
+            if (!dup)
+                shared.push_back(mid);
+        }
+    }
+    return shared;
+}
+
+double sharedEndpointMergeFunnelRadius(const BezierCurve& a,
+                                       const BezierCurve& b,
+                                       double band, double cap,
+                                       double endpoint_tol) {
+    if (a.empty() || b.empty() || band <= 0.0 || cap <= 0.0)
+        return 0.0;
+    const int n = 128;
+    const std::vector<Vec2d> pa = a.sample(n);
+    const std::vector<Vec2d> pb = b.sample(n);
+    if (pa.size() < 2 || pb.size() < 2)
+        return 0.0;
+    double radius = 0.0;
+    for (int ia = 0; ia < 2; ++ia) {
+        const bool a_start = ia == 0;
+        const Vec2d ea = a_start ? a.startPt() : a.endPt();
+        for (int ib = 0; ib < 2; ++ib) {
+            const bool b_start = ib == 0;
+            const Vec2d eb = b_start ? b.startPt() : b.endPt();
+            if ((ea - eb).norm() > endpoint_tol)
+                continue;
+            // 两条曲线各自的收敛段取小：任一条先离开贴近带，收敛段即结束。
+            const double run = std::min(
+                funnelRunFrom(pa, pb, a_start, band, cap),
+                funnelRunFrom(pb, pa, b_start, band, cap));
+            radius = std::max(radius, run);
+        }
+    }
+    return radius;
+}
+
+double curveTurningSpan(const BezierCurve& curve, int samples_per_seg) {
+    if (curve.empty() || samples_per_seg < 1)
+        return 0.0;
+    std::vector<Vec2d> tans;
+    tans.reserve(curve.segs.size() * (size_t)(samples_per_seg + 1));
+    for (const auto& seg : curve.segs)
+        for (int i = 0; i <= samples_per_seg; ++i) {
+            Vec2d d = seg.evalDeriv1((double)i / (double)samples_per_seg);
+            if (d.norm() > 1e-9)
+                tans.push_back(d.normalized());
+        }
+    if (tans.size() < 2)
+        return 0.0;
+    // running 有符号累加，跨度取 max-min：同向连续绕转会把两端拉开，
+    // S 形的两段反向弯则互相抵消，只剩较大的单侧弯角。
+    double running = 0.0;
+    double lo = 0.0;
+    double hi = 0.0;
+    for (size_t i = 1; i < tans.size(); ++i) {
+        running += std::atan2(
+            cross2d(tans[i - 1], tans[i]), tans[i - 1].dot(tans[i]));
+        lo = std::min(lo, running);
+        hi = std::max(hi, running);
+    }
+    return hi - lo;
 }
 
 }

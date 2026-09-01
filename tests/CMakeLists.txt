@@ -58,3 +58,55 @@ target_include_directories(diag_pair_isect PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_executable(diag_focus diag_focus.cpp)
 target_link_libraries(diag_focus PRIVATE intersection_gen_lib)
 target_include_directories(diag_focus PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_handle_order diag_handle_order.cpp)
+target_link_libraries(diag_handle_order PRIVATE intersection_gen_lib)
+target_include_directories(diag_handle_order PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_all_violations diag_all_violations.cpp)
+target_link_libraries(diag_all_violations PRIVATE intersection_gen_lib)
+target_include_directories(diag_all_violations PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_uturn_leads diag_uturn_leads.cpp)
+target_link_libraries(diag_uturn_leads PRIVATE intersection_gen_lib)
+target_include_directories(diag_uturn_leads PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_family_ladder diag_family_ladder.cpp)
+target_link_libraries(diag_family_ladder PRIVATE intersection_gen_lib)
+target_include_directories(diag_family_ladder PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_pair_cross diag_pair_cross.cpp)
+target_link_libraries(diag_pair_cross PRIVATE intersection_gen_lib)
+target_include_directories(diag_pair_cross PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_fanout_order diag_fanout_order.cpp)
+target_link_libraries(diag_fanout_order PRIVATE intersection_gen_lib)
+target_include_directories(diag_fanout_order PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_fan_natural diag_fan_natural.cpp)
+target_link_libraries(diag_fan_natural PRIVATE intersection_gen_lib)
+target_include_directories(diag_fan_natural PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_fan_shape_space diag_fan_shape_space.cpp)
+target_link_libraries(diag_fan_shape_space PRIVATE intersection_gen_lib)
+target_include_directories(diag_fan_shape_space PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_gen_time diag_gen_time.cpp)
+target_link_libraries(diag_gen_time PRIVATE intersection_gen_lib)
+target_include_directories(diag_gen_time PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_uturn_nesting diag_uturn_nesting.cpp)
+target_link_libraries(diag_uturn_nesting PRIVATE intersection_gen_lib)
+target_include_directories(diag_uturn_nesting PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_uturn_candidate_cross diag_uturn_candidate_cross.cpp)
+target_link_libraries(diag_uturn_candidate_cross PRIVATE intersection_gen_lib)
+target_include_directories(diag_uturn_candidate_cross PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_single_cubic diag_single_cubic.cpp)
+target_link_libraries(diag_single_cubic PRIVATE intersection_gen_lib)
+target_include_directories(diag_single_cubic PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_turning_excess diag_turning_excess.cpp)
+target_link_libraries(diag_turning_excess PRIVATE intersection_gen_lib)
+target_include_directories(diag_turning_excess PRIVATE ${CMAKE_SOURCE_DIR}/src)

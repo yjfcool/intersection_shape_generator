@@ -1,0 +1,15 @@
+# 焦点用例清单：逐条单跑的高价值回归用例（tools/test_report.py --stages focus 使用）。
+#
+# 格式：<测试可执行文件名>|<Catch2 用例名>
+#   - 以 # 开头的行与空行忽略；用例名按 Catch2 精确匹配，允许包含空格。
+#   - 单跑的意义：这些用例内部断言多、耗时长，混在整套里失败原因不易定位；
+#     单跑后每条用例单独产出一份 XML，报表里可看到断言级别的失败明细。
+#
+# 名单来源：docs/WORK_LOG.md「专项焦点用例」小节。新增焦点用例请同步更新该文档。
+
+test_intersection_input_regression|110000703-u left turns keep single arch shape
+test_intersection_input_regression|structural merge-funnel exemption stays scoped to inverted corridors
+test_intersection_input_regression|intersection_cross U-turns 39 and 40 keep straight-arc-straight shape
+test_intersection_input_regression|100000412 U-turn family lateral ladder is monotone per shared endpoint
+test_intersection_input_regression|100000643 keeps same-cluster U-turn family non-intersecting
+test_intersection_input_regression|110003449 keeps straight 12 natural and crosswalk U-turns segmented

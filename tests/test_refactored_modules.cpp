@@ -4,6 +4,7 @@
 #include "constraints/uturn_envelope_constraint.h"
 #include "curve/bezier.h"
 #include "curve/curve_utils.h"
+#include "utils.h"
 #include "domain/scene_view.h"
 #include "io/iodata_json.h"
 #include "initialization/fixed_shape_initializer.h"
@@ -197,6 +198,72 @@ TEST_CASE("UTurnCurveInitializer builds aligned and segmented shapes") {
     REQUIRE(segmented.segs.back().ctrl[3].isApprox(p1));
     REQUIRE(segmented.segs.front().ctrl[3].y() > p0.y());
     REQUIRE(segmented.segs.back().ctrl[0].y() > p1.y());
+}
+
+TEST_CASE("UTurnCurveInitializer keeps a narrow U-turn shape usable after minimum leads") {
+    // 0.24m 横向间隙的极窄调头：首尾必须先拉满 2m 直段，中弧只能在这条
+    // 0.24m 走廊里完成反向。此时"圆整"不是硬门禁——候选搜索的圆整判定
+    // 只在 chord_len >= 1.0 时启用(segmented_uturn_candidate_search.cpp)，
+    // 因为 segmentedUTurnMiddleArcLooksRound 的凸出量下限含 0.25m 绝对项，
+    // 而中弧凸出量是 0.75 * arc_alpha * gap，gap=0.24 时默认把手比例
+    // 2/3 只能凸出 0.12m，先验地不可能达标。窄间隙下真正的硬门禁是
+    // 段数、最小直段、自交与曲率上限。
+    const isg::Vec2d p0(0, 0);
+    const isg::Vec2d t0(0, 1);
+    const isg::Vec2d p1(0.24, 0);
+    const isg::Vec2d t1(0, -1);
+    const isg::UTurnCurveInitializer initializer;
+    const isg::BezierCurve curve = initializer.buildSegmented(p0, t0, p1, t1,
+                                                              2.0, 2.0);
+
+    REQUIRE(curve.numSegments() == 3);
+    CHECK(isg::segmentedUTurnHasMinimumStraightLeads(curve, 2.0, 2.0));
+    CHECK((curve.segs.front().ctrl[3] - curve.segs.front().ctrl[0]).norm() >= 2.0);
+    CHECK((curve.segs.back().ctrl[3] - curve.segs.back().ctrl[0]).norm() >= 2.0);
+    CHECK_FALSE(isg::curveSelfIntersectsBusiness(curve, 1.0));
+    CHECK(curve.maxCurvature(40) < isg::segmentedUTurnMaxCurvatureLimit(
+        p0, t0, p1, t1));
+
+    // 圆整仍然是可达的，只是需要调用方把把手比例调大——候选搜索的
+    // arc_alphas 一直枚举到 2.0，正是为窄间隙准备的档位。
+    const isg::BezierCurve round_curve = initializer.buildSegmented(
+        p0, t0, p1, t1, 2.0, 2.0, 2.0);
+    REQUIRE(round_curve.numSegments() == 3);
+    CHECK(isg::segmentedUTurnMiddleArcLooksRound(round_curve, isg::Vec2d(0, 1)));
+    CHECK(isg::segmentedUTurnHasMinimumStraightLeads(round_curve, 2.0, 2.0));
+}
+
+TEST_CASE("UTurnCurveInitializer keeps minimum straight leads under lateral stagger") {
+    // 首尾平齐点的横向错开沿 U 轴法线平移 q0/q1。切向与 U 轴不平行时，这个
+    // 平移会在 -T 方向留下分量，把"最小直行段"的弦长读数压到 min_lead 之下，
+    // 而轴向站位不变——于是候选搜索的最小直段门禁与家族平齐站位门禁互斥，
+    // 三段式候选集被夹空，几何 U 型调头退化成跨不过人行横道的单段曲线。
+    // buildSegmented 必须按错开量补偿 lead，使弦长读数重新达到 min_lead。
+    const isg::UTurnCurveInitializer initializer;
+    const isg::Vec2d p0(0.0, 0.0);
+    const isg::Vec2d t0 = isg::Vec2d(1.0, -1.0).normalized();
+    const isg::Vec2d p1(2.3, 2.3);
+    // 出口切向与进入切向不严格反平行（真实路口的常态）：此时 U 轴是两者的
+    // 角平分线，横向错开不再垂直于 T0，才会出现毫米级的弦长亏损。
+    const isg::Vec2d t1 = isg::Vec2d(-1.05, 1.0).normalized();
+    const double min_lead = 7.93;
+
+    for (double stagger : {0.02, 0.10, 0.30}) {
+        const isg::BezierCurve curve = initializer.buildSegmented(
+            p0, t0, p1, t1, min_lead, min_lead, 2.0 / 3.0, stagger,
+            0.0, 0.0, stagger, stagger);
+        REQUIRE(curve.numSegments() == 3);
+        // 严格容差下的最小直段门禁：与候选搜索使用的判定完全一致。
+        CHECK(isg::segmentedUTurnHasMinimumStraightLeads(
+            curve, min_lead, min_lead));
+        // 补偿只沿切向加长，轴向站位仍须保持 q0/q1 平齐。
+        isg::Vec2d axis = t0 - t1;
+        axis.normalize();
+        const isg::Vec2d q0 = curve.segs.front().ctrl[3];
+        const isg::Vec2d q1 = curve.segs.back().ctrl[0];
+        CHECK(std::abs(q0.dot(axis) - q1.dot(axis)) < 0.05);
+        CHECK_FALSE(isg::curveSelfIntersectsBusiness(curve, 1.0));
+    }
 }
 
 TEST_CASE("AvoidanceCandidateGenerator builds waypoint curves with endpoint G1") {
@@ -1249,4 +1316,59 @@ TEST_CASE("SegmentedUTurnCandidateSearch delegates hard audits") {
     REQUIRE(curve.numSegments() == 3);
     REQUIRE(curve.startTan().normalized().dot(t0) > 0.99);
     REQUIRE(curve.endTan().normalized().dot(t1) > 0.99);
+}
+
+TEST_CASE("singleCubicSignedEndCurvature orders a shared-endpoint fan-out") {
+    // 共享端点与共享端点切向的一族单段三次曲线，其端点邻域左右次序完全由
+    // 有符号端点曲率决定；本例验证符号语义、闭式解和"h0 单调不足以定序"。
+    const isg::Vec2d p0(0, 0);
+    const isg::Vec2d t0(1, 0);
+    const isg::Vec2d p1(20, 10);       // 远端在进入切向左侧
+    const isg::Vec2d t1 = isg::Vec2d(1, 1).normalized();
+    auto make = [&](double h0, double h1) {
+        isg::BezierSegment seg;
+        seg.ctrl[0] = p0;
+        seg.ctrl[1] = p0 + t0 * h0;
+        seg.ctrl[2] = p1 - t1 * h1;
+        seg.ctrl[3] = p1;
+        isg::BezierCurve c;
+        c.segs.push_back(seg);
+        return c;
+    };
+    // 左偏的曲线转入率为正，直线为零。
+    REQUIRE(isg::singleCubicSignedEndCurvature(make(6.0, 6.0), true) > 0.0);
+    const isg::Vec2d chord = p1 - p0;
+    isg::BezierSegment line;
+    line.ctrl[0] = p0;
+    line.ctrl[1] = p0 + 0.25 * chord;
+    line.ctrl[2] = p0 + 0.75 * chord;
+    line.ctrl[3] = p1;
+    isg::BezierCurve straight;
+    straight.segs.push_back(line);
+    REQUIRE(std::abs(isg::singleCubicSignedEndCurvature(straight, true)) < 1e-12);
+
+    // 闭式解 kappa0 = (2/3)*(cross(T0,chord) - h1*cross(T0,T1)) / h0^2。
+    const double h0 = 5.0, h1 = 7.0;
+    const double expected = (2.0 / 3.0) *
+        (isg::cross2d(t0, chord) - h1 * isg::cross2d(t0, t1)) / (h0 * h0);
+    REQUIRE(std::abs(isg::singleCubicSignedEndCurvature(make(h0, h1), true) -
+                     expected) < 1e-9);
+
+    // 尾把手相同时，共享侧把手 h0 单调即可定序（h0 越短转入越急）。
+    const double ka = isg::singleCubicSignedEndCurvature(make(5.0, 2.0), true);
+    const double kb = isg::singleCubicSignedEndCurvature(make(6.0, 2.0), true);
+    REQUIRE(ka > kb);
+    // 但尾把手独立选取即可把这一次序翻转：h0 仍是 5 < 6，转入率却反过来。
+    // 这正是逐对比较共享侧把手投影无法表达扇出总序的原因。
+    const double k_short_h0 = isg::singleCubicSignedEndCurvature(
+        make(5.0, 6.0), true);
+    const double k_long_h0 = isg::singleCubicSignedEndCurvature(
+        make(6.0, 0.5), true);
+    REQUIRE(k_short_h0 < k_long_h0);
+
+    // 尾端点侧的语义与首端点一致：值越大越偏向该端点切向的左侧。
+    const isg::BezierCurve c = make(6.0, 6.0);
+    REQUIRE(isg::singleCubicSignedEndCurvature(c, false) < 0.0);
+    REQUIRE(std::abs(isg::singleCubicSignedEndCurvature(isg::BezierCurve(), true))
+            < 1e-12);
 }

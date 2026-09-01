@@ -30,7 +30,10 @@ public:
         double base_lead1_extra_after_align = 0.0,
         double aligned_family_station = std::numeric_limits<double>::quiet_NaN(),
         double aligned_entry_stagger = std::numeric_limits<double>::quiet_NaN(),
-        double aligned_exit_stagger = std::numeric_limits<double>::quiet_NaN()) const;
+        double aligned_exit_stagger = std::numeric_limits<double>::quiet_NaN(),
+        /// 家族分档步长(米)，透传给 UTurnCurveInitializer::buildSegmented，
+        /// 用于把横向偏置钳制在本成员的家族槽位内。0 表示不做钳制。
+        double family_stagger_step = 0.0) const;
 };
 
 }  // 命名空间 isg

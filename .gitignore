@@ -21,3 +21,6 @@ cmake-build-core/
 depends/
 depends.bak/
 src/others/
+
+# 统一测试报表产物（tools/test_report.py）
+reports/

@@ -81,7 +81,10 @@ ConstraintReport ConstraintEvaluator::evaluate(const BezierCurve& curve,
     }
 
     if (profile.check_boundary && !context.view.input().boundaries.empty()) {
-        const BoundarySafetyResult safety = curveBoundarySafety(
+        // 与生成侧同口径：剔除端点贴合 RoadEdge 的共线擦碰（曲线端点与折线端点
+        // 重合导致的厘米级数值穿越），否则生成侧接受的单段 cubic 会在审计侧
+        // 重新报 physical.boundary。发夹形鼻端折回的另一条腿仍参与判违。
+        const BoundarySafetyResult safety = curveBoundarySafetyIgnoringEndpointGraze(
             curve, context.view.input().boundaries, boundarySafetyCenter(context.view.input()),
             std::max(32, profile.samples * 2), 0.75, 0.10, 0.05);
         if (safety.intersects || safety.outside_road_edge) {
