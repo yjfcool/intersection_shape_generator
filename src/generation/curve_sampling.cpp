@@ -5,6 +5,30 @@
 
 namespace isg {
 
+void buildSampledCurveIndex(SampledCurve& sampled) {
+    sampled.bbox = BoundingBox2d();
+    sampled.segment_boxes.clear();
+    sampled.segment_midpoints.clear();
+    sampled.block_boxes.clear();
+    for (const auto& point : sampled.pts)
+        sampled.bbox.expand(point);
+    if (sampled.pts.size() < 2)
+        return;
+    const std::size_t nseg = sampled.pts.size() - 1;
+    sampled.segment_boxes.resize(nseg);
+    sampled.segment_midpoints.reserve(nseg);
+    sampled.block_boxes.resize((nseg + kSampleBlockSize - 1) / kSampleBlockSize);
+    for (std::size_t i = 0; i < nseg; ++i) {
+        sampled.segment_boxes[i].expand(sampled.pts[i]);
+        sampled.segment_boxes[i].expand(sampled.pts[i + 1]);
+        sampled.segment_midpoints.push_back(
+            0.5 * (sampled.pts[i] + sampled.pts[i + 1]));
+        BoundingBox2d& block = sampled.block_boxes[i / kSampleBlockSize];
+        block.expand(sampled.pts[i]);
+        block.expand(sampled.pts[i + 1]);
+    }
+}
+
 SampledCurve sampleCurveForIntersections(
     const BezierCurve& curve, int minimum_samples) {
     SampledCurve sampled;
@@ -13,18 +37,7 @@ SampledCurve sampleCurveForIntersections(
     int count = std::max(
         minimum_samples, static_cast<int>(std::ceil(curve.arcLength() / 0.35)) + 1);
     sampled.pts = curve.sampleByArcLength(std::min(count, 160));
-    for (const auto& point : sampled.pts)
-        sampled.bbox.expand(point);
-    if (sampled.pts.size() >= 2) {
-        sampled.segment_boxes.resize(sampled.pts.size() - 1);
-        sampled.segment_midpoints.reserve(sampled.pts.size() - 1);
-        for (std::size_t i = 0; i + 1 < sampled.pts.size(); ++i) {
-            sampled.segment_boxes[i].expand(sampled.pts[i]);
-            sampled.segment_boxes[i].expand(sampled.pts[i + 1]);
-            sampled.segment_midpoints.push_back(
-                0.5 * (sampled.pts[i] + sampled.pts[i + 1]));
-        }
-    }
+    buildSampledCurveIndex(sampled);
     return sampled;
 }
 

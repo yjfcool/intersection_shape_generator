@@ -4,10 +4,118 @@
 #include "utils.h"
 #include <cmath>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
 namespace isg {
+
+namespace {
+
+////////////////////////////////////////////////////////////
+// 成对相交判定的采样索引缓存
+////////////////////////////////////////////////////////////
+// curvesIntersectBusinessOutsideBalls 是全流程的最热函数（病态数据上占
+// 自身耗时的八成以上）。原实现的两处浪费：
+//   1. 每次调用都按弧长重新采样两条曲线（各最多 240 点），而生成/修复阶段
+//      会用同一批候选反复两两配对，同一条曲线在一轮里被重复采样几十次；
+//   2. 内层是 O(Na×Nb) 的裸双层循环，240×240 约 5.7 万次配对全部逐个判断。
+//
+// 采样只依赖控制点，是纯函数，因此按控制点精确相等复用采样结果，得到的
+// 折线与每次重算逐位一致。分块包围盒只用于整段跳过“分段包围盒必然分离”
+// 的区间——这些配对在逐段判断里也会被同一条件拒掉，且 i、j 仍按升序访问，
+// 首个命中的交点不变，故判定结果与原实现完全一致。
+constexpr int kPairBlockSize = 16;
+constexpr std::size_t kPairSampleSlots = 256;  // 2 的幂，直接映射
+
+struct PairSampleIndex {
+    std::vector<Vec2d> pts;
+    std::vector<BoundingBox2d> seg_box;
+    std::vector<BoundingBox2d> block_box;
+    BoundingBox2d whole;
+};
+
+void fillPairSampleIndex(const BezierCurve& c, PairSampleIndex& idx) {
+    int n = std::max(48, (int)std::ceil(c.arcLength() / 0.20) + 1);
+    n = std::min(n, 240);
+    idx.pts = c.sampleByArcLength(n);
+    idx.seg_box.clear();
+    idx.block_box.clear();
+    idx.whole = BoundingBox2d();
+    const int nseg = (int)idx.pts.size() - 1;
+    if (nseg <= 0)
+        return;
+    idx.seg_box.resize(nseg);
+    idx.block_box.resize((nseg + kPairBlockSize - 1) / kPairBlockSize);
+    for (int i = 0; i < nseg; ++i) {
+        idx.seg_box[i].expand(idx.pts[i]);
+        idx.seg_box[i].expand(idx.pts[i + 1]);
+        BoundingBox2d& block = idx.block_box[i / kPairBlockSize];
+        block.expand(idx.pts[i]);
+        block.expand(idx.pts[i + 1]);
+        idx.whole.expand(idx.pts[i]);
+    }
+    idx.whole.expand(idx.pts[nseg]);
+}
+
+bool sameControlPoints(const std::vector<BezierSegment>& x,
+                       const std::vector<BezierSegment>& y) {
+    if (x.size() != y.size())
+        return false;
+    for (std::size_t s = 0; s < x.size(); ++s)
+        for (int i = 0; i < 4; ++i)
+            if (x[s].ctrl[i][0] != y[s].ctrl[i][0] ||
+                x[s].ctrl[i][1] != y[s].ctrl[i][1])
+                return false;
+    return true;
+}
+
+std::size_t controlPointSlot(const std::vector<BezierSegment>& segs) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const auto& s : segs)
+        for (int i = 0; i < 4; ++i)
+            for (int k = 0; k < 2; ++k) {
+                std::uint64_t bits = 0;
+                const double v = s.ctrl[i][k];
+                std::memcpy(&bits, &v, sizeof(bits));
+                h = (h ^ bits) * 1099511628211ULL;
+            }
+    h ^= h >> 29;
+    return static_cast<std::size_t>(h) & (kPairSampleSlots - 1);
+}
+
+struct PairSampleSlot {
+    std::vector<BezierSegment> key;
+    BoundingBox2d bbox;    // 与 BezierCurve::bbox() 逐位一致的缓存值
+    PairSampleIndex idx;
+    bool valid = false;    // key/bbox 已就绪
+    bool sampled = false;  // idx 已就绪
+};
+
+// 取（必要时建立）该曲线的缓存槽位，只保证 key 与 bbox 就绪；采样按需惰性填充，
+// 这样包围盒判否的配对不必付出采样代价。
+PairSampleSlot& acquirePairSlot(std::vector<PairSampleSlot>& cache,
+                                std::size_t slot, const BezierCurve& c) {
+    PairSampleSlot& e = cache[slot];
+    if (e.valid && sameControlPoints(e.key, c.segs))
+        return e;
+    e.key = c.segs;
+    e.bbox = c.bbox();
+    e.sampled = false;
+    e.valid = true;
+    return e;
+}
+
+const PairSampleIndex& ensurePairSamples(PairSampleSlot& e, const BezierCurve& c) {
+    if (!e.sampled) {
+        fillPairSampleIndex(c, e.idx);
+        e.sampled = true;
+    }
+    return e.idx;
+}
+
+}  // 匿名命名空间
 
 double localCurvature(const Vec2d& a, const Vec2d& b, const Vec2d& c) {
     double ab = (b - a).norm(), bc = (c - b).norm(), ac = (c - a).norm();
@@ -273,40 +381,72 @@ bool curvesIntersectBusinessOutsideBalls(const BezierCurve& a,
                                         const BezierCurve& b, double ep,
                                         const std::vector<Vec2d>& centers,
                                         double radius) {
-    if (!bboxOverlap(a, b))
+    if (a.empty() || b.empty())
         return false;
-    auto adaptiveSample = [](const BezierCurve& c) {
-        int n = std::max(48, (int)std::ceil(c.arcLength() / 0.20) + 1);
-        n = std::min(n, 240);
-        return c.sampleByArcLength(n);
-    };
-    auto pa = adaptiveSample(a);
-    auto pb = adaptiveSample(b);
-    for (int i = 0; i + 1 < (int)pa.size(); ++i) {
-        for (int j = 0; j + 1 < (int)pb.size(); ++j) {
-            if (std::max(pa[i].x(), pa[i + 1].x()) <
-                    std::min(pb[j].x(), pb[j + 1].x()) ||
-                std::max(pb[j].x(), pb[j + 1].x()) <
-                    std::min(pa[i].x(), pa[i + 1].x()) ||
-                std::max(pa[i].y(), pa[i + 1].y()) <
-                    std::min(pb[j].y(), pb[j + 1].y()) ||
-                std::max(pb[j].y(), pb[j + 1].y()) <
-                    std::min(pa[i].y(), pa[i + 1].y()))
+    static thread_local std::vector<PairSampleSlot> cache(kPairSampleSlots);
+    const std::size_t slot_a = controlPointSlot(a.segs);
+    const std::size_t slot_b = controlPointSlot(b.segs);
+    PairSampleSlot& ea = acquirePairSlot(cache, slot_a, a);
+    // b 与 a 争用同一槽位且控制点不同时改用局部槽位，避免覆盖 a 的缓存。
+    PairSampleSlot local_b;
+    PairSampleSlot* eb = nullptr;
+    if (slot_b == slot_a) {
+        if (sameControlPoints(ea.key, b.segs)) {
+            eb = &ea;
+        } else {
+            local_b.key = b.segs;
+            local_b.bbox = b.bbox();
+            local_b.valid = true;
+            eb = &local_b;
+        }
+    } else {
+        eb = &acquirePairSlot(cache, slot_b, b);
+    }
+    // 等价于 bboxOverlap(a, b)，只是包围盒来自缓存。
+    if (!ea.bbox.intersects(eb->bbox))
+        return false;
+    const PairSampleIndex& ia = ensurePairSamples(ea, a);
+    const PairSampleIndex& ib = ensurePairSamples(*eb, b);
+    const std::vector<Vec2d>& pa = ia.pts;
+    const std::vector<Vec2d>& pb = ib.pts;
+    const int na = (int)pa.size() - 1;
+    const int nb = (int)pb.size() - 1;
+    if (na <= 0 || nb <= 0)
+        return false;
+    const int nblock = (int)ib.block_box.size();
+    for (int i = 0; i < na; ++i) {
+        // a 侧整块与 b 的总包围盒分离时，跳过该块的全部 a 段。
+        if ((i % kPairBlockSize) == 0 &&
+            !ia.block_box[i / kPairBlockSize].intersects(ib.whole)) {
+            i += kPairBlockSize - 1;
+            continue;
+        }
+        const BoundingBox2d& abox = ia.seg_box[i];
+        if (!abox.intersects(ib.whole))
+            continue;
+        for (int blk = 0; blk < nblock; ++blk) {
+            if (!abox.intersects(ib.block_box[blk]))
                 continue;
-            Vec2d isect;
-            if (!segmentsIntersect(pa[i], pa[i + 1], pb[j], pb[j + 1], &isect))
-                continue;
-            if (distToAllEndpoints(isect, a, b) <= ep)
-                continue;
-            bool in_ball = false;
-            for (const Vec2d& c : centers) {
-                if ((isect - c).norm() <= radius) {
-                    in_ball = true;
-                    break;
+            const int lo = blk * kPairBlockSize;
+            const int hi = std::min(nb, lo + kPairBlockSize);
+            for (int j = lo; j < hi; ++j) {
+                if (!abox.intersects(ib.seg_box[j]))
+                    continue;
+                Vec2d isect;
+                if (!segmentsIntersect(pa[i], pa[i + 1], pb[j], pb[j + 1], &isect))
+                    continue;
+                if (distToAllEndpoints(isect, a, b) <= ep)
+                    continue;
+                bool in_ball = false;
+                for (const Vec2d& c : centers) {
+                    if ((isect - c).norm() <= radius) {
+                        in_ball = true;
+                        break;
+                    }
                 }
+                if (!in_ball)
+                    return true;
             }
-            if (!in_ball)
-                return true;
         }
     }
     return false;

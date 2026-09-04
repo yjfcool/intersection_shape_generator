@@ -126,18 +126,7 @@ static SampledCurve sampleStrictPairCurve(const BezierCurve& curve) {
     const int count = std::max(
         48, static_cast<int>(std::ceil(curve.arcLength() / 0.20)) + 1);
     sampled.pts = curve.sampleByArcLength(std::min(count, 240));
-    for (const auto& point : sampled.pts)
-        sampled.bbox.expand(point);
-    if (sampled.pts.size() >= 2) {
-        sampled.segment_boxes.resize(sampled.pts.size() - 1);
-        sampled.segment_midpoints.reserve(sampled.pts.size() - 1);
-        for (std::size_t i = 0; i + 1 < sampled.pts.size(); ++i) {
-            sampled.segment_boxes[i].expand(sampled.pts[i]);
-            sampled.segment_boxes[i].expand(sampled.pts[i + 1]);
-            sampled.segment_midpoints.push_back(
-                0.5 * (sampled.pts[i] + sampled.pts[i + 1]));
-        }
-    }
+    buildSampledCurveIndex(sampled);
     return sampled;
 }
 
@@ -214,16 +203,50 @@ static bool curveRawIntersectsBoundariesImpl(
             64, std::min(240, (int)std::ceil(curve.arcLength() / 0.18) + 1)));
     if (pts.size() < 2)
         return false;
+    // 采样折线 × 边界折线是 O(Ns×Nb) 的双层循环：240 个采样点配一条 50 段的
+    // 边界就有上万次 segmentHasForbiddenBoundaryContact，而绝大多数配对的包围盒
+    // 根本不相交。这里先算出曲线分段包围盒，再对每条边界预算分段包围盒，
+    // 用包围盒拒绝替代逐对求交。
+    // segmentHasForbiddenBoundaryContact 的第一道判据就是 segmentsIntersect，
+    // 包围盒不相交时它必然返回 false，因此剪枝不改变任何结论；1e-9 的余量
+    // 对应 segmentsIntersect 共线重叠判据里的参数容差。
+    const double kBoxSlack = 1e-9;
+    const std::size_t nseg = pts.size() - 1;
+    std::vector<BoundingBox2d> curve_seg_box(nseg);
+    for (std::size_t i = 0; i < nseg; ++i) {
+        curve_seg_box[i].expand(pts[i]);
+        curve_seg_box[i].expand(pts[i + 1]);
+    }
+    const auto boxesApart = [kBoxSlack](const BoundingBox2d& x,
+                                        const BoundingBox2d& y) {
+        return x.max_pt[0] < y.min_pt[0] - kBoxSlack ||
+               y.max_pt[0] < x.min_pt[0] - kBoxSlack ||
+               x.max_pt[1] < y.min_pt[1] - kBoxSlack ||
+               y.max_pt[1] < x.min_pt[1] - kBoxSlack;
+    };
+    std::vector<BoundingBox2d> bnd_seg_box;
     for (size_t bi = 0; bi < boundaries.size(); ++bi) {
         const auto& bnd = boundaries[bi];
         if ((road_edges_only && bnd.type != Boundary::Type::RoadEdge) ||
             bnd.geometry.points.size() < 2)
             continue;
-        if (!curve_box.intersects(bnd.geometry.bbox()))
+        const BoundingBox2d bnd_box = bnd.geometry.bbox();
+        if (!curve_box.intersects(bnd_box))
             continue;
         const auto& bpts = bnd.geometry.points;
-        for (int i = 0; i + 1 < (int)pts.size(); ++i) {
-            for (int j = 0; j + 1 < (int)bpts.size(); ++j) {
+        const std::size_t nbseg = bpts.size() - 1;
+        bnd_seg_box.assign(nbseg, BoundingBox2d());
+        for (std::size_t j = 0; j < nbseg; ++j) {
+            bnd_seg_box[j].expand(bpts[j]);
+            bnd_seg_box[j].expand(bpts[j + 1]);
+        }
+        for (std::size_t i = 0; i < nseg; ++i) {
+            const BoundingBox2d& abox = curve_seg_box[i];
+            if (boxesApart(abox, bnd_box))
+                continue;
+            for (std::size_t j = 0; j < nbseg; ++j) {
+                if (boxesApart(abox, bnd_seg_box[j]))
+                    continue;
                 if (!segmentHasForbiddenBoundaryContact(
                         pts[i], pts[i + 1], bpts[j], bpts[j + 1],
                         pts.front(), pts.back(), endpoint_tol))
@@ -585,59 +608,93 @@ static double distToSampledEndpoints(const Vec2d& pt, const SampledCurve& a, con
 
 // 对两条采样曲线执行带业务端点豁免的线段相交检查，并可选检测近距离平行贴合。
 // 返回 true 表示存在端点容差之外的交叉或重叠，并可写出冲突位置。
+//
+// 分块剪枝说明：内层用 b 的分块粗包围盒整段跳过与当前 a 段必然分离的区间。
+// 判据与逐段的 max<min 分离判断完全一致（BoundingBox2d::intersects 用闭区间），
+// 所以跳过的都是原本也会被 continue 的配对；i、j 仍按升序访问，写出的首个
+// 冲突位置与逐段遍历一致。
 static bool sampledCurvesIntersectBusiness(
     const SampledCurve& a, const SampledCurve& b, double endpoint_tol,
     Vec2d* out = nullptr, bool detect_near_overlap = false) {
     if (a.pts.size() < 2 || b.pts.size() < 2 || !a.bbox.intersects(b.bbox))
         return false;
-    for (int ai = 0; ai + 1 < (int)a.pts.size(); ++ai) {
-        for (int bi = 0; bi + 1 < (int)b.pts.size(); ++bi) {
-            if (a.segment_boxes.size() == a.pts.size() - 1 &&
-                b.segment_boxes.size() == b.pts.size() - 1 &&
-                !a.segment_boxes[ai].intersects(b.segment_boxes[bi]))
+    const int na = static_cast<int>(a.pts.size()) - 1;
+    const int nb = static_cast<int>(b.pts.size()) - 1;
+    const bool has_boxes = a.segment_boxes.size() == a.pts.size() - 1 &&
+        b.segment_boxes.size() == b.pts.size() - 1;
+    const bool has_blocks = has_boxes &&
+        b.block_boxes.size() ==
+            static_cast<std::size_t>((nb + kSampleBlockSize - 1) / kSampleBlockSize) &&
+        a.block_boxes.size() ==
+            static_cast<std::size_t>((na + kSampleBlockSize - 1) / kSampleBlockSize);
+    const int nblock = has_blocks ? static_cast<int>(b.block_boxes.size()) : 1;
+    for (int ai = 0; ai < na; ++ai) {
+        if (has_blocks) {
+            // a 侧整块与 b 的总包围盒分离时，跳过该块的全部 a 段。
+            if ((ai % kSampleBlockSize) == 0 &&
+                !a.block_boxes[ai / kSampleBlockSize].intersects(b.bbox)) {
+                ai += kSampleBlockSize - 1;
                 continue;
-            const Vec2d& a0 = a.pts[ai];
-            const Vec2d& a1 = a.pts[ai + 1];
-            const Vec2d& b0 = b.pts[bi];
-            const Vec2d& b1 = b.pts[bi + 1];
-            if (std::max(a0.x(), a1.x()) < std::min(b0.x(), b1.x()) ||
-                std::max(b0.x(), b1.x()) < std::min(a0.x(), a1.x()) ||
-                std::max(a0.y(), a1.y()) < std::min(b0.y(), b1.y()) ||
-                std::max(b0.y(), b1.y()) < std::min(a0.y(), a1.y()))
-                continue;
-            const Vec2d amid = a.segment_midpoints.size() == a.pts.size() - 1
-                ? a.segment_midpoints[ai]
-                : 0.5 * (a0 + a1);
-            const Vec2d bmid = b.segment_midpoints.size() == b.pts.size() - 1
-                ? b.segment_midpoints[bi]
-                : 0.5 * (b0 + b1);
-            if ((amid - bmid).squaredNorm() > 900.0)
-                continue;
-            Vec2d isect;
-            if (!segmentsIntersect(a.pts[ai], a.pts[ai + 1], b.pts[bi], b.pts[bi + 1], &isect)) {
-                if (!detect_near_overlap)
-                    continue;
-                Vec2d ad = a.pts[ai + 1] - a.pts[ai];
-                Vec2d bd = b.pts[bi + 1] - b.pts[bi];
-                if (ad.norm() < 1e-8 || bd.norm() < 1e-8)
-                    continue;
-                if (std::abs(ad.normalized().dot(bd.normalized())) < 0.96)
-                    continue;
-                double near_dist = std::min({
-                    pointToSegment(a.pts[ai], b.pts[bi], b.pts[bi + 1]).first,
-                    pointToSegment(a.pts[ai + 1], b.pts[bi], b.pts[bi + 1]).first,
-                    pointToSegment(b.pts[bi], a.pts[ai], a.pts[ai + 1]).first,
-                    pointToSegment(b.pts[bi + 1], a.pts[ai], a.pts[ai + 1]).first
-                });
-                if (near_dist > 0.18)
-                    continue;
-                isect = 0.5 * (amid + bmid);
             }
-            if (distToSampledEndpoints(isect, a, b) <= endpoint_tol)
+            if (!a.segment_boxes[ai].intersects(b.bbox))
                 continue;
-            if (out)
-                *out = isect;
-            return true;
+        }
+        for (int blk = 0; blk < nblock; ++blk) {
+            int bi_begin = 0;
+            int bi_end = nb;
+            if (has_blocks) {
+                if (!a.segment_boxes[ai].intersects(b.block_boxes[blk]))
+                    continue;
+                bi_begin = blk * kSampleBlockSize;
+                bi_end = std::min(nb, bi_begin + kSampleBlockSize);
+            }
+            for (int bi = bi_begin; bi < bi_end; ++bi) {
+                if (has_boxes &&
+                    !a.segment_boxes[ai].intersects(b.segment_boxes[bi]))
+                    continue;
+                const Vec2d& a0 = a.pts[ai];
+                const Vec2d& a1 = a.pts[ai + 1];
+                const Vec2d& b0 = b.pts[bi];
+                const Vec2d& b1 = b.pts[bi + 1];
+                if (std::max(a0.x(), a1.x()) < std::min(b0.x(), b1.x()) ||
+                    std::max(b0.x(), b1.x()) < std::min(a0.x(), a1.x()) ||
+                    std::max(a0.y(), a1.y()) < std::min(b0.y(), b1.y()) ||
+                    std::max(b0.y(), b1.y()) < std::min(a0.y(), a1.y()))
+                    continue;
+                const Vec2d amid = a.segment_midpoints.size() == a.pts.size() - 1
+                    ? a.segment_midpoints[ai]
+                    : 0.5 * (a0 + a1);
+                const Vec2d bmid = b.segment_midpoints.size() == b.pts.size() - 1
+                    ? b.segment_midpoints[bi]
+                    : 0.5 * (b0 + b1);
+                if ((amid - bmid).squaredNorm() > 900.0)
+                    continue;
+                Vec2d isect;
+                if (!segmentsIntersect(a0, a1, b0, b1, &isect)) {
+                    if (!detect_near_overlap)
+                        continue;
+                    Vec2d ad = a1 - a0;
+                    Vec2d bd = b1 - b0;
+                    if (ad.norm() < 1e-8 || bd.norm() < 1e-8)
+                        continue;
+                    if (std::abs(ad.normalized().dot(bd.normalized())) < 0.96)
+                        continue;
+                    double near_dist = std::min({
+                        pointToSegment(a0, b0, b1).first,
+                        pointToSegment(a1, b0, b1).first,
+                        pointToSegment(b0, a0, a1).first,
+                        pointToSegment(b1, a0, a1).first
+                    });
+                    if (near_dist > 0.18)
+                        continue;
+                    isect = 0.5 * (amid + bmid);
+                }
+                if (distToSampledEndpoints(isect, a, b) <= endpoint_tol)
+                    continue;
+                if (out)
+                    *out = isect;
+                return true;
+            }
         }
     }
     return false;
@@ -7930,12 +7987,119 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         original_a, original_b, kConnectionPointTolerance);
                 };
 
-            std::vector<FamilyCandidate> selected(family.size());
+            // 存指针而不是拷贝：候选自带 BezierCurve，回溯每次迭代都整体
+            // 赋值会带来数千万次向量堆分配。候选池在搜索期间不再变动，
+            // 指针始终有效。
+            std::vector<const FamilyCandidate*> selected(family.size(), nullptr);
             std::vector<bool> selected_flags(family.size(), false);
             std::vector<ExternalCandidate> selected_external(external_ids.size());
             std::vector<bool> selected_external_flags(external_ids.size(), false);
+            // 回溯每层只有「新选中成员」参与的配对可能新增冲突：更浅层成员、
+            // 外部成员与基线曲线的几何在本层没有变化，上一层已经逐对校验通过，
+            // 重算必然得到同样结论。因此按成员预先建立入射配对索引，把每个
+            // 节点的 O(全部配对) 扫描降到 O(该成员的配对)。
+            //
+            // 家族成员两两之间的组合由下面 previous<depth 的循环用同一谓词
+            // （family_pair_forbidden）完整覆盖，且不依赖 ClusterOrderSolver
+            // 是否登记了该对，所以家族内部配对不重复放进索引。
+            std::vector<std::vector<const CurvePair*>> family_incident_pairs(
+                family.size());
+            std::vector<std::vector<const CurvePair*>> external_incident_pairs(
+                external_ids.size());
+            for (const auto& pair : cluster_solver_.pairs()) {
+                if (pair.exempt == CrossExemption::StructuralCross)
+                    continue;
+                const auto ia = family_index.find(pair.id_a);
+                const auto ib = family_index.find(pair.id_b);
+                const bool a_family = ia != family_index.end();
+                const bool b_family = ib != family_index.end();
+                if (a_family && !b_family)
+                    family_incident_pairs[ia->second].push_back(&pair);
+                else if (b_family && !a_family)
+                    family_incident_pairs[ib->second].push_back(&pair);
+                if (a_family || b_family)
+                    continue;
+                const auto ea = external_index.find(pair.id_a);
+                const auto eb = external_index.find(pair.id_b);
+                if (ea != external_index.end())
+                    external_incident_pairs[ea->second].push_back(&pair);
+                if (eb != external_index.end())
+                    external_incident_pairs[eb->second].push_back(&pair);
+            }
             std::unordered_map<std::string, std::size_t> external_rejections;
             std::unordered_map<std::string, std::size_t> internal_rejections;
+            // 这两张表只用于 ISG_PROFILE 的拒绝原因统计。回溯内层每次拒绝
+            // 都要拼出 "a|b" 字符串再插入哈希表，而 100000643 的单个家族内部
+            // 拒绝就超过百万次，实测占该数据集约 16% 的耗时。未开启诊断时
+            // 直接跳过计数：计数不参与任何判定，搜索结果完全不变。
+            const bool profile_rejections = isgProfile();
+            // 与固定基线曲线的冲突只取决于候选自身，与其余成员的取法无关。
+            // 原实现把这个判定放在回溯内层，同一候选会随上层组合被重复检查
+            // 上万次（100000643 的 73|91 达 9.3 万次）。这里在搜索前一次性
+            // 过滤，保持候选原有优先顺序；被删除的候选在任何组合里都会被同
+            // 一条判定拒绝，因此最终接受的组合不变。
+            for (std::size_t mi = 0; mi < family.size(); ++mi) {
+                std::vector<const BezierCurve*> baseline_partners;
+                for (const CurvePair* pair_ptr : family_incident_pairs[mi]) {
+                    const ConnId& other = pair_ptr->id_a == family[mi]->id
+                        ? pair_ptr->id_b : pair_ptr->id_a;
+                    if (external_index.count(other))
+                        continue;
+                    const auto ri = baseline_index.find(other);
+                    if (ri != baseline_index.end() && results[ri->second].curve)
+                        baseline_partners.push_back(
+                            results[ri->second].curve.get());
+                }
+                if (baseline_partners.empty())
+                    continue;
+                std::vector<FamilyCandidate> kept;
+                kept.reserve(pools[mi].size());
+                for (const FamilyCandidate& candidate : pools[mi]) {
+                    bool blocked = false;
+                    for (const BezierCurve* partner : baseline_partners) {
+                        if (curvesHaveForbiddenSameClusterIntersection(
+                                candidate.curve, *partner, kClusterEndpointTol)) {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if (!blocked)
+                        kept.push_back(candidate);
+                }
+                pools[mi].swap(kept);
+            }
+            bool family_pool_empty = false;
+            for (const auto& pool : pools) {
+                if (pool.empty())
+                    family_pool_empty = true;
+            }
+            if (family_pool_empty) {
+                if (isgProfile())
+                    fprintf(stderr,
+                            "[ISG_PROFILE] U-turn family %s pool emptied by baseline prefilter\n",
+                            family.front()->id.c_str());
+                continue;
+            }
+            // 家族成员两两之间的判定同样只取决于两个候选的下标，回溯里会被
+            // 反复重算（74|76 达 111 万次，而不同下标组合最多约 10 万种）。
+            // 按需填充三态表：0 未计算 / 1 允许 / 2 禁止。
+            std::vector<std::vector<std::uint8_t>> internal_memo(
+                family.size() * family.size());
+            const auto internal_forbidden =
+                [&](std::size_t pi, std::size_t pc, std::size_t di,
+                    std::size_t dc) {
+                    std::vector<std::uint8_t>& table =
+                        internal_memo[pi * family.size() + di];
+                    if (table.empty())
+                        table.assign(pools[pi].size() * pools[di].size(), 0);
+                    std::uint8_t& cell = table[pc * pools[di].size() + dc];
+                    if (cell == 0)
+                        cell = family_pair_forbidden(pools[pi][pc].curve,
+                                                     pools[di][dc].curve)
+                            ? 2 : 1;
+                    return cell == 2;
+                };
+            std::vector<std::size_t> selected_idx(family.size(), 0);
             std::size_t search_nodes = 0;
             const std::size_t max_search_nodes = 120000;
             std::function<bool(std::size_t)> search_family;
@@ -7946,8 +8110,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         return false;
                     if (depth == family.size())
                         return true;
-                    for (const FamilyCandidate& item : pools[depth]) {
-                        selected[depth] = item;
+                    for (std::size_t ci = 0; ci < pools[depth].size(); ++ci) {
+                        const FamilyCandidate& item = pools[depth][ci];
+                        selected[depth] = &item;
+                        selected_idx[depth] = ci;
                         selected_flags[depth] = true;
                         bool valid = true;
                         // 家族内部的共享端点组合不能依赖 ClusterOrderSolver
@@ -7957,10 +8123,13 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         // 中弧穿越在原子提交后才暴露。
                         for (std::size_t previous = 0;
                              previous < depth && valid; ++previous) {
-                            if (family_pair_forbidden(
-                                    selected[previous].curve, item.curve)) {
-                                ++internal_rejections[
-                                    family[previous]->id + "|" + family[depth]->id];
+                            if (internal_forbidden(previous,
+                                                   selected_idx[previous],
+                                                   depth, ci)) {
+                                if (profile_rejections)
+                                    ++internal_rejections[
+                                        family[previous]->id + "|" +
+                                        family[depth]->id];
                                 valid = false;
                             }
                         }
@@ -7968,7 +8137,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             selected_flags[depth] = false;
                             continue;
                         }
-                        for (const auto& pair : cluster_solver_.pairs()) {
+                        for (const CurvePair* pair_ptr :
+                                 family_incident_pairs[depth]) {
+                            const CurvePair& pair = *pair_ptr;
                             if (pair.exempt == CrossExemption::StructuralCross)
                                 continue;
                             const auto ia = family_index.find(pair.id_a);
@@ -7994,7 +8165,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             const BezierCurve* curve_a = nullptr;
                             const BezierCurve* curve_b = nullptr;
                             if (a_family)
-                                curve_a = &selected[ia->second].curve;
+                                curve_a = &selected[ia->second]->curve;
                             else if (a_external)
                                 curve_a = &selected_external[ea->second].curve;
                             else {
@@ -8004,7 +8175,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                     curve_a = results[ri->second].curve.get();
                             }
                             if (b_family)
-                                curve_b = &selected[ib->second].curve;
+                                curve_b = &selected[ib->second]->curve;
                             else if (b_external)
                                 curve_b = &selected_external[eb->second].curve;
                             else {
@@ -8021,14 +8192,14 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                       *curve_a, *curve_b,
                                       kClusterEndpointTol);
                             if (forbidden) {
-                                const std::string pair_key =
-                                    pair.id_a + "|" + pair.id_b;
-                                if (a_family && b_family)
-                                    ++internal_rejections[pair_key];
-                                else {
-                                    ++external_rejections[pair_key];
-                                    if (isgProfile() &&
-                                        external_rejections[pair_key] <= 2) {
+                                if (profile_rejections) {
+                                    const std::string pair_key =
+                                        pair.id_a + "|" + pair.id_b;
+                                    if (a_family && b_family) {
+                                        ++internal_rejections[pair_key];
+                                    } else if (
+                                            ++external_rejections[pair_key]
+                                                <= 2) {
                                         const std::vector<Vec2d> crossings =
                                             curveCrossings(*curve_a, *curve_b, 0.01);
                                         double nearest_endpoint =
@@ -8048,9 +8219,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                                 "[ISG_PROFILE] U-turn family %s reject %s alpha=%.3f bias=%.2f/%.2f crossings=%zu endpoint_range=%.4f..%.4f\n",
                                                 family.front()->id.c_str(),
                                                 pair_key.c_str(),
-                                                selected[depth].alpha,
-                                                selected[depth].entry_bias,
-                                                selected[depth].exit_bias,
+                                                selected[depth]->alpha,
+                                                selected[depth]->entry_bias,
+                                                selected[depth]->exit_bias,
                                                 crossings.size(), nearest_endpoint,
                                                 farthest_endpoint);
                                     }
@@ -8079,7 +8250,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     selected_external[depth] = item;
                     selected_external_flags[depth] = true;
                     bool valid = true;
-                    for (const auto& pair : cluster_solver_.pairs()) {
+                    for (const CurvePair* pair_ptr :
+                             external_incident_pairs[depth]) {
+                        const CurvePair& pair = *pair_ptr;
                         if (pair.exempt == CrossExemption::StructuralCross)
                             continue;
                         const auto ia = family_index.find(pair.id_a);
@@ -8100,7 +8273,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         const BezierCurve* curve_a = nullptr;
                         const BezierCurve* curve_b = nullptr;
                         if (a_family)
-                            curve_a = &selected[ia->second].curve;
+                            curve_a = &selected[ia->second]->curve;
                         else if (a_external)
                             curve_a = &selected_external[ea->second].curve;
                         else {
@@ -8110,7 +8283,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                 curve_a = results[ri->second].curve.get();
                         }
                         if (b_family)
-                            curve_b = &selected[ib->second].curve;
+                            curve_b = &selected[ib->second]->curve;
                         else if (b_external)
                             curve_b = &selected_external[eb->second].curve;
                         else {
@@ -8126,7 +8299,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             : curvesHaveForbiddenSameClusterIntersection(
                                   *curve_a, *curve_b, kClusterEndpointTol);
                         if (forbidden) {
-                            ++external_rejections[pair.id_a + "|" + pair.id_b];
+                            if (profile_rejections)
+                                ++external_rejections[
+                                    pair.id_a + "|" + pair.id_b];
                             valid = false;
                             break;
                         }
@@ -8166,7 +8341,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
             accepted_patch.reserve(family.size() + external_ids.size());
             for (std::size_t i = 0; i < family.size(); ++i)
                 accepted_patch.push_back(
-                    CurvePatchEntry{family[i]->id, selected[i].curve});
+                    CurvePatchEntry{family[i]->id, selected[i]->curve});
             for (std::size_t i = 0; i < external_ids.size(); ++i)
                 accepted_patch.push_back(
                     CurvePatchEntry{external_ids[i], selected_external[i].curve});
@@ -8185,8 +8360,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         family.size() + external_ids.size(), search_nodes);
                 for (std::size_t i = 0; i < selected.size(); ++i)
                     fprintf(stderr, " %s=%.2f/%.2f@%.2f",
-                            family[i]->id.c_str(), selected[i].entry_bias,
-                            selected[i].exit_bias, selected[i].station_offset);
+                            family[i]->id.c_str(), selected[i]->entry_bias,
+                            selected[i]->exit_bias, selected[i]->station_offset);
                 for (const ConnId& external_id : external_ids)
                     fprintf(stderr, " %s=external", external_id.c_str());
                 fprintf(stderr, "\n");

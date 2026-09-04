@@ -5,7 +5,9 @@
 #include "utils.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -464,10 +466,32 @@ inline BoundarySafetyResult curveBoundarySafety(
     for (const auto& pt : pts)
         curve_box.expand(pt);
 
+    // 采样折线 × 边界安全段同样是 O(Ns×Nseg) 的双层循环。先算好每个采样段的
+    // 包围盒，逐段拒绝掉与 seg.bbox 不相交的配对：
+    // segmentHasForbiddenBoundaryContact 的首个判据是 segmentsIntersect，
+    // 包围盒不相交时必然返回 false，因此剪枝不改变判定结果。
+    // 1e-9 的余量对应 segmentsIntersect 共线重叠判据里的参数容差。
+    const double box_slack = 1e-9;
+    const std::size_t sample_segs = pts.size() - 1;
+    std::vector<BoundingBox2d> sample_box(sample_segs);
+    for (std::size_t i = 0; i < sample_segs; ++i) {
+        sample_box[i].expand(pts[i]);
+        sample_box[i].expand(pts[i + 1]);
+    }
+    const auto boxesApart = [box_slack](const BoundingBox2d& x,
+                                       const BoundingBox2d& y) {
+        return x.max_pt[0] < y.min_pt[0] - box_slack ||
+               y.max_pt[0] < x.min_pt[0] - box_slack ||
+               x.max_pt[1] < y.min_pt[1] - box_slack ||
+               y.max_pt[1] < x.min_pt[1] - box_slack;
+    };
+
     for (const auto& seg : segments) {
         if (!curve_box.intersects(seg.bbox))
             continue;
-        for (int i = 0; i + 1 < (int)pts.size(); ++i) {
+        for (std::size_t i = 0; i < sample_segs; ++i) {
+            if (boxesApart(sample_box[i], seg.bbox))
+                continue;
             if (segmentHasForbiddenBoundaryContact(
                     pts[i], pts[i + 1], seg.a, seg.b,
                     pts.front(), pts.back(), endpoint_tol)) {
@@ -493,6 +517,77 @@ inline BoundarySafetyResult curveBoundarySafety(
     return result;
 }
 
+// ── buildBoundarySafetySegments 结果缓存 ─────────────────────────────────
+// 该函数的输出只取决于 boundaries 内容、center 与 fence_outline
+// （exempt_masks 未参与计算）。它为每个 RoadEdge 段的两个端点扫描其它所有
+// boundary 的全部线段，复杂度 O(S²)：110004764 有 91 条 boundary，单次重建
+// 就要做数百万次点到线段距离，而候选评估会对同一批 boundary 反复调用它，
+// 实测占该数据集 62% 的自身耗时。
+//
+// 这里按内容指纹缓存结果。指纹覆盖全部 boundary 类型与坐标、center 和围栏
+// 外环，代价与点数成正比，相对 O(S²) 重建可以忽略；只要内容不变就复用，
+// 返回的线段集合与每次重建逐位一致。
+inline std::uint64_t boundarySafetyFingerprint(
+        const std::vector<Boundary>& boundaries, const Vec2d& center,
+        const Polygon2d* fence_outline) {
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&h](double v) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        h = (h ^ bits) * 1099511628211ULL;
+    };
+    const auto mixSize = [&h](std::size_t v) {
+        h = (h ^ static_cast<std::uint64_t>(v)) * 1099511628211ULL;
+    };
+    mixSize(boundaries.size());
+    for (const auto& bnd : boundaries) {
+        mixSize(static_cast<std::size_t>(bnd.type));
+        mixSize(bnd.geometry.points.size());
+        for (const auto& pt : bnd.geometry.points) {
+            mix(pt[0]);
+            mix(pt[1]);
+        }
+    }
+    mix(center[0]);
+    mix(center[1]);
+    if (fence_outline) {
+        mixSize(fence_outline->outer.size() + 1);
+        for (const auto& pt : fence_outline->outer) {
+            mix(pt[0]);
+            mix(pt[1]);
+        }
+    } else {
+        mixSize(0);
+    }
+    return h;
+}
+
+inline const std::vector<BoundarySafetySegment>& cachedBoundarySafetySegments(
+        const std::vector<Boundary>& boundaries, const Vec2d& center,
+        const Polygon2d* fence_outline) {
+    struct Entry {
+        std::uint64_t key = 0;
+        bool valid = false;
+        std::vector<BoundarySafetySegment> segments;
+    };
+    // 同一轮生成里只会交替使用少量 (center, fence) 组合，8 槽轮转足够。
+    static thread_local std::vector<Entry> cache(8);
+    static thread_local std::size_t next_slot = 0;
+    const std::uint64_t key =
+        boundarySafetyFingerprint(boundaries, center, fence_outline);
+    for (const Entry& entry : cache) {
+        if (entry.valid && entry.key == key)
+            return entry.segments;
+    }
+    Entry& slot = cache[next_slot];
+    next_slot = (next_slot + 1) % cache.size();
+    slot.segments =
+        buildBoundarySafetySegments(boundaries, center, nullptr, fence_outline);
+    slot.key = key;
+    slot.valid = true;
+    return slot.segments;
+}
+
 inline BoundarySafetyResult curveBoundarySafety(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
         const Vec2d& center, int min_samples = 64,
@@ -501,8 +596,8 @@ inline BoundarySafetyResult curveBoundarySafety(
         double outside_tol = 0.05,
         const Polygon2d* fence_outline = nullptr,
         double sample_spacing = 0.18) {
-    auto all_segments = buildBoundarySafetySegments(
-        boundaries, center, nullptr, fence_outline);
+    const std::vector<BoundarySafetySegment>& all_segments =
+        cachedBoundarySafetySegments(boundaries, center, fence_outline);
     // 候选检查通常只涉及密集 Boundary 集合中的局部区域。
     // 保留 3 米缓冲带，因为 roadEdgeOutsidePenalty 会使用该范围；
     // 先过滤可避免每个采样点都扫描完整集合，同时保持结果不变。
@@ -517,7 +612,7 @@ inline BoundarySafetyResult curveBoundarySafety(
                 segments.push_back(seg);
         }
     } else {
-        segments = std::move(all_segments);
+        segments = all_segments;
     }
     return curveBoundarySafety(
         curve, segments, min_samples, curve_endpoint_tol,

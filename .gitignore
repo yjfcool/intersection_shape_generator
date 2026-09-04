@@ -9,6 +9,8 @@ node_modules
 .settings/
 .vscode/
 .claude/
+.perf_baseline/
+__pycache__
 build/
 release/
 debug/
