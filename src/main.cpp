@@ -17,6 +17,9 @@ int main(int argc, char* argv[]) {
         files.emplace_back(argv[1]);
     } else {
         files = {
+                std::string(PROJECT_ROOT_DIR) + "/datas/100000443.json",
+                std::string(PROJECT_ROOT_DIR) + "/datas/110004764.json",
+            std::string(PROJECT_ROOT_DIR) + "/datas/100001036.json",
                 std::string(PROJECT_ROOT_DIR) + "/datas/100000536.json",
                 std::string(PROJECT_ROOT_DIR) + "/datas/100000547.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100000012.json",
@@ -27,7 +30,6 @@ int main(int argc, char* argv[]) {
             std::string(PROJECT_ROOT_DIR) + "/datas/intersection_cross.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100000385-u.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/110002137.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/100000443.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100000412.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/110002479.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/110003449.json",

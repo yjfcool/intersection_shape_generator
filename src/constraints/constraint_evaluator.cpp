@@ -81,12 +81,11 @@ ConstraintReport ConstraintEvaluator::evaluate(const BezierCurve& curve,
     }
 
     if (profile.check_boundary && !context.view.input().boundaries.empty()) {
-        // 与生成侧同口径：剔除端点贴合 RoadEdge 的共线擦碰（曲线端点与折线端点
-        // 重合导致的厘米级数值穿越），否则生成侧接受的单段 cubic 会在审计侧
-        // 重新报 physical.boundary。发夹形鼻端折回的另一条腿仍参与判违。
-        const BoundarySafetyResult safety = curveBoundarySafetyIgnoringEndpointGraze(
-            curve, context.view.input().boundaries, boundarySafetyCenter(context.view.input()),
-            std::max(32, profile.samples * 2), 0.75, 0.10, 0.05);
+        // 与生成侧同口径：只允许曲线真实首/尾连接点的浮点误差；Boundary
+        // 端点及端点后的共线贴合、重叠和穿越都参与判违。
+        const BoundarySafetyResult safety = curveBoundarySafetyForInput(
+            curve, context.view.input(), std::max(32, profile.samples * 2),
+            0.75, 0.10, 0.05);
         if (safety.intersects || safety.outside_road_edge) {
             ConstraintResult result;
             result.id = "physical.boundary";
@@ -101,7 +100,8 @@ ConstraintReport ConstraintEvaluator::evaluate(const BezierCurve& curve,
             Vec2d location(0, 0);
             const double distance = minimumCurveBoundaryDistanceForAudit(
                 curve, context.view.input().boundaries, Boundary::Type::RoadEdge,
-                std::max(32, profile.samples * 2), 0.75, &location);
+                std::max(32, profile.samples * 2), kConnectionPointTolerance,
+                &location);
             if (distance < profile.road_edge_clearance) {
                 ConstraintResult result;
                 result.id = "physical.road_edge_clearance";

@@ -2,6 +2,7 @@
 
 #include "constraints/cluster_order.h"
 #include "preprocessing/crosswalk_clearance_calculator.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,11 +13,108 @@ namespace isg {
 
 namespace {
 
+bool crosswalkNearTurnChord(const Crosswalk& crosswalk,
+                            const Vec2d& p0, const Vec2d& p1,
+                            double max_distance) {
+    const std::vector<Vec2d> points = toVec2dArray(crosswalk.geometry.outer);
+    for (size_t i = 1; i < points.size(); ++i) {
+        const Vec2d& a = points[i - 1];
+        const Vec2d& b = points[i];
+        if (pointToSegment(a, p0, p1).first <= max_distance ||
+            pointToSegment(b, p0, p1).first <= max_distance ||
+            pointToSegment(p0, a, b).first <= max_distance ||
+            pointToSegment(p1, a, b).first <= max_distance)
+            return true;
+    }
+    return false;
+}
+
 LaneGroupId laneGroupIdForRole(
         const Connectivity& connectivity, const IntersectionInput& input, bool entry_side);
 
 bool sameAlignmentFamily(const Connectivity& a, const Connectivity& b,
         const IntersectionInput& input, bool entry_side, UTurnAlignmentScope scope);
+
+// 扫描与掉头首/尾直行方向近似共线、且从连接点附近开始延伸的 RoadEdge。
+// 这类边缘通常是车道穿行边缘的长边：掉头若在边缘远端之前开始中弧，严格
+// Boundary 判定会把首/尾直段标成外侧或相交。返回远端投影站位，供整个家族
+// 统一抬高平齐站位；只使用明确共线的长边，避免把横向鼻端或无关边缘误当成
+// 掉头站位约束。
+bool alignedRoadEdgeLeadStation(const Vec2d& origin, const Vec2d& lead_direction,
+        const Vec2d& alignment_axis, const IntersectionInput& input,
+        double& station) {
+    if (lead_direction.norm() < 1e-8 || alignment_axis.norm() < 1e-8)
+        return false;
+    const Vec2d direction = lead_direction.normalized();
+    const Vec2d axis = alignment_axis.normalized();
+    const double max_lateral_distance = 0.80;
+    // 严格 Boundary 约束下，站位不能只越过单条 RoadEdge 的端点：连续
+    // Connector/RoadEdge 链的转折段仍可能落入中弧扫掠区。保留有限余量，
+    // 让三段式中弧在边缘链转折之后再开始，同时不把候选推到路口外很远。
+    const double endpoint_margin = 1.50;
+    bool found = false;
+    double best = -std::numeric_limits<double>::infinity();
+    for (const auto& boundary : input.boundaries) {
+        if (boundary.type != Boundary::Type::RoadEdge ||
+            boundary.geometry.points.size() < 2)
+            continue;
+        const std::vector<Vec2d> points =
+            toVec2dArray(boundary.geometry.points);
+        for (std::size_t i = 1; i < points.size(); ++i) {
+            const Vec2d a = points[i - 1];
+            const Vec2d b = points[i];
+            const Vec2d edge = b - a;
+            const double edge_length = edge.norm();
+            if (edge_length < 1.0)
+                continue;
+            if (std::abs(edge.normalized().dot(direction)) < 0.94)
+                continue;
+            const double sa = (a - origin).dot(direction);
+            const double sb = (b - origin).dot(direction);
+            const double near_s = std::min(sa, sb);
+            const double far_s = std::max(sa, sb);
+            if (far_s < -0.20 || near_s > 1.50 || far_s - near_s < 1.0)
+                continue;
+            if (std::abs(cross2d(direction, a - origin)) > max_lateral_distance ||
+                std::abs(cross2d(direction, b - origin)) > max_lateral_distance)
+                continue;
+            const Vec2d far_point = sa >= sb ? a : b;
+            best = std::max(best, far_point.dot(axis) + endpoint_margin);
+            found = true;
+        }
+    }
+    if (found)
+        station = best;
+    return found;
+}
+
+bool boundaryAlignmentForUTurnComponent(
+        const std::vector<const Connectivity*>& component,
+        const IntersectionInput& input, const Vec2d& axis,
+        double& station) {
+    bool found = false;
+    double best = -std::numeric_limits<double>::infinity();
+    for (const Connectivity* member : component) {
+        const std::pair<Vec2d, Vec2d> entry =
+            input.entryPtDir(member->entry_lane_id);
+        const std::pair<Vec2d, Vec2d> exit =
+            input.exitPtDir(member->exit_lane_id);
+        double candidate = 0.0;
+        if (alignedRoadEdgeLeadStation(
+                entry.first, entry.second, axis, input, candidate)) {
+            best = std::max(best, candidate);
+            found = true;
+        }
+        if (alignedRoadEdgeLeadStation(
+                exit.first, -exit.second, axis, input, candidate)) {
+            best = std::max(best, candidate);
+            found = true;
+        }
+    }
+    if (found)
+        station = best;
+    return found;
+}
 
 }  // namespace
 
@@ -103,6 +201,23 @@ UTurnFamilyInfo UTurnFamilyBuilder::build(
     enforceAlignmentStation(
         entry.first, entry.second, exit.first, exit.second,
         info.aligned_station, info.lead0, info.lead1);
+
+    // 严格 Boundary 口径下，首/尾直段不能在对齐 RoadEdge 远端前结束，否则
+    // 中弧会从车道穿行边缘的错误一侧开始。站位必须由整族统一提高，避免同一
+    // 家族的不同成员分别越过不同边缘后失去平齐；同时反转相向错开方向，让
+    // 首尾直段沿边缘链的外侧展开。无共线长边的场景保持原有参数。
+    double boundary_station = 0.0;
+    const std::vector<const Connectivity*> component_for_boundary =
+        alignmentComponent(connectivity, input, scope, topology, false);
+    if (boundaryAlignmentForUTurnComponent(
+            component_for_boundary, input, info.axis, boundary_station) &&
+        boundary_station > info.aligned_station + 0.05) {
+        info.aligned_station = boundary_station;
+        info.boundary_alignment_required = true;
+        enforceAlignmentStation(
+            entry.first, entry.second, exit.first, exit.second,
+            info.aligned_station, info.lead0, info.lead1);
+    }
 
     info.rank = radiusRank(
         connectivity, input, scope, topology,
@@ -407,16 +522,42 @@ UTurnLeadFloors UTurnFamilyBuilder::leadFloors(
         calculator.ahead(entry_point, entry_tangent, input);
     const CrosswalkClearanceResult exit =
         calculator.behind(exit_point, exit_tangent, input);
+    // 射线命中并不等于该人行横道属于当前掉头走廊：100000547-1 的两条
+    // 射线都命中东侧横道，但横道整体离进出端点弦超过 4m，首尾若按其
+    // 远边强行拉长，中弧必穿另一组 RoadEdge。只有横道多边形落在端点
+    // 弦 4m 走廊内才参与当前掉头的净空约束。
+    const double turn_corridor_width = 4.0;
+    CrosswalkClearanceResult effective_entry = entry;
+    CrosswalkClearanceResult effective_exit = exit;
+    const bool apply_short_turn_correction = input.mode == 2;
+    auto retainIfNearChord = [&](CrosswalkClearanceResult& result) {
+        if (!apply_short_turn_correction)
+            return;
+        if (!result.found)
+            return;
+        auto it = std::find_if(
+            input.crosswalks.begin(), input.crosswalks.end(),
+            [&](const Crosswalk& crosswalk) {
+                return crosswalk.id == result.crosswalk_id &&
+                       crosswalkNearTurnChord(
+                           crosswalk, entry_point, exit_point,
+                           turn_corridor_width);
+            });
+        if (it == input.crosswalks.end())
+            result = CrosswalkClearanceResult();
+    };
+    retainIfNearChord(effective_entry);
+    retainIfNearChord(effective_exit);
     UTurnLeadFloors floors;
-    floors.crosswalk0 = entry.found;
-    floors.crosswalk1 = exit.found;
-    if (entry.found)
-        floors.crosswalk_ids.insert(entry.crosswalk_id);
-    if (exit.found)
-        floors.crosswalk_ids.insert(exit.crosswalk_id);
+    floors.crosswalk0 = effective_entry.found;
+    floors.crosswalk1 = effective_exit.found;
+    if (effective_entry.found)
+        floors.crosswalk_ids.insert(effective_entry.crosswalk_id);
+    if (effective_exit.found)
+        floors.crosswalk_ids.insert(effective_exit.crosswalk_id);
     if (floors.crosswalk0 || floors.crosswalk1) {
-        floors.lead0 = floors.crosswalk0 ? entry.clearance : 0.0;
-        floors.lead1 = floors.crosswalk1 ? exit.clearance : 0.0;
+        floors.lead0 = floors.crosswalk0 ? effective_entry.clearance : 0.0;
+        floors.lead1 = floors.crosswalk1 ? effective_exit.clearance : 0.0;
     } else {
         floors.lead0 = no_crosswalk_min_lead;
         floors.lead1 = no_crosswalk_min_lead;
@@ -426,6 +567,8 @@ UTurnLeadFloors UTurnFamilyBuilder::leadFloors(
 
 std::vector<Crosswalk> UTurnFamilyBuilder::clearanceCrosswalks(
     const IntersectionInput& input, const UTurnLeadFloors& floors) const {
+    if (!floors.crosswalk0 && !floors.crosswalk1)
+        return {};
     if (floors.crosswalk_ids.size() < 2)
         return input.crosswalks;
     std::vector<Crosswalk> selected;

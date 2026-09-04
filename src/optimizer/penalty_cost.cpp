@@ -18,6 +18,8 @@ void PenaltyCostCache::rebuild(
     bnd_segs.clear();
     for (auto& bnd : boundaries) {
         auto& pts = bnd.geometry.points;
+        const bool duplicate_fence_outline = roadEdgeDuplicatesFenceOutline(
+            bnd, fence.outer.empty() ? nullptr : &fence);
         std::vector<BoundarySegment> boundary_segments;
         bool has_pos_center_side = false;
         bool has_neg_center_side = false;
@@ -32,6 +34,7 @@ void PenaltyCostCache::rebuild(
             seg.len = len;
             seg.center_signed = cross2d(d, center - pts[i]) / len;
             seg.road_edge = (bnd.type == Boundary::Type::RoadEdge);
+            seg.center_side_reliable = !duplicate_fence_outline;
             if (seg.road_edge && seg.center_signed > 1e-6)
                 has_pos_center_side = true;
             if (seg.road_edge && seg.center_signed < -1e-6)
@@ -43,7 +46,7 @@ void PenaltyCostCache::rebuild(
         bool reliable = !(bnd.type == Boundary::Type::RoadEdge &&
                           has_pos_center_side && has_neg_center_side);
         for (auto& seg : boundary_segments) {
-            seg.center_side_reliable = reliable;
+            seg.center_side_reliable = seg.center_side_reliable && reliable;
             bnd_segs.push_back(seg);
         }
     }
@@ -76,6 +79,8 @@ static double roadEdgeOutsidePenaltyCached(
     for (const auto& seg : segments) {
         if (!seg.road_edge || !seg.center_side_reliable ||
             std::abs(seg.center_signed) < 1e-6)
+            continue;
+        if (seg.len < 2.0)
             continue;
         Vec2d d = seg.b - seg.a;
         double len2 = d.squaredNorm();
@@ -142,7 +147,7 @@ double PenaltyCost::evalObstacle(const BezierCurve& c) const {
 }
 
 /// 边界线穿越惩罚:
-/// 1. 曲线非端点与任意Boundary相交为硬惩罚;
+/// 1. 曲线除真实首/尾连接点外与任意Boundary相交、贴合或重叠均为硬惩罚;
 /// 2. RoadEdge按"路口中心所在侧"定义可行半平面, 曲线越到外侧时施加连续距离惩罚。
 double PenaltyCost::evalBoundary(const BezierCurve& c) const {
     double cost = 0;
@@ -155,20 +160,14 @@ double PenaltyCost::evalBoundary(const BezierCurve& c) const {
 
     for (auto& bs : cache_.bnd_segs)
         for (int ci = 0; ci + 1 < (int)cp.size(); ++ci)
-            if (segmentsIntersect(cp[ci], cp[ci + 1], bs.a, bs.b)) {
-                Vec2d isect;
-                segmentsIntersect(cp[ci], cp[ci + 1], bs.a, bs.b, &isect);
-                if ((isect - cp.front()).norm() <= 0.75 ||
-                    (isect - cp.back()).norm() <= 0.75 ||
-                    (bs.a_is_boundary_endpoint && (isect - bs.a).norm() <= 0.10) ||
-                    (bs.b_is_boundary_endpoint && (isect - bs.b).norm() <= 0.10))
-                    continue;
+            if (segmentHasForbiddenBoundaryContact(
+                    cp[ci], cp[ci + 1], bs.a, bs.b,
+                    cp.front(), cp.back(), kConnectionPointTolerance))
                 cost += 25.0;
-            }
 
     for (int i = 1; i + 1 < (int)cp.size(); ++i) {
-        if ((cp[i] - cp.front()).norm() <= 0.75 ||
-            (cp[i] - cp.back()).norm() <= 0.75)
+        if ((cp[i] - cp.front()).norm() <= kConnectionPointTolerance ||
+            (cp[i] - cp.back()).norm() <= kConnectionPointTolerance)
             continue;
         double outside = roadEdgeOutsidePenaltyCached(cp[i], cache_.bnd_segs, 0.05);
         cost += outside * outside * 30.0;
@@ -176,8 +175,8 @@ double PenaltyCost::evalBoundary(const BezierCurve& c) const {
 
     if (road_edge_clearance > 0.0) {
         for (int i = 1; i + 1 < (int)cp.size(); ++i) {
-            if ((cp[i] - cp.front()).norm() <= 0.75 ||
-                (cp[i] - cp.back()).norm() <= 0.75)
+            if ((cp[i] - cp.front()).norm() <= kConnectionPointTolerance ||
+                (cp[i] - cp.back()).norm() <= kConnectionPointTolerance)
                 continue;
             double d_edge = roadEdgeDistanceCached(cp[i], cache_.bnd_segs);
             if (!std::isfinite(d_edge))

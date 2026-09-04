@@ -468,7 +468,11 @@ BezierCurve UTurnCurveInitializer::buildSegmented(
     // 见 UTurnFamilyBuilder::familyLateralLadder。
     double entry_bias_eff = entry_lateral_bias;
     double exit_bias_eff = exit_lateral_bias;
-    if (family_stagger_step >= 0.10) {
+    // 诊断时允许关闭槽位钳制，以验证“家族分档”和边界绕行偏置是否互相
+    // 限制；正式生成仍保持默认钳制，只有家族级公共候选显式传入 0 步长时
+    // 才允许改变整族的相对平移。
+    if (family_stagger_step >= 0.10 &&
+        std::getenv("ISG_NO_SLOT_CLAMP") == nullptr) {
         // 槽位宽度按"名义步长"和"本侧实际落实的档位"取小。等差列成员的档位本身
         // 就 >= 一个步长，取小后与只用步长完全一致；只有被家族压缩过或走廊退化的
         // 成员才收紧。这类成员与外层邻居的实际间距是家族级联给出的

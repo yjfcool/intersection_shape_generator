@@ -291,7 +291,13 @@ bool SegmentedUTurnCandidateSearch::search(
         if (d_exit < 0.5)
             bias_exit_side = true;
     }
-    if ((bias_entry_side || bias_exit_side) && (!have_best || best_cross > 0)) {
+    // 边界避让不能依赖兄弟曲线是否已经生成：同一批次中排在前面的 U-turn
+    // 可能没有可用于推导偏置方向的共享兄弟，但其首尾直段仍可能贴近或穿过
+    // RoadEdge。对存在 Boundary 的输入始终尝试有限的两侧偏置；候选最终仍
+    // 必须通过严格物理审计，因此不会把“尝试偏置”变成任何接触豁免。
+    const bool boundary_bias_needed = !input.boundaries.empty();
+    if ((bias_entry_side || bias_exit_side || boundary_bias_needed) &&
+        (!have_best || best_cross > 0)) {
         // G1 余量：首尾直段方向相对车道切向的偏差为 atan(bias/lead)，
         // shape.uturn.leads 要求方向点积 >= 0.98(约 11.5°)。常规档位以各侧
         // lead 下限的 5% 为上限(约 2.9°)，数据驱动档位的硬上限取 0.14*lead
@@ -403,6 +409,28 @@ bool SegmentedUTurnCandidateSearch::search(
             }
             if (!tier.empty())
                 tiers.push_back(tier);
+        }
+        if (boundary_bias_needed) {
+            const double boundary_cap0 = g1_cap0;
+            const double boundary_cap1 = g1_cap1;
+            for (double fraction : {0.50, 1.00}) {
+                BiasTier tier;
+                // 双侧同向偏置优先保持中弧整体平移，四种符号组合都保留，
+                // 让斜向 Boundary 的内外侧由严格审计实际筛选。
+                tier.push_back(std::make_pair(
+                    fraction * boundary_cap0, fraction * boundary_cap1));
+                tier.push_back(std::make_pair(
+                    -fraction * boundary_cap0, -fraction * boundary_cap1));
+                tier.push_back(std::make_pair(
+                    fraction * boundary_cap0, -fraction * boundary_cap1));
+                tier.push_back(std::make_pair(
+                    -fraction * boundary_cap0, fraction * boundary_cap1));
+                tier.push_back(std::make_pair(fraction * boundary_cap0, 0.0));
+                tier.push_back(std::make_pair(-fraction * boundary_cap0, 0.0));
+                tier.push_back(std::make_pair(0.0, fraction * boundary_cap1));
+                tier.push_back(std::make_pair(0.0, -fraction * boundary_cap1));
+                tiers.push_back(tier);
+            }
         }
         // 偏置阶段复用主搜索的完整把手序列：实测把它裁成 6 个代表值会让
         // 100000385-u / 100000443 / 110003285 找不到零交叉候选，整体违约数从

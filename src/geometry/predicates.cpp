@@ -121,10 +121,12 @@ double minimumCurveBoundaryDistanceForAudit(const BezierCurve& curve,
                                             Vec2d* location) {
     const std::vector<Vec2d> points = sampleCurveForAudit(curve, samples);
     if (points.size() < 3) return 1e18;
+    const double endpoint_tol = std::min(
+        std::max(0.0, endpoint_exclusion), 1e-4);
     double minimum = 1e18;
     for (size_t i = 1; i + 1 < points.size(); ++i) {
-        if ((points[i] - points.front()).norm() <= endpoint_exclusion ||
-            (points[i] - points.back()).norm() <= endpoint_exclusion)
+        if ((points[i] - points.front()).norm() <= endpoint_tol ||
+            (points[i] - points.back()).norm() <= endpoint_tol)
             continue;
         for (const auto& boundary : boundaries) {
             if (boundary.type != type) continue;

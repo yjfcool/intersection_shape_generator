@@ -1,6 +1,7 @@
 #include "constraints/shape_constraint.h"
 
 #include "constraints/fence_check.h"
+#include "curve/curve_utils.h"
 #include "geometry/predicates.h"
 #include "utils.h"
 
@@ -62,14 +63,75 @@ bool segmentStraight(const BezierSegment& segment) {
                std::max(0.05, length * 0.03);
 }
 
+bool twoSegmentWaypointShapeAcceptable(const BezierCurve& curve,
+                                       const CurveGenerationContext& context,
+                                       const Vec2d& chord,
+                                       double turn_strength) {
+    if (curve.numSegments() != 2 || chord.norm() < 1e-6 ||
+        context.entry.second.norm() < 1e-8 || context.exit.second.norm() < 1e-8)
+        return false;
+    const Vec2d start_tan = curve.startTan();
+    const Vec2d end_tan = curve.endTan();
+    if (start_tan.norm() < 1e-8 || end_tan.norm() < 1e-8 ||
+        start_tan.normalized().dot(context.entry.second.normalized()) < 0.95 ||
+        end_tan.normalized().dot(context.exit.second.normalized()) < 0.95)
+        return false;
+
+    const BezierSegment& first = curve.segs.front();
+    const BezierSegment& second = curve.segs.back();
+    const Vec2d left_tan = first.evalDeriv1(1.0);
+    const Vec2d right_tan = second.evalDeriv1(0.0);
+    if (left_tan.norm() < 1e-8 || right_tan.norm() < 1e-8 ||
+        left_tan.normalized().dot(right_tan.normalized()) < 0.98 ||
+        (second.ctrl[3] - first.ctrl[0]).norm() < 1e-6 ||
+        (first.ctrl[3] - first.ctrl[0]).norm() < 0.30 ||
+        (second.ctrl[3] - second.ctrl[0]).norm() < 0.30)
+        return false;
+
+    const double ratio = curve.arcLength() / chord.norm();
+    double max_lateral = 0.0;
+    const Vec2d chord_dir = chord.normalized();
+    for (const Vec2d& point : curve.sampleByArcLength(96))
+        max_lateral = std::max(
+            max_lateral,
+            std::abs(cross2d(chord_dir, point - context.entry.first)));
+
+    if (turn_strength <= 0.25)
+        return ratio <= 1.12 && max_lateral / chord.norm() <= 0.12 &&
+               curve.maxCurvature(40) <= 3.0;
+    return ratio >= (chord.norm() < 12.0 ? 1.02 : 1.06) &&
+           ratio <= 1.45 && max_lateral / chord.norm() <= 0.45 &&
+           curve.maxCurvature(40) <= 2.5 &&
+           curveTurningSpan(curve) <= 200.0 * M_PI / 180.0 &&
+           !signFlip(curve);
+}
+
 bool pointInCrosswalks(const Vec2d& point, const std::vector<Crosswalk>& crosswalks) {
     for (const auto& crosswalk : crosswalks)
         if (polygonContains(crosswalk.geometry, point)) return true;
     return false;
 }
 
+bool crosswalkNearTurnChord(const Crosswalk& crosswalk,
+                            const Vec2d& p0, const Vec2d& p1,
+                            double max_distance) {
+    const std::vector<Vec2d> points = toVec2dArray(crosswalk.geometry.outer);
+    for (size_t i = 1; i < points.size(); ++i) {
+        const Vec2d& a = points[i - 1];
+        const Vec2d& b = points[i];
+        if (pointToSegment(a, p0, p1).first <= max_distance ||
+            pointToSegment(b, p0, p1).first <= max_distance ||
+            pointToSegment(p0, a, b).first <= max_distance ||
+            pointToSegment(p1, a, b).first <= max_distance)
+            return true;
+    }
+    return false;
+}
+
 double requiredCrosswalkLead(const Vec2d& origin, const Vec2d& direction,
-                             const std::vector<Crosswalk>& crosswalks) {
+                             const std::vector<Crosswalk>& crosswalks,
+                             const Vec2d* turn_exit = nullptr,
+                             bool apply_turn_corridor_filter = false) {
     if (direction.norm() < 1e-8) return 0.0;
     const Vec2d forward = direction.normalized();
     const Vec2d lateral(-forward.y(), forward.x());
@@ -85,7 +147,11 @@ double requiredCrosswalkLead(const Vec2d& origin, const Vec2d& direction,
             const double b_forward = (points[i + 1] - origin).dot(forward);
             const double edge_near = std::min(a_forward, b_forward);
             const double edge_far = std::max(a_forward, b_forward);
-            if (edge_far <= 0.0 || edge_near > 12.0) continue;
+            if (edge_far <= 0.0 || edge_near > 12.0)
+                continue;
+            if (apply_turn_corridor_filter && turn_exit && !crosswalkNearTurnChord(
+                    crosswalk, origin, *turn_exit, 4.0))
+                continue;
             const double a_lateral = (points[i] - origin).dot(lateral);
             const double b_lateral = (points[i + 1] - origin).dot(lateral);
             const double minimum_lateral = a_lateral * b_lateral <= 0.0 ? 0.0 :
@@ -111,14 +177,28 @@ ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
     if (!context.connectivity || isGeometricUTurn(context))
         return satisfied("shape.ordinary.not_applicable");
     if (curve.empty()) return violated("shape.ordinary", "ordinary curve is empty");
+    const Vec2d chord = context.exit.first - context.entry.first;
+    if (curve.numSegments() == 2) {
+        const Vec2d t0 = context.entry.second.norm() > 1e-8
+            ? context.entry.second.normalized() : chord.normalized();
+        const double turn_strength = std::abs(cross2d(t0, chord.normalized()));
+        if (!twoSegmentWaypointShapeAcceptable(
+                curve, context, chord, turn_strength))
+            return violated("shape.ordinary.waypoint",
+                            "ordinary two-segment waypoint curve is not a smooth legal arch");
+        return satisfied("shape.ordinary.waypoint");
+    }
     if (curve.numSegments() != 1)
         return violated("shape.ordinary.single_segment", "ordinary curve must be one cubic segment");
-    const Vec2d chord = context.exit.first - context.entry.first;
     if (chord.norm() < 1e-6) return violated("shape.ordinary.chord", "ordinary curve has degenerate chord");
     const Vec2d t0 = context.entry.second.norm() > 1e-8 ? context.entry.second.normalized() : chord.normalized();
     const double turn_strength = std::abs(cross2d(t0, chord.normalized()));
+    // 方向交点是普通曲线的自然形态参考，不是物理避让的硬边界。
+    // 密集 Boundary 链场景可能需要沿端点切向轴延长把手才能绕开边缘；
+    // 单段、轴向、G1、弧长和曲率约束仍保持硬性检查。
     if (!ordinarySingleCubicControlsValid(curve, context.entry.first, t0,
-                                          context.exit.first, context.exit.second))
+                                          context.exit.first, context.exit.second,
+                                          1e-5, false))
         return violated("shape.ordinary.controls", "ordinary cubic controls leave endpoint tangent axes");
     const Vec2d start_tangent = curve.startTan();
     const Vec2d end_tangent = curve.endTan();
@@ -139,7 +219,9 @@ ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
             return violated("shape.ordinary.straight", "straight curve is not sufficiently straight");
     } else {
         const double minimum_ratio = chord.norm() < 12.0 ? 1.02 : 1.06;
-        if (ratio < minimum_ratio || ratio > 1.35 || curve.maxCurvature(40) > 2.5 || signFlip(curve))
+        const double maximum_ratio = chord.norm() <= 15.0 ? 1.40 : 1.35;
+        if (ratio < minimum_ratio || ratio > maximum_ratio ||
+            curve.maxCurvature(40) > 2.5 || signFlip(curve))
             return violated("shape.ordinary.turn", "turn curve is not a single smooth arch");
     }
     return satisfied("shape.ordinary");
@@ -160,10 +242,16 @@ ConstraintResult evaluateUTurnShape(const BezierCurve& curve,
         return violated("shape.uturn.leads", "U-turn lead segments are not straight and lane-aligned");
     const std::vector<Crosswalk>* crosswalks = context.scene ?
         &context.scene->view.input().crosswalks : nullptr;
+    const bool apply_turn_corridor_filter = context.scene &&
+        context.scene->view.input().mode == 2;
     const double required0 = crosswalks ?
-        requiredCrosswalkLead(context.entry.first, context.entry.second, *crosswalks) : 0.0;
+        requiredCrosswalkLead(context.entry.first, context.entry.second, *crosswalks,
+                              &context.exit.first,
+                              apply_turn_corridor_filter) : 0.0;
     const double required1 = crosswalks ?
-        requiredCrosswalkLead(context.exit.first, -context.exit.second, *crosswalks) : 0.0;
+        requiredCrosswalkLead(context.exit.first, -context.exit.second, *crosswalks,
+                              &context.entry.first,
+                              apply_turn_corridor_filter) : 0.0;
     if (required0 <= 0.0 && required1 <= 0.0 &&
         (first_chord.norm() < 2.0 || last_chord.norm() < 2.0))
         return violated("shape.uturn.leads", "U-turn without Crosswalk needs 2m straight leads");
@@ -194,9 +282,13 @@ ConstraintResult evaluateUTurnCrosswalk(const BezierCurve& curve,
             return violated("shape.crosswalk.arc", "U-turn middle arc enters Crosswalk");
     }
     const double required0 = requiredCrosswalkLead(
-        context.entry.first, context.entry.second, context.scene->view.input().crosswalks);
+        context.entry.first, context.entry.second,
+        context.scene->view.input().crosswalks, &context.exit.first,
+        context.scene->view.input().mode == 2);
     const double required1 = requiredCrosswalkLead(
-        context.exit.first, -context.exit.second, context.scene->view.input().crosswalks);
+        context.exit.first, -context.exit.second,
+        context.scene->view.input().crosswalks, &context.entry.first,
+        context.scene->view.input().mode == 2);
     if ((curve.segs.front().ctrl[3] - curve.segs.front().ctrl[0]).norm() + 1e-6 < required0 ||
         (curve.segs.back().ctrl[3] - curve.segs.back().ctrl[0]).norm() + 1e-6 < required1)
         return violated("shape.crosswalk.lead", "U-turn straight lead does not clear Crosswalk");

@@ -54,6 +54,7 @@ struct UTurnFamilyLadder {
 /// 单条 U-turn 使用的家族级只读几何快照。
 struct UTurnFamilyInfo {
     bool geometric_uturn;
+    bool boundary_alignment_required;
     Vec2d axis;
     double radius;
     double lead0;
@@ -63,7 +64,8 @@ struct UTurnFamilyInfo {
     std::vector<Crosswalk> clearance_crosswalks;
 
     UTurnFamilyInfo()
-        : geometric_uturn(false), axis(1, 0), radius(0.0),
+        : geometric_uturn(false), boundary_alignment_required(false),
+          axis(1, 0), radius(0.0),
           lead0(0.0), lead1(0.0),
           aligned_station(0.0) {}
 };

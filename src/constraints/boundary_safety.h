@@ -11,6 +11,10 @@
 
 namespace isg {
 
+// 避让约束唯一允许的端点误差。该误差只用于识别曲线自身的真实首点/尾点，
+// 不用于放宽 Boundary 端点，也不允许把端点后的贴合、重叠或穿越隐藏掉。
+static constexpr double kConnectionPointTolerance = 1e-4;
+
 // 临时对照开关：设置 ISG_LEGACY_SHAPE=1 时，端点擦碰豁免与转角超量门禁全部退回
 // 旧行为，用于在同一个二进制里对比回归基线。
 inline bool isgLegacyShapeGates() {
@@ -19,10 +23,6 @@ inline bool isgLegacyShapeGates() {
 }
 
 // 临时归因开关：单独退回三项改动之一，用于定位回归来源。
-inline bool isgLegacyGraze() {
-    static const bool legacy = std::getenv("ISG_LEGACY_GRAZE") != nullptr;
-    return legacy || isgLegacyShapeGates();
-}
 inline bool isgLegacyExcess() {
     static const bool legacy = std::getenv("ISG_LEGACY_EXCESS") != nullptr;
     return legacy || isgLegacyShapeGates();
@@ -35,6 +35,7 @@ inline bool isgLegacySegTie() {
 struct BoundarySafetySegment {
     Vec2d a{0, 0};
     Vec2d b{0, 0};
+    BoundingBox2d bbox;
     double len = 0.0;
     double center_signed = 0.0;
     bool road_edge = false;
@@ -48,6 +49,91 @@ struct BoundarySafetyResult {
     bool outside_road_edge = false;
     double outside_penalty = 0.0;
 };
+
+// 判断曲线采样线段与 Boundary 线段的接触是否超出曲线真实首/尾连接点。
+// 非平行线段只有一个交点；共线时必须检查完整重叠区间，否则仅用
+// segmentsIntersect 返回的中点可能把“从首点开始的贴合/重叠”错误当成合法连接。
+inline bool segmentHasForbiddenBoundaryContact(
+        const Vec2d& curve_a, const Vec2d& curve_b,
+        const Vec2d& boundary_a, const Vec2d& boundary_b,
+        const Vec2d& curve_start, const Vec2d& curve_end,
+        double endpoint_tol = kConnectionPointTolerance) {
+    const double tol = std::min(
+        std::max(0.0, endpoint_tol), kConnectionPointTolerance);
+    Vec2d curve_delta = curve_b - curve_a;
+    Vec2d boundary_delta = boundary_b - boundary_a;
+    if (curve_delta.norm() < 1e-10 || boundary_delta.norm() < 1e-10)
+        return false;
+    if (!segmentsIntersect(
+            curve_a, curve_b, boundary_a, boundary_b, nullptr))
+        return false;
+
+    auto outside_endpoint_tolerance = [&](const Vec2d& point) {
+        return (point - curve_start).norm() > tol &&
+               (point - curve_end).norm() > tol;
+    };
+
+    const double denominator = cross2d(curve_delta, boundary_delta);
+    if (std::abs(denominator) > 1e-12) {
+        Vec2d intersection;
+        if (!segmentsIntersect(
+                curve_a, curve_b, boundary_a, boundary_b, &intersection))
+            return false;
+        return outside_endpoint_tolerance(intersection);
+    }
+
+    const double curve_len2 = curve_delta.squaredNorm();
+    const double t0 = (boundary_a - curve_a).dot(curve_delta) / curve_len2;
+    const double t1 = (boundary_b - curve_a).dot(curve_delta) / curve_len2;
+    const double lo = std::max(0.0, std::min(t0, t1));
+    const double hi = std::min(1.0, std::max(t0, t1));
+    if (lo > hi + 1e-9)
+        return false;
+    // Five probes cover both ends and the interior of the overlap interval.
+    // The interval is at most one sampled curve segment, so this also catches
+    // a contact that starts at a curve endpoint and continues beyond it.
+    for (int i = 0; i <= 4; ++i) {
+        const double t = lo + (hi - lo) * static_cast<double>(i) / 4.0;
+        if (outside_endpoint_tolerance(curve_a + t * curve_delta))
+            return true;
+    }
+    return false;
+}
+
+/// RoadEdge 若整条折线都贴着精细 area.outer，则它只是围栏轮廓的重复报告，
+/// 不能再以路口中心侧把有限边外推成无限半平面。逐段采样避免仅端点贴近围栏、
+/// 中间却横穿路口的长边被误分类；该判据只影响中心侧，真实相交和净距仍照常检查。
+inline bool roadEdgeDuplicatesFenceOutline(
+        const Boundary& boundary, const Polygon2d* fence_outline,
+        double max_distance = 0.60, double sample_spacing = 0.25) {
+    if (boundary.type != Boundary::Type::RoadEdge || !fence_outline ||
+        fence_outline->outer.size() < 2 || boundary.geometry.points.size() < 2)
+        return false;
+
+    const auto& edge = boundary.geometry.points;
+    const auto& ring = fence_outline->outer;
+    const double spacing = std::max(0.05, sample_spacing);
+    for (int i = 0; i + 1 < (int)edge.size(); ++i) {
+        const Vec2d a = edge[i];
+        const Vec2d b = edge[i + 1];
+        const double length = (b - a).norm();
+        if (length < 1e-8)
+            continue;
+        const int samples = std::max(1, (int)std::ceil(length / spacing));
+        for (int s = 0; s <= samples; ++s) {
+            const Vec2d point = a + (double)s / (double)samples * (b - a);
+            double distance = std::numeric_limits<double>::infinity();
+            for (int r = 0; r < (int)ring.size(); ++r) {
+                const Vec2d ra = ring[r];
+                const Vec2d rb = ring[(r + 1) % ring.size()];
+                distance = std::min(distance, pointToSegment(point, ra, rb).first);
+            }
+            if (distance > max_distance)
+                return false;
+        }
+    }
+    return true;
+}
 
 template <typename SegmentT>
 inline bool roadEdgeAdherentContactAllowed(
@@ -185,14 +271,31 @@ inline Vec2d boundarySafetyCenter(const IntersectionInput& input) {
 
 inline std::vector<BoundarySafetySegment> buildBoundarySafetySegments(
         const std::vector<Boundary>& boundaries, const Vec2d& center,
-        const std::vector<std::vector<bool>>* exempt_masks = nullptr) {
+        const std::vector<std::vector<bool>>* exempt_masks = nullptr,
+        const Polygon2d* fence_outline = nullptr) {
+    auto endpointTouchesOtherBoundary = [&](size_t boundary_index,
+                                             const Vec2d& point) {
+        constexpr double kJunctionTolerance = 1e-3;
+        for (size_t other_index = 0; other_index < boundaries.size(); ++other_index) {
+            if (other_index == boundary_index)
+                continue;
+            const auto& other_points = boundaries[other_index].geometry.points;
+            for (int i = 0; i + 1 < (int)other_points.size(); ++i) {
+                if (pointToSegment(point, other_points[i], other_points[i + 1]).first <=
+                    kJunctionTolerance)
+                    return true;
+            }
+        }
+        return false;
+    };
+
     std::vector<BoundarySafetySegment> segments;
     for (size_t bi = 0; bi < boundaries.size(); ++bi) {
         const auto& bnd = boundaries[bi];
         const auto& pts = bnd.geometry.points;
-        const std::vector<bool>* mask =
-            (exempt_masks && bi < exempt_masks->size() && !(*exempt_masks)[bi].empty())
-                ? &(*exempt_masks)[bi] : nullptr;
+        const bool duplicate_fence_outline =
+            roadEdgeDuplicatesFenceOutline(bnd, fence_outline);
+        (void)exempt_masks;
         std::vector<BoundarySafetySegment> boundary_segments;
         bool has_pos_center_side = false;
         bool has_neg_center_side = false;
@@ -204,17 +307,24 @@ inline std::vector<BoundarySafetySegment> buildBoundarySafetySegments(
             BoundarySafetySegment seg;
             seg.a = pts[i];
             seg.b = pts[i + 1];
+            seg.bbox.expand(seg.a);
+            seg.bbox.expand(seg.b);
             seg.len = len;
             seg.center_signed = cross2d(d, center - pts[i]) / len;
             seg.road_edge = (bnd.type == Boundary::Type::RoadEdge);
+            // RoadEdge 与 Connector/其它 Boundary 端点相接后已经是有限的
+            // 连续链，单段的中心侧不能再向无穷半平面外推。这里仅关闭“外侧”
+            // 推断；真实相交、共线贴合、重叠和 mode=2 净距仍由线段检查执行。
+            const bool chain_junction = seg.road_edge &&
+                (endpointTouchesOtherBoundary(bi, seg.a) ||
+                 endpointTouchesOtherBoundary(bi, seg.b));
+            seg.center_side_reliable = !duplicate_fence_outline && !chain_junction;
             // 中心侧可靠性必须在完整折线上统计，豁免段只是不参与判违，
             // 不能改变该 boundary 的中心侧一致性结论。
             if (seg.road_edge && seg.center_signed > 1e-6)
                 has_pos_center_side = true;
             if (seg.road_edge && seg.center_signed < -1e-6)
                 has_neg_center_side = true;
-            if (mask && i < (int)mask->size() && (*mask)[i])
-                continue;
             seg.a_is_boundary_endpoint = (i == 0);
             seg.b_is_boundary_endpoint = (i + 1 == (int)pts.size() - 1);
             boundary_segments.push_back(seg);
@@ -222,7 +332,7 @@ inline std::vector<BoundarySafetySegment> buildBoundarySafetySegments(
         bool reliable = !(bnd.type == Boundary::Type::RoadEdge &&
                           has_pos_center_side && has_neg_center_side);
         for (auto& seg : boundary_segments) {
-            seg.center_side_reliable = reliable;
+            seg.center_side_reliable = seg.center_side_reliable && reliable;
             segments.push_back(seg);
         }
     }
@@ -284,6 +394,21 @@ inline double roadEdgeOutsidePenalty(
         if (!seg.road_edge || !seg.center_side_reliable ||
             std::abs(seg.center_signed) < 1e-6)
             continue;
+        // 很短的 RoadEdge 通常是车道端点/鼻端的连接片段，有限线段附近
+        // 不足以支持稳定的“无限中心侧半平面”推断；真实接触和 mode=2
+        // 净距仍由独立检查负责。仅对长度至少 2m 的边段启用外侧判定。
+        if (seg.len < 2.0)
+            continue;
+        const double dx = pt.x() < seg.bbox.min_pt.x()
+            ? seg.bbox.min_pt.x() - pt.x()
+            : (pt.x() > seg.bbox.max_pt.x()
+                ? pt.x() - seg.bbox.max_pt.x() : 0.0);
+        const double dy = pt.y() < seg.bbox.min_pt.y()
+            ? seg.bbox.min_pt.y() - pt.y()
+            : (pt.y() > seg.bbox.max_pt.y()
+                ? pt.y() - seg.bbox.max_pt.y() : 0.0);
+        if (dx * dx + dy * dy > max_influence_dist * max_influence_dist)
+            continue;
         Vec2d d = seg.b - seg.a;
         double len2 = d.squaredNorm();
         if (len2 < 1e-12)
@@ -307,8 +432,12 @@ inline double roadEdgeOutsidePenalty(
 
 inline BoundarySafetyResult curveBoundarySafety(
         const BezierCurve& curve, const std::vector<BoundarySafetySegment>& segments,
-        int min_samples = 64, double curve_endpoint_tol = 0.75,
-        double boundary_endpoint_tol = 0.10, double outside_tol = 0.05) {
+        int min_samples = 64, double curve_endpoint_tol = kConnectionPointTolerance,
+        double boundary_endpoint_tol = 0.10, double outside_tol = 0.05,
+        double sample_spacing = 0.18) {
+    (void)boundary_endpoint_tol;
+    const double endpoint_tol = std::min(
+        std::max(0.0, curve_endpoint_tol), kConnectionPointTolerance);
     BoundarySafetyResult result;
     if (segments.empty() || curve.empty())
         return result;
@@ -318,7 +447,8 @@ inline BoundarySafetyResult curveBoundarySafety(
     for (int si = 0; si < (int)curve.segs.size(); ++si) {
         const auto& curve_seg = curve.segs[si];
         int seg_samples = std::max(
-            2, (int)std::ceil(curve_seg.arcLength(12) / 0.18) + 1);
+            2, (int)std::ceil(curve_seg.arcLength(12) /
+                              std::max(0.05, sample_spacing)) + 1);
         seg_samples = std::min(seg_samples, 80);
         for (int i = 0; i < seg_samples; ++i) {
             if (si > 0 && i == 0)
@@ -335,31 +465,23 @@ inline BoundarySafetyResult curveBoundarySafety(
         curve_box.expand(pt);
 
     for (const auto& seg : segments) {
-        BoundingBox2d seg_box;
-        seg_box.expand(seg.a);
-        seg_box.expand(seg.b);
-        if (!curve_box.intersects(seg_box))
+        if (!curve_box.intersects(seg.bbox))
             continue;
         for (int i = 0; i + 1 < (int)pts.size(); ++i) {
-            Vec2d isect;
-            if (!segmentsIntersect(pts[i], pts[i + 1], seg.a, seg.b, &isect))
-                continue;
-            if ((isect - pts.front()).norm() <= curve_endpoint_tol ||
-                (isect - pts.back()).norm() <= curve_endpoint_tol)
-                continue;
-            if ((seg.a_is_boundary_endpoint && (isect - seg.a).norm() <= boundary_endpoint_tol) ||
-                (seg.b_is_boundary_endpoint && (isect - seg.b).norm() <= boundary_endpoint_tol))
-                continue;
-            result.intersects = true;
-            break;
+            if (segmentHasForbiddenBoundaryContact(
+                    pts[i], pts[i + 1], seg.a, seg.b,
+                    pts.front(), pts.back(), endpoint_tol)) {
+                result.intersects = true;
+                break;
+            }
         }
         if (result.intersects)
             break;
     }
 
     for (int i = 1; i + 1 < (int)pts.size(); ++i) {
-        if ((pts[i] - pts.front()).norm() <= curve_endpoint_tol ||
-            (pts[i] - pts.back()).norm() <= curve_endpoint_tol)
+        if ((pts[i] - pts.front()).norm() <= endpoint_tol ||
+            (pts[i] - pts.back()).norm() <= endpoint_tol)
             continue;
         double p = roadEdgeOutsidePenalty(pts[i], segments, outside_tol);
         if (p > 1e-3) {
@@ -374,10 +496,13 @@ inline BoundarySafetyResult curveBoundarySafety(
 inline BoundarySafetyResult curveBoundarySafety(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
         const Vec2d& center, int min_samples = 64,
-        double curve_endpoint_tol = 0.75,
+        double curve_endpoint_tol = kConnectionPointTolerance,
         double boundary_endpoint_tol = 0.10,
-        double outside_tol = 0.05) {
-    auto all_segments = buildBoundarySafetySegments(boundaries, center);
+        double outside_tol = 0.05,
+        const Polygon2d* fence_outline = nullptr,
+        double sample_spacing = 0.18) {
+    auto all_segments = buildBoundarySafetySegments(
+        boundaries, center, nullptr, fence_outline);
     // 候选检查通常只涉及密集 Boundary 集合中的局部区域。
     // 保留 3 米缓冲带，因为 roadEdgeOutsidePenalty 会使用该范围；
     // 先过滤可避免每个采样点都扫描完整集合，同时保持结果不变。
@@ -388,10 +513,7 @@ inline BoundarySafetyResult curveBoundarySafety(
         query_box.max_pt += Vec2d(3.05, 3.05);
         segments.reserve(all_segments.size());
         for (const auto& seg : all_segments) {
-            BoundingBox2d seg_box;
-            seg_box.expand(seg.a);
-            seg_box.expand(seg.b);
-            if (query_box.intersects(seg_box))
+            if (query_box.intersects(seg.bbox))
                 segments.push_back(seg);
         }
     } else {
@@ -399,7 +521,7 @@ inline BoundarySafetyResult curveBoundarySafety(
     }
     return curveBoundarySafety(
         curve, segments, min_samples, curve_endpoint_tol,
-        boundary_endpoint_tol, outside_tol);
+        boundary_endpoint_tol, outside_tol, sample_spacing);
 }
 
 // 曲线相对折线中被标记区间的最大横向偏移（"擦碰深度"）。
@@ -515,22 +637,33 @@ inline bool boundaryExemptMasksEmpty(const std::vector<std::vector<bool>>& masks
 inline BoundarySafetyResult curveBoundarySafetyIgnoringEndpointGraze(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
         const Vec2d& center, int min_samples = 64,
-        double curve_endpoint_tol = 0.75, double boundary_endpoint_tol = 0.10,
+        double curve_endpoint_tol = kConnectionPointTolerance, double boundary_endpoint_tol = 0.10,
         double outside_tol = 0.05, double pos_tol = 0.60,
-        double dir_min_dot = 0.70, double graze_tol = 0.25) {
-    const BoundarySafetyResult strict = curveBoundarySafety(
+        double dir_min_dot = 0.70, double graze_tol = 0.25,
+        const Polygon2d* fence_outline = nullptr) {
+    // 保留旧函数名以兼容已有调用方，但“忽略端点擦碰”已不再是产品规则：
+    // 只有曲线真实首/尾连接点允许浮点误差，端点后的贴合、重叠和穿越一律保留。
+    (void)pos_tol;
+    (void)dir_min_dot;
+    (void)graze_tol;
+    return curveBoundarySafety(
         curve, boundaries, center, min_samples, curve_endpoint_tol,
-        boundary_endpoint_tol, outside_tol);
-    if (isgLegacyGraze() || (!strict.intersects && !strict.outside_road_edge))
-        return strict;
-    const std::vector<std::vector<bool>> masks = endpointGrazeExemptSegmentMasks(
-        curve, boundaries, pos_tol, dir_min_dot, graze_tol);
-    if (boundaryExemptMasksEmpty(masks))
-        return strict;
-    std::vector<BoundarySafetySegment> segments =
-        buildBoundarySafetySegments(boundaries, center, &masks);
-    return curveBoundarySafety(curve, segments, min_samples, curve_endpoint_tol,
-                              boundary_endpoint_tol, outside_tol);
+        boundary_endpoint_tol, outside_tol, fence_outline);
+}
+
+/// 生成、优化后审计与公共约束验证共用的输入级边界口径。只有精细路口面可作为
+/// RoadEdge 重复轮廓证据；粗糙包络不参与该判断，避免放宽真实道路边界。
+inline BoundarySafetyResult curveBoundarySafetyForInput(
+        const BezierCurve& curve, const IntersectionInput& input,
+        int min_samples = 64, double curve_endpoint_tol = kConnectionPointTolerance,
+        double boundary_endpoint_tol = 0.10, double outside_tol = 0.05) {
+    const Polygon2d* fence_outline =
+        !input.area.is_rough && !input.area.geometry.outer.empty()
+            ? &input.area.geometry : nullptr;
+    return curveBoundarySafetyIgnoringEndpointGraze(
+        curve, input.boundaries, boundarySafetyCenter(input), min_samples,
+        curve_endpoint_tol, boundary_endpoint_tol, outside_tol,
+        0.60, 0.70, 0.25, fence_outline);
 }
 
 } // 命名空间 isg

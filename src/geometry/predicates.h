@@ -30,7 +30,7 @@ double minimumCurveBoundaryDistanceForAudit(const BezierCurve& curve,
                                             const std::vector<Boundary>& boundaries,
                                             Boundary::Type type,
                                             int samples = 64,
-                                            double endpoint_exclusion = 0.75,
+                                            double endpoint_exclusion = 1e-4,
                                             Vec2d* location = nullptr);
 
 }  // 命名空间 isg

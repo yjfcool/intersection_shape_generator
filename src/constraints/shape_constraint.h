@@ -5,7 +5,8 @@
 
 namespace isg {
 
-/// 检查普通直行/转向曲线的端点、控制轴、单段和单拱形态。
+/// 检查普通直行/转向曲线的端点、控制轴和形态；严格避让回退允许两段
+/// G1 路点曲线，普通自然候选仍保持单段 cubic。
 ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
                                        const CurveGenerationContext& context);
 

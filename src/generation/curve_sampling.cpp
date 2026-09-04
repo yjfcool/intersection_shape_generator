@@ -15,6 +15,16 @@ SampledCurve sampleCurveForIntersections(
     sampled.pts = curve.sampleByArcLength(std::min(count, 160));
     for (const auto& point : sampled.pts)
         sampled.bbox.expand(point);
+    if (sampled.pts.size() >= 2) {
+        sampled.segment_boxes.resize(sampled.pts.size() - 1);
+        sampled.segment_midpoints.reserve(sampled.pts.size() - 1);
+        for (std::size_t i = 0; i + 1 < sampled.pts.size(); ++i) {
+            sampled.segment_boxes[i].expand(sampled.pts[i]);
+            sampled.segment_boxes[i].expand(sampled.pts[i + 1]);
+            sampled.segment_midpoints.push_back(
+                0.5 * (sampled.pts[i] + sampled.pts[i + 1]));
+        }
+    }
     return sampled;
 }
 

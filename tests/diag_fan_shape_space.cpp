@@ -12,11 +12,13 @@
 //
 // Usage: diag_fan_shape_space <data.json> <target_id> <sibling_id> [...]
 #include "constraints/shape_constraint.h"
+#include "constraints/constraint_evaluator.h"
 #include "curve/curve_utils.h"
 #include "domain/scene_context.h"
 #include "generation/connectivity_generation_context.h"
 #include "intersection_shape_generator.h"
 #include "io/iodata_json.h"
+#include "toolkits/toolkits.h"
 #include "utils.h"
 
 #include <cstdio>
@@ -40,6 +42,33 @@ BezierCurve makeCubic(const Vec2d& p0, const Vec2d& t0, const Vec2d& p1,
     return curve;
 }
 
+bool hasPhysicalViolation(const BezierCurve& curve,
+                          const SceneContext& scene,
+                          const Connectivity& conn) {
+    CurveGenerationContext context = CurveGenerationContextBuilder().build(
+        scene, conn);
+    context.profile.enforce_fence = true;
+    // Match the generator's strict candidate gate rather than the evaluator's
+    // lower default sample count; narrow fence notches must not be skipped.
+    context.profile.samples = 64;
+    context.profile.check_self_intersection = true;
+    context.profile.check_obstacle = true;
+    context.profile.check_boundary = true;
+    context.profile.check_g1 = false;
+    context.profile.check_curvature = false;
+    context.profile.check_ordinary_shape = false;
+    context.profile.check_uturn_shape = false;
+    context.profile.check_crosswalk = false;
+    context.profile.check_cluster = false;
+    context.profile.road_edge_clearance = 0.0;
+    const ConstraintReport report = ConstraintEvaluator().evaluate(
+        curve, context, GenerationState());
+    for (const auto& result : report.results)
+        if (result.state == ConstraintState::Violated)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -54,10 +83,16 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; ++i)
         sibling_ids.push_back(argv[i]);
 
-    IntersectionInput input = IntersectionIO::loadFromFile(path);
+    // The generator owns the direction-normalization pass. Keep its input raw
+    // for the formal output, and build a separate once-normalized copy for the
+    // candidate-space inspection below; passing an already normalized input to
+    // generate() would apply the pass twice and change exit tangents.
+    const IntersectionInput raw_input = IntersectionIO::loadFromFile(path);
+    IntersectionInput input = InputNormalizer(raw_input);
+    ConnectivityDirectionNormalizer(input, ConnectivityDirectionConfig{});
     IntersectionShapeGenerator gen;
     IntersectionOutput output;
-    if (!gen.generate(input, output)) {
+    if (!gen.generate(raw_input, output)) {
         fprintf(stderr, "GEN FAILED\n");
         return 1;
     }
@@ -99,6 +134,14 @@ int main(int argc, char** argv) {
         } else {
             printf("  final: %d segments\n", c.numSegments());
         }
+    }
+    for (const ConnId& sibling_id : sibling_ids) {
+        auto sibling_it = finals.find(sibling_id);
+        if (sibling_it == finals.end() || sibling_it->second->numSegments() != 1)
+            continue;
+        const auto& g = sibling_it->second->segs.front().ctrl;
+        printf("  sibling %s: h0=%.3f h1=%.3f\n", sibling_id.c_str(),
+               (g[1] - g[0]).norm(), (g[3] - g[2]).norm());
     }
 
     const int kSteps = 16;
@@ -153,5 +196,122 @@ int main(int argc, char** argv) {
         }
     }
     printf("  shape-feasible cells=%d, of which clean=%d\n", feasible, clean);
+
+    if (std::getenv("ISG_DIAG_PHYSICAL") && sibling_ids.size() >= 1) {
+        std::vector<const Connectivity*> members;
+        auto find_conn = [&](const ConnId& id) -> const Connectivity* {
+            for (const auto& conn : input.connectivities)
+                if (conn.id == id)
+                    return &conn;
+            return nullptr;
+        };
+        members.push_back(target);
+        for (const ConnId& id : sibling_ids) {
+            const Connectivity* conn = find_conn(id);
+            if (conn)
+                members.push_back(conn);
+        }
+        SceneContext physical_scene(input);
+        std::vector<std::vector<BezierCurve>> safe(members.size());
+        const int physical_steps = 32;
+        for (std::size_t mi = 0; mi < members.size(); ++mi) {
+            const auto entry_m = input.entryPtDir(members[mi]->entry_lane_id);
+            const auto exit_m = input.exitPtDir(members[mi]->exit_lane_id);
+            const auto bounds_m = ordinarySingleCubicHandleBounds(
+                entry_m.first, entry_m.second, exit_m.first, exit_m.second,
+                false);
+            const double chord_m = (exit_m.first - entry_m.first).norm();
+            const double turn_m = chord_m > 1e-8
+                ? std::abs(cross2d(entry_m.second.normalized(),
+                                   (exit_m.first - entry_m.first).normalized()))
+                : 0.0;
+            for (int i0 = 0; i0 <= physical_steps; ++i0) {
+                const double f0 = 0.02 + 0.98 * i0 / physical_steps;
+                const double h0 = std::max(bounds_m.start_min,
+                                           f0 * bounds_m.start_max);
+                for (int i1 = 0; i1 <= physical_steps; ++i1) {
+                    const double f1 = 0.02 + 0.98 * i1 / physical_steps;
+                    const double h1 = std::max(bounds_m.end_min,
+                                               f1 * bounds_m.end_max);
+                    const BezierCurve candidate = makeCubic(
+                        entry_m.first, entry_m.second, exit_m.first,
+                        exit_m.second, h0, h1);
+                    if (!ordinarySingleCubicControlsValid(
+                            candidate, entry_m.first, entry_m.second,
+                            exit_m.first, exit_m.second, 1e-5, false) ||
+                        curveSelfIntersectsBusiness(candidate, 1.0))
+                        continue;
+                    const double ratio = candidate.arcLength() / chord_m;
+                    const double min_ratio = chord_m < 12.0 ? 1.02 : 1.06;
+                    const double max_ratio = chord_m <= 15.0 ? 1.40 : 1.35;
+                    if ((turn_m > 0.25 &&
+                         (ratio < min_ratio || ratio > max_ratio ||
+                          candidate.maxCurvature(20) > 2.5)) ||
+                        (turn_m <= 0.25 &&
+                         (ratio > 1.08 || candidate.maxCurvature(40) > 3.0)) ||
+                        hasPhysicalViolation(candidate, physical_scene, *members[mi]))
+                        continue;
+                    safe[mi].push_back(candidate);
+                }
+            }
+            printf("  physical-safe %s: %zu candidates\n",
+                   members[mi]->id.c_str(), safe[mi].size());
+            if (std::getenv("ISG_DIAG_PRINT_SAFE")) {
+                printf("    safe handles %s:", members[mi]->id.c_str());
+                for (const auto& candidate : safe[mi]) {
+                    printf(" %.3f/%.3f",
+                           (candidate.segs.front().ctrl[1] -
+                            candidate.segs.front().ctrl[0]).norm(),
+                           (candidate.segs.front().ctrl[3] -
+                            candidate.segs.front().ctrl[2]).norm());
+                }
+                printf("\n");
+            }
+        }
+        if (members.size() >= 2) {
+            int pair_ok = 0;
+            for (const auto& a : safe[0])
+                for (const auto& b : safe[1])
+                    if (!curvesIntersectBusiness(a, b, 1.5) &&
+                        !sharedEndpointControlPolylinesCross(a, b, 0.30)) {
+                        ++pair_ok;
+                        if (pair_ok <= 8)
+                            printf("    pair h=%.3f/%.3f %.3f/%.3f\n",
+                                   (a.segs[0].ctrl[1] - a.segs[0].ctrl[0]).norm(),
+                                   (a.segs[0].ctrl[3] - a.segs[0].ctrl[2]).norm(),
+                                   (b.segs[0].ctrl[1] - b.segs[0].ctrl[0]).norm(),
+                                   (b.segs[0].ctrl[3] - b.segs[0].ctrl[2]).norm());
+                    }
+            printf("  physical-safe pair %s|%s combinations=%d\n",
+                   members[0]->id.c_str(), members[1]->id.c_str(), pair_ok);
+        }
+        if (members.size() == 3) {
+            int triples = 0;
+            for (const auto& a : safe[0]) {
+                for (const auto& b : safe[1]) {
+                    if (curvesIntersectBusiness(a, b, 1.5) ||
+                        sharedEndpointControlPolylinesCross(a, b, 0.30))
+                        continue;
+                    for (const auto& c : safe[2]) {
+                        if (!curvesIntersectBusiness(a, c, 1.5) &&
+                            !sharedEndpointControlPolylinesCross(a, c, 0.30) &&
+                            !curvesIntersectBusiness(b, c, 1.5) &&
+                            !sharedEndpointControlPolylinesCross(b, c, 0.30)) {
+                            ++triples;
+                            if (triples <= 5)
+                                printf("    triple h=%.3f/%.3f %.3f/%.3f %.3f/%.3f\n",
+                                       (a.segs[0].ctrl[1] - a.segs[0].ctrl[0]).norm(),
+                                       (a.segs[0].ctrl[3] - a.segs[0].ctrl[2]).norm(),
+                                       (b.segs[0].ctrl[1] - b.segs[0].ctrl[0]).norm(),
+                                       (b.segs[0].ctrl[3] - b.segs[0].ctrl[2]).norm(),
+                                       (c.segs[0].ctrl[1] - c.segs[0].ctrl[0]).norm(),
+                                       (c.segs[0].ctrl[3] - c.segs[0].ctrl[2]).norm());
+                        }
+                    }
+                }
+            }
+            printf("  physical-safe triples=%d\n", triples);
+        }
+    }
     return 0;
 }

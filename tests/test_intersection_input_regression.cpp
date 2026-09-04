@@ -7,6 +7,8 @@
 #include "curve/curve_utils.h"
 #include "generation/uturn_shape.h"
 #include "generator/polygon_builder.h"
+#include "geometry/predicates.h"
+#include "initialization/ordinary_curve_initializer.h"
 #include "intersection_shape_generator.h"
 #include "io/iodata_json.h"
 #include "optimizer/sdf_field.h"
@@ -523,21 +525,14 @@ static std::vector<CurveBoundaryHitForTest> rawCurveBoundaryHitsForTest(
         bool hit_boundary = false;
         for (int i = 0; i + 1 < (int)pts.size() && !hit_boundary; ++i) {
             for (int j = 0; j + 1 < (int)bpts.size(); ++j) {
-                Vec2d isect;
-                if (!segmentsIntersect(
-                        pts[i], pts[i + 1], bpts[j], bpts[j + 1], &isect))
+                if (!segmentHasForbiddenBoundaryContact(
+                        pts[i], pts[i + 1], bpts[j], bpts[j + 1],
+                        pts.front(), pts.back(), curve_endpoint_tol))
                     continue;
-                if ((isect - curve.startPt()).norm() <= curve_endpoint_tol ||
-                    (isect - curve.endPt()).norm() <= curve_endpoint_tol)
-                    continue;
-                bool at_boundary_endpoint =
-                    (j == 0 &&
-                     (isect - bpts.front()).norm() <= boundary_endpoint_tol) ||
-                    (j + 1 == (int)bpts.size() - 1 &&
-                     (isect - bpts.back()).norm() <= boundary_endpoint_tol);
-                if (at_boundary_endpoint)
-                    continue;
-                hits.push_back({boundary.id, isect});
+                Vec2d witness;
+                segmentsIntersect(
+                    pts[i], pts[i + 1], bpts[j], bpts[j + 1], &witness);
+                hits.push_back({boundary.id, witness});
                 hit_boundary = true;
                 break;
             }
@@ -1232,6 +1227,38 @@ TEST_CASE("RoadEdge boundary safety rejects adherent contact and outside crossin
         curveBoundarySafety(crossing, std::vector<Boundary>{edge}, center, 96);
     CHECK(crossing_safety.intersects);
     CHECK((crossing_safety.intersects || crossing_safety.outside_road_edge));
+
+    BezierCurve outside_only;
+    outside_only.segs.push_back(makeCubicG1(
+        Vec2d(2, -2), Vec2d(1, 0), Vec2d(8, -2), Vec2d(1, 0), 0.30));
+    BoundarySafetyResult outside_safety =
+        curveBoundarySafety(outside_only, std::vector<Boundary>{edge}, center, 96);
+    INFO("a long edge with a local center-side witness must reject an outside-only curve");
+    CHECK(outside_safety.outside_road_edge);
+
+    Polygon2d fence_outline;
+    fence_outline.outer = {Vec2d(-1, 0.4), Vec2d(11, 0.4),
+                           Vec2d(11, 8), Vec2d(-1, 8)};
+    BoundarySafetyResult duplicate_outline_safety = curveBoundarySafety(
+        outside_only, std::vector<Boundary>{edge}, center, 96,
+        0.75, 0.10, 0.05, &fence_outline);
+    INFO("a RoadEdge repeated by the fine fence outline must not define a second infinite half-plane");
+    CHECK_FALSE(duplicate_outline_safety.intersects);
+    CHECK_FALSE(duplicate_outline_safety.outside_road_edge);
+
+    BoundarySafetyResult duplicate_outline_crossing = curveBoundarySafety(
+        crossing, std::vector<Boundary>{edge}, center, 96,
+        0.75, 0.10, 0.05, &fence_outline);
+    INFO("disabling the duplicate half-plane must retain real RoadEdge intersections");
+    CHECK(duplicate_outline_crossing.intersects);
+
+    Boundary diagonal = edge;
+    diagonal.geometry.points = {Vec2d(0, 0), Vec2d(10, 10)};
+    Polygon2d square;
+    square.outer = {Vec2d(0, 0), Vec2d(10, 0),
+                    Vec2d(10, 10), Vec2d(0, 10)};
+    INFO("endpoint proximity alone must not classify a cross-intersection edge as a fence duplicate");
+    CHECK_FALSE(roadEdgeDuplicatesFenceOutline(diagonal, &square));
 }
 
 static Vec2d expectedLaneCutPoint(
@@ -2317,6 +2344,64 @@ TEST_CASE("100000547 fine area preserves local RoadEdge chain shapes",
     CHECK_FALSE(hasPolygonPointNear(synthetic_area.geometry.outer, outer_tip, 1e-6));
 }
 
+TEST_CASE("100000547 U-turn 1 and right turns keep canonical segmented/natural shapes",
+          "[regression][shape][uturn][right-turn][100000547]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000547.json";
+    IntersectionInput input = loadInputOrSkip(path);
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(gen.generate(input, output));
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    INFO("100000547 shape generation elapsed_ms=" << elapsed_ms);
+    CHECK(elapsed_ms < 15000.0);
+
+    auto curves = curveMap(output);
+    REQUIRE(curves.count("1") == 1);
+    REQUIRE(curves["1"]->curve);
+    const BezierCurve& uturn = *curves["1"]->curve;
+    REQUIRE(uturn.numSegments() == 3);
+    CHECK(segmentLooksStraightForTest(uturn.segs.front()));
+    CHECK(segmentLooksStraightForTest(uturn.segs.back()));
+    CHECK((uturn.segs.front().ctrl[3] - uturn.segs.front().ctrl[0]).norm() >= 2.0 - 1e-6);
+    CHECK((uturn.segs.back().ctrl[3] - uturn.segs.back().ctrl[0]).norm() >= 2.0 - 1e-6);
+    auto uturn_entry = input.entryPtDir(curves["1"]->entry_lane_id);
+    auto uturn_exit = input.exitPtDir(curves["1"]->exit_lane_id);
+    Vec2d uturn_axis = uturn_entry.second.normalized() - uturn_exit.second.normalized();
+    uturn_axis.normalize();
+    if (uturn_axis.dot(uturn_entry.second) < 0.0)
+        uturn_axis = -uturn_axis;
+    CHECK(std::abs((uturn.segs.front().ctrl[3] - uturn.segs.back().ctrl[0]).dot(uturn_axis)) < 0.05);
+    CHECK(uturn.segs[1].maxCurvature(30) > 0.03);
+    CHECK_FALSE(curveSelfIntersectsBusiness(uturn, 1.0));
+
+    const OrdinaryCurveInitializer initializer;
+    for (const ConnId& id : {ConnId("13"), ConnId("11")}) {
+        REQUIRE(curves.count(id) == 1);
+        REQUIRE(curves[id]->curve);
+        const BezierCurve& curve = *curves[id]->curve;
+        REQUIRE(curve.numSegments() == 1);
+        const auto entry = input.entryPtDir(curves[id]->entry_lane_id);
+        const auto exit = input.exitPtDir(curves[id]->exit_lane_id);
+        const BezierCurve preferred = initializer.buildPreferredSingleCubic(
+            entry.first, entry.second, exit.first, exit.second);
+        REQUIRE(preferred.numSegments() == 1);
+        CHECK(ordinarySingleCubicControlsValid(
+            curve, entry.first, entry.second, exit.first, exit.second,
+            1e-5, true));
+        CHECK(std::abs((curve.segs.front().ctrl[1] - entry.first).norm() -
+                       (preferred.segs.front().ctrl[1] - entry.first).norm()) < 0.05);
+        CHECK(std::abs((exit.first - curve.segs.front().ctrl[2]).norm() -
+                       (exit.first - preferred.segs.front().ctrl[2]).norm()) < 0.05);
+        CHECK(arcChordRatioForTest(curve) > 1.08);
+        CHECK(curve.maxCurvature(40) < 0.50);
+        CHECK_FALSE(hasCurvatureSignFlipForTest(curve));
+    }
+    CHECK_FALSE(curvesIntersectBeyondAllowedEndpointOverlapForTest(
+        *curves["13"]->curve, *curves["11"]->curve, 0.30));
+}
+
 TEST_CASE("100000610 fine area clips merged RoadEdges toward the intersection",
           "[regression][area][shared-edge][100000610]") {
     const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000610.json";
@@ -2763,7 +2848,7 @@ TEST_CASE("100000443 U-turn three-segment shape and crosswalk clearance",
     for (const auto& pair : std::vector<std::pair<ConnId, ConnId>>{
              {"18", "20"}, {"19", "20"}, {"33", "34"},
              {"40", "42"}, {"40", "44"}, {"42", "44"},
-             {"41", "43"}}) {
+             {"41", "43"}, {"5", "9"}}) {
         const auto& a = require_curve(pair.first);
         const auto& b = require_curve(pair.second);
         INFO("same-direction same-cluster pair " << pair.first << "|"
@@ -2772,6 +2857,9 @@ TEST_CASE("100000443 U-turn three-segment shape and crosswalk clearance",
         CHECK_FALSE(curvesIntersectBeyondAllowedEndpointOverlapForTest(
             *a.curve, *b.curve, 0.15));
     }
+    INFO("long near-straight conn 9 uses the bounded two-segment waypoint fallback "
+         "when its single-cubic domain has no compatible conn 5");
+    CHECK(require_curve("9").curve->numSegments() == 2);
 
     // ── (E) Reported turns do not traverse nearby boundaries ────────────────
     for (const ConnId& id : {"10", "12", "14", "28", "30", "39"}) {
@@ -2954,6 +3042,88 @@ TEST_CASE("100000012 straight curves keep shape and same-cluster separation",
             CHECK_FALSE(hasCurvatureSignFlipForTest(middle));
         }
     }
+}
+
+// 100001036 的 43123902 是精细 area.outer 的重复 RoadEdge（整条最大偏差
+// 约 0.472m）。旧中心侧规则把这条约 4m 的有限边外推成无限半平面：右转25
+// 的首选单段因此被误送进多段 Boundary 避让，左转53则在物理优化中获得横向
+// 自由度并把退出把手推过方向射线交点，最终穿过同入同簇的54/55。
+// 本用例同时锁住根因修复和两组曲线的表达、轴向范围、物理与拓扑约束。
+TEST_CASE("100001036 fence-duplicate RoadEdge keeps right 25 and left 53 families valid",
+          "[regression][boundary][shape][cluster][g1][100001036]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100001036.json";
+    IntersectionInput input = loadInputOrSkip(path);
+    REQUIRE_FALSE(input.area.is_rough);
+    REQUIRE(input.mode == 2);
+    // 生成器内部按输入规范化车道方向；曲线轴向审计必须使用同一规范化
+    // 参考系，否则原始折线切向会与输出端点产生亚厘米级坐标差异。
+    IntersectionInput normalized_input = InputNormalizer(input);
+    ConnectivityDirectionNormalizer(normalized_input, ConnectivityDirectionConfig{});
+
+    auto started = std::chrono::steady_clock::now();
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    INFO("100001036 generation elapsed_ms=" << elapsed_ms);
+    CHECK(elapsed_ms < 15000.0);
+
+    auto curves = curveMap(output);
+    const std::vector<ConnId> right_ids = {"25", "26", "27"};
+    const std::vector<ConnId> left_ids = {"53", "54", "55"};
+    std::vector<ConnId> target_ids = right_ids;
+    target_ids.insert(target_ids.end(), left_ids.begin(), left_ids.end());
+
+    for (const ConnId& id : target_ids) {
+        REQUIRE(curves.count(id) == 1);
+        REQUIRE(curves[id]->curve);
+        const ConnectivityCurve& cc = *curves[id];
+        const BezierCurve& curve = *cc.curve;
+        auto entry = normalized_input.entryPtDir(cc.entry_lane_id);
+        auto exit_ = normalized_input.exitPtDir(cc.exit_lane_id);
+
+        INFO("conn " << id << " segments=" << curve.numSegments()
+             << " reason=" << cc.violation.reason);
+        CHECK(curve.numSegments() == 1);
+        CHECK(endpointG1Min(cc, input) > 0.99);
+        CHECK(ordinarySingleCubicControlsValid(
+            curve, entry.first, entry.second, exit_.first, exit_.second, 1e-5, true));
+        CHECK_FALSE(curveSelfIntersectsBusiness(curve, 1.0));
+        CHECK(cc.violation.reason.empty());
+
+        const BoundarySafetyResult safety = curveBoundarySafetyForInput(
+            curve, input, 128, 0.15, 0.10, 0.05);
+        INFO("conn " << id << " boundary intersects=" << safety.intersects
+             << " outside=" << safety.outside_road_edge
+             << " penalty=" << safety.outside_penalty);
+        CHECK_FALSE(safety.intersects);
+        CHECK_FALSE(safety.outside_road_edge);
+        CHECK(curveInsideFence(curve, input.area.geometry, 64));
+
+        Vec2d clearance_location(0, 0);
+        const double road_edge_distance = minimumCurveBoundaryDistanceForAudit(
+            curve, input.boundaries, Boundary::Type::RoadEdge,
+            128, 0.75, &clearance_location);
+        INFO("conn " << id << " min non-endpoint RoadEdge distance="
+             << road_edge_distance);
+        CHECK(road_edge_distance >= 0.95);
+    }
+
+    auto check_family = [&](const std::vector<ConnId>& ids) {
+        for (size_t i = 0; i < ids.size(); ++i) {
+            for (size_t j = i + 1; j < ids.size(); ++j) {
+                const BezierCurve& a = *curves[ids[i]]->curve;
+                const BezierCurve& b = *curves[ids[j]]->curve;
+                INFO("same-entry family pair " << ids[i] << "|" << ids[j]
+                     << " must not cross or have interpenetrating control polygons");
+                CHECK_FALSE(curvesIntersectBusiness(a, b, 1.5));
+                CHECK_FALSE(sharedEndpointControlPolylinesCross(a, b));
+            }
+        }
+    };
+    check_family(right_ids);
+    check_family(left_ids);
 }
 
 TEST_CASE("100000643 obstacle reroute preserves same-cluster U-turn topology", "[regression][cluster][obstacle]") {
@@ -4929,12 +5099,11 @@ TEST_CASE("curveTurningSpan separates a full-loop fold from a legal S-curve",
     CHECK(curveTurningSpan(single, 0) == 0.0);
 }
 
-// 端点贴合 RoadEdge 的共线擦碰豁免必须是**有方向**的：只放行厘米级的共享端点
-// 数值摆动，真正切进路缘照旧判违。这里用合成的发夹形鼻端把两种情形钉死，
-// 顺带锁住"鼻端折回的另一条腿不进豁免区间"——旧的
-// filterEndpointAdherentBoundaries 用整条折线首尾弦方向，会把整条剔除。
-TEST_CASE("endpoint graze exemption clears wobble but keeps real road-edge cuts",
-          "[shape][boundary][graze-exemption]") {
+// 避让约束只允许曲线真实首/尾连接点接触 Boundary；端点后的共线擦碰、贴合
+// 和重叠都必须保留为违约。这里用合成的发夹形鼻端钉死严格口径，并确认
+// Boundary 自身端点不能替代曲线连接点成为豁免条件。
+TEST_CASE("boundary avoidance allows only exact curve connection points",
+          "[shape][boundary][strict-contact]") {
     // 发夹形 RoadEdge：沿 +x 的两条近平行腿，中间一段与腿垂直的鼻端。
     // 共线走向区间因此只覆盖 seg0，鼻端与折回腿留在判违集合内。
     Boundary nose;
@@ -4954,14 +5123,26 @@ TEST_CASE("endpoint graze exemption clears wobble but keeps real road-edge cuts"
     BezierCurve grazing;
     grazing.segs.push_back(wobble);
     // 严格判定必须先报违，否则本用例什么也没验证。
-    const BoundarySafetyResult wobble_strict =
+    const BoundarySafetyResult wobble_direct =
         curveBoundarySafety(grazing, boundaries, center, 128, 0.15, 0.10, 0.05);
-    REQUIRE(wobble_strict.intersects);
-    const BoundarySafetyResult wobble_relaxed =
+    REQUIRE(wobble_direct.intersects);
+    const BoundarySafetyResult wobble_strict =
         curveBoundarySafetyIgnoringEndpointGraze(grazing, boundaries, center, 128, 0.15);
-    INFO("centimetre wobble on the collinear leg must be exempted");
-    CHECK_FALSE(wobble_relaxed.intersects);
-    CHECK_FALSE(wobble_relaxed.outside_road_edge);
+    INFO("contact after the connection point must remain a violation");
+    CHECK(wobble_strict.intersects);
+
+    BezierCurve exact_endpoint_contact;
+    exact_endpoint_contact.segs.push_back(makeCubicG1(
+        Vec2d(0, 0), Vec2d(1, 0), Vec2d(-2, 2), Vec2d(-1, 1), 0.30));
+    const BoundarySafetyResult exact_endpoint_safety =
+        curveBoundarySafetyForInput(exact_endpoint_contact,
+                                     IntersectionInput(), 128, 0.15);
+    // The empty input has no Boundary; the direct check below verifies the actual
+    // endpoint-only contract without relying on input-level fence setup.
+    const BoundarySafetyResult exact_endpoint_direct = curveBoundarySafety(
+        exact_endpoint_contact, boundaries, center, 128, 0.15);
+    CHECK_FALSE(exact_endpoint_safety.intersects);
+    CHECK_FALSE(exact_endpoint_direct.intersects);
 
     // 切进路缘：同样从折线首点出发、同样起始共线，但中途下切约 1.7m 再穿出。
     BezierSegment cut;
@@ -4975,4 +5156,12 @@ TEST_CASE("endpoint graze exemption clears wobble but keeps real road-edge cuts"
         curveBoundarySafetyIgnoringEndpointGraze(cutting, boundaries, center, 128, 0.15);
     INFO("a metre-scale cut through the same leg must stay a violation");
     CHECK(cut_relaxed.intersects);
+
+    BezierCurve near_boundary_endpoint;
+    near_boundary_endpoint.segs.push_back(makeCubicG1(
+        Vec2d(-0.20, 1), Vec2d(1, -0.1), Vec2d(4, 2), Vec2d(1, 0), 0.30));
+    const BoundarySafetyResult near_endpoint_safety = curveBoundarySafety(
+        near_boundary_endpoint, boundaries, center, 128, 0.15);
+    INFO("a Boundary endpoint near, but not equal to, a curve endpoint cannot be exempted");
+    CHECK(near_endpoint_safety.intersects);
 }

@@ -8,6 +8,7 @@
 //
 // 用法: diag_uturn_candidate_cross <data.json> <conn_id> [entry_bias exit_bias]
 #include "constraints/cluster_order.h"
+#include "constraints/boundary_safety.h"
 #include "curve/curve_utils.h"
 #include "generation/uturn_shape.h"
 #include "initialization/uturn_curve_initializer.h"
@@ -29,6 +30,52 @@ using namespace isg;
 namespace {
 
 constexpr double kClusterEndpointTol = 1.5;
+
+double envOverride(const char* name, double fallback) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0')
+        return fallback;
+    char* end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    return end != value && *end == '\0' && std::isfinite(parsed)
+        ? parsed : fallback;
+}
+
+std::vector<std::string> rawBoundaryHits(
+    const BezierCurve& curve, const IntersectionInput& input) {
+    std::vector<std::string> hits;
+    const bool print_contacts = std::getenv("ISG_DIAG_CONTACT") != nullptr;
+    if (curve.empty())
+        return hits;
+    const std::vector<Vec2d> sampled = curve.sampleByArcLength(std::max(
+        64, std::min(240, (int)std::ceil(curve.arcLength() / 0.18) + 1)));
+    for (const auto& boundary : input.boundaries) {
+        const auto& points = boundary.geometry.points;
+        bool hit = false;
+        for (int i = 0; i + 1 < (int)sampled.size() && !hit; ++i) {
+            for (int j = 0; j + 1 < (int)points.size(); ++j) {
+                Vec2d intersection;
+                if (segmentsIntersect(sampled[i], sampled[i + 1],
+                                      points[j], points[j + 1], &intersection) &&
+                    segmentHasForbiddenBoundaryContact(
+                        sampled[i], sampled[i + 1], points[j], points[j + 1],
+                        sampled.front(), sampled.back())) {
+                    hit = true;
+                    if (print_contacts) {
+                        printf("\n    contact %s: (%.6f,%.6f) curve_end_dist=%.6f/%.6f\n",
+                               boundary.id.c_str(), intersection.x(), intersection.y(),
+                               (intersection - sampled.front()).norm(),
+                               (intersection - sampled.back()).norm());
+                    }
+                    break;
+                }
+            }
+        }
+        if (hit)
+            hits.push_back(boundary.id);
+    }
+    return hits;
+}
 
 bool pureGeometricInput(const IntersectionInput& input) {
     return input.obstacles.empty() && input.boundaries.empty() &&
@@ -134,6 +181,12 @@ int main(int argc, char** argv) {
     const ConnId target(argv[2]);
     const double entry_bias = argc > 3 ? std::atof(argv[3]) : 0.0;
     const double exit_bias = argc > 4 ? std::atof(argv[4]) : 0.0;
+    const double middle_handle_scale0 = envOverride(
+        "ISG_DIAG_MIDDLE_HANDLE0", 1.0);
+    const double middle_handle_scale1 = envOverride(
+        "ISG_DIAG_MIDDLE_HANDLE1", 1.0);
+    const bool scan = std::getenv("ISG_DIAG_SCAN") != nullptr;
+    const bool scan_bias_only = std::getenv("ISG_DIAG_SCAN_BIAS_ONLY") != nullptr;
     // 可选：直接覆盖家族分档量，用来观察"若家族给本成员另一个档位会怎样"，
     // 绕开 buildSegmented 内部对反向偏置的槽位钳制。
     const bool override_stagger = argc > 6;
@@ -167,19 +220,37 @@ int main(int argc, char** argv) {
     const UTurnAlignmentScope scope = UTurnAlignmentScope::LaneEndpoint;
     const UTurnFamilyInfo family =
         builder.build(*conn, input, scope, &solver, false);
+    const std::pair<Vec2d, Vec2d> entry =
+        input.entryPtDir(conn->entry_lane_id);
+    const std::pair<Vec2d, Vec2d> exit =
+        input.exitPtDir(conn->exit_lane_id);
+    const double station_offset = envOverride(
+        "ISG_DIAG_STATION_OFFSET", 0.0);
+    double min_lead0 = family.lead0;
+    double min_lead1 = family.lead1;
+    const double target_station = std::isfinite(family.aligned_station)
+        ? family.aligned_station + station_offset
+        : family.aligned_station;
+    builder.enforceAlignmentStation(
+        entry.first, entry.second, exit.first, exit.second,
+        target_station, min_lead0, min_lead1);
     const bool physical = !pureGeometricInput(input);
     const double step = physical && family.rank.family_size >= 3 ? 0.25 : 0.01;
     const UTurnFamilyLadder ladder = builder.familyLateralLadder(
         *conn, input, scope, step, &solver, false);
 
-    const std::pair<Vec2d, Vec2d> entry = input.entryPtDir(conn->entry_lane_id);
-    const std::pair<Vec2d, Vec2d> exit = input.exitPtDir(conn->exit_lane_id);
     const double station = family.rank.family_size > 1
-        ? family.aligned_station : std::numeric_limits<double>::quiet_NaN();
+        ? target_station : std::numeric_limits<double>::quiet_NaN();
     printf("==== %s ====\n", target.c_str());
     printf("  family size=%zu rank=%zu radius=%.4f station=%.4f\n",
            family.rank.family_size, family.rank.reverse_radius_rank,
            family.radius, station);
+    const std::vector<const Connectivity*> family_members =
+        builder.alignmentComponent(*conn, input, scope, &solver, false);
+    printf("  family members:");
+    for (const Connectivity* member : family_members)
+        printf(" %s", member->id.c_str());
+    printf("\n");
     printf("  lead floors: %.4f/%.4f  ladder: step=%.4f entry=%.4f exit=%.4f\n",
            family.lead0, family.lead1, ladder.step,
            ladder.entry_stagger, ladder.exit_stagger);
@@ -203,36 +274,93 @@ int main(int argc, char** argv) {
 
     const std::vector<double> arc_alphas =
         {2.0 / 3.0, 0.75, 0.85, 1.0, 1.25, 1.50, 1.75, 2.0,
-         0.58, 0.50, 0.38, 0.28, 0.16};
+         2.5, 3.0, 4.0, 5.0, 0.58, 0.50, 0.38, 0.28, 0.16};
     const Vec2d lateral_ref{-axis.y(), axis.x()};
     const double side = (exit.first - entry.first).dot(lateral_ref) >= 0.0
         ? 1.0 : -1.0;
-    for (double alpha : arc_alphas) {
+    const std::vector<double> scan_biases =
+        {-2.0, -1.5, -1.0, -0.70, -0.35, 0.0, 0.35, 0.70, 1.0, 1.5, 2.0};
+    const std::vector<double> scan_station_offsets =
+        {-1.0, 0.0, 0.75, 1.5, 2.5, 3.5};
+    const std::vector<double> scan_handle_scales =
+        {0.50, 0.75, 1.0, 1.25, 1.50};
+    const std::vector<double>& use_alphas = scan ? arc_alphas : arc_alphas;
+    for (double alpha : use_alphas) {
+      const std::vector<double>& entry_biases = scan
+          ? scan_biases : std::vector<double>{entry_bias};
+      const std::vector<double>& exit_biases = scan
+          ? scan_biases : std::vector<double>{exit_bias};
+      const std::vector<double> default_station_offsets = {station_offset};
+      const std::vector<double>& station_offsets = scan && !scan_bias_only
+          ? scan_station_offsets : default_station_offsets;
+      const std::vector<double>& handle_scales = scan && !scan_bias_only
+          ? scan_handle_scales : std::vector<double>{1.0};
+      for (double use_entry_bias : entry_biases) {
+       for (double use_exit_bias : exit_biases) {
+        for (double use_station_offset : station_offsets) {
+         for (double use_handle_scale0 : handle_scales) {
+          for (double use_handle_scale1 : handle_scales) {
+        double scan_min_lead0 = family.lead0;
+        double scan_min_lead1 = family.lead1;
+        const double scan_station = std::isfinite(family.aligned_station)
+            ? family.aligned_station + use_station_offset
+            : family.aligned_station;
+        builder.enforceAlignmentStation(
+            entry.first, entry.second, exit.first, exit.second,
+            scan_station, scan_min_lead0, scan_min_lead1);
         const double use_entry_stagger =
             override_stagger ? stagger0_override : ladder.entry_stagger;
         const double use_exit_stagger =
             override_stagger ? stagger1_override : ladder.exit_stagger;
-        const BezierCurve candidate = UTurnCurveInitializer().buildSegmented(
+        BezierCurve candidate = UTurnCurveInitializer().buildSegmented(
             entry.first, entry.second, exit.first, exit.second,
-            family.lead0, family.lead1, alpha, 0.0, 0.0, 0.0,
+            scan_min_lead0, scan_min_lead1, alpha, 0.0, 0.0, 0.0,
             use_entry_stagger, use_exit_stagger,
-            entry_bias, exit_bias, ladder.step);
-        printf("  alpha=%.3f segs=%d", alpha, (int)candidate.numSegments());
+            use_entry_bias, use_exit_bias, ladder.step);
+        if (candidate.numSegments() == 3) {
+            BezierSegment& middle = candidate.segs[1];
+            const Vec2d q0 = middle.ctrl[0];
+            const Vec2d q1 = middle.ctrl[3];
+            Vec2d d0 = middle.ctrl[1] - q0;
+            Vec2d d1 = q1 - middle.ctrl[2];
+            if (d0.norm() > 1e-8)
+                middle.ctrl[1] = q0 + d0.normalized() *
+                    d0.norm() * (scan ? use_handle_scale0 : middle_handle_scale0);
+            if (d1.norm() > 1e-8)
+                middle.ctrl[2] = q1 - d1.normalized() *
+                    d1.norm() * (scan ? use_handle_scale1 : middle_handle_scale1);
+        }
+        printf("  alpha=%.3f bias=%.2f/%.2f station_offset=%.2f handle=%.2f/%.2f segs=%d",
+               alpha, use_entry_bias, use_exit_bias, use_station_offset,
+               use_handle_scale0, use_handle_scale1,
+               (int)candidate.numSegments());
         if (candidate.numSegments() != 3) { printf(" (not segmented)\n"); continue; }
+        const BoundarySafetyResult boundary_safety =
+            curveBoundarySafetyForInput(candidate, input, 128);
+        const std::vector<std::string> boundary_hits =
+            rawBoundaryHits(candidate, input);
         const Vec2d q0 = candidate.segs.front().ctrl[3];
         const Vec2d q1 = candidate.segs.back().ctrl[0];
         const double kmax = candidate.maxCurvature(40);
+        printf(" boundary=%d outside=%d raw=",
+               (int)(boundary_safety.intersects || boundary_safety.outside_road_edge),
+               (int)boundary_safety.outside_road_edge);
+        for (const auto& boundary_id : boundary_hits)
+            printf("%s,", boundary_id.c_str());
         printf(" lead=%.3f/%.3f gap=%.4f q0lat=%+.4f q1lat=%+.4f"
                " d_station=%.4f/%.4f kmax=%.3f(<%.3f) self=%d round=%d",
                (q0 - entry.first).norm(), (exit.first - q1).norm(),
                (q1 - q0).norm(),
                (q0 - exit.first).dot(lateral_ref) * side,
                (q1 - exit.first).dot(lateral_ref) * side,
-               std::isfinite(station) ? q0.dot(axis) - station : 0.0,
-               std::isfinite(station) ? q1.dot(axis) - station : 0.0,
+               std::isfinite(scan_station) ? q0.dot(axis) - scan_station : 0.0,
+               std::isfinite(scan_station) ? q1.dot(axis) - scan_station : 0.0,
                kmax, max_curvature,
                (int)curveSelfIntersectsBusiness(candidate, 1.0),
                (int)segmentedUTurnMiddleArcLooksRound(candidate, axis));
+        if (scan || std::getenv("ISG_DIAG_POINTS"))
+            printf(" q0=(%.3f,%.3f) q1=(%.3f,%.3f)",
+                   q0.x(), q0.y(), q1.x(), q1.y());
         printf(" crosses:");
         int count = 0;
         std::vector<ConnId> hits;
@@ -248,6 +376,13 @@ int main(int argc, char** argv) {
         }
         if (count == 0) printf(" none");
         printf("\n");
+        if (scan && boundary_hits.empty() && count == 0 &&
+            kmax < max_curvature && !curveSelfIntersectsBusiness(candidate, 1.0) &&
+            candidate.arcLength() / std::max(1e-6, (entry.first - exit.first).norm()) >= 1.35) {
+            printf("    SCAN_SAFE alpha=%.3f bias=%.2f/%.2f station_offset=%.2f handle=%.2f/%.2f\n",
+                   alpha, use_entry_bias, use_exit_bias, use_station_offset,
+                   use_handle_scale0, use_handle_scale1);
+        }
         {
             const Vec2d lat_dir{-axis.y(), axis.x()};
             const double sgn =
@@ -269,6 +404,11 @@ int main(int argc, char** argv) {
                            : "无结构性豁免");
             }
         }
+          }
+         }
+        }
+       }
+      }
     }
 
     // 同簇伙伴在"出口车道回退方向"上的有符号横向剖面：用于判断掉头的首尾直段

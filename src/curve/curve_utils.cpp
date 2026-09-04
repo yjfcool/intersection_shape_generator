@@ -284,6 +284,15 @@ bool curvesIntersectBusinessOutsideBalls(const BezierCurve& a,
     auto pb = adaptiveSample(b);
     for (int i = 0; i + 1 < (int)pa.size(); ++i) {
         for (int j = 0; j + 1 < (int)pb.size(); ++j) {
+            if (std::max(pa[i].x(), pa[i + 1].x()) <
+                    std::min(pb[j].x(), pb[j + 1].x()) ||
+                std::max(pb[j].x(), pb[j + 1].x()) <
+                    std::min(pa[i].x(), pa[i + 1].x()) ||
+                std::max(pa[i].y(), pa[i + 1].y()) <
+                    std::min(pb[j].y(), pb[j + 1].y()) ||
+                std::max(pb[j].y(), pb[j + 1].y()) <
+                    std::min(pa[i].y(), pa[i + 1].y()))
+                continue;
             Vec2d isect;
             if (!segmentsIntersect(pa[i], pa[i + 1], pb[j], pb[j + 1], &isect))
                 continue;
