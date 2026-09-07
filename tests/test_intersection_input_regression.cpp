@@ -2605,6 +2605,45 @@ TEST_CASE("100000443 road edge clipping ignores opposite-direction group hits",
     }
 }
 
+TEST_CASE("100002465 area keeps the inward 485 RoadEdge branch",
+          "[regression][area][road-edge-chain][100002465]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100002465.json";
+    IntersectionInput input = loadInputOrSkip(path);
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(gen.generate(input, output));
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    INFO("100002465 generation elapsed_ms=" << elapsed_ms);
+    INFO("100002465 area generation elapsed_ms=" << output.perf.area_gen_ms);
+    REQUIRE(elapsed_ms < 15000.0);
+    REQUIRE(output.perf.area_gen_ms < 1000.0);
+    REQUIRE_FALSE(output.area.geometry.outer.empty());
+    REQUIRE(isSimplePolygon(output.area.geometry));
+
+    const Boundary* edge485 = findBoundary(input, "485");
+    const Boundary* edge703 = findBoundary(input, "703");
+    REQUIRE(edge485);
+    REQUIRE(edge703);
+    INFO("RoadEdge 485 must return from the cut point to the shared 485|703 node");
+    CHECK(hasPolygonPointNear(
+        output.area.geometry.outer, edge485->geometry.points.front(), 0.08));
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, edge485->geometry.points[1], 0.08));
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, edge485->geometry.points[2], 0.08));
+    INFO("The remote 485 endpoint would create the reported outward spike");
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, edge485->geometry.points.back(), 0.08));
+    INFO("The remote 703 endpoint would create the original outward spike");
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, edge703->geometry.points.front(), 0.08));
+    INFO("The shared 485|703 endpoint is the inward return node, not a spike");
+    CHECK(hasPolygonPointNear(
+        output.area.geometry.outer, edge703->geometry.points.back(), 0.08));
+}
+
 TEST_CASE("U-turn alignment scope switches between lane endpoint and lane group families",
           "[regression][uturn][alignment]") {
     IntersectionInput input = makeUTurnAlignmentScopeInput();

@@ -1769,12 +1769,152 @@ private:
                 if (total > 0.05)
                     result.boundary_lines.push_back(boundary_lines[i].pts);
             } else {
-                // MergeBoundaryLines 为连接外轮廓可能反转几何，但 segment_dirs
-                // 始终保留原 RoadEdge 交通方向。单命中裁剪必须在两种方向相反时
-                // 翻转保留侧，否则会把路口外的整段道路边缘收入路口面。
-                bool keep_prefix = hasRole(hit, GroupRole::Exit);
-                if (hit.boundary_dir.dot(hit.chain_dir) < 0.0)
-                    keep_prefix = !keep_prefix;
+                // 合并链在多个 RoadEdge 共享端点处可能发生回折。若单命中点
+                // 紧邻这样的共享节点，链方向只能告诉我们交通方向上的前后，
+                // 不能决定应该把共享节点另一侧的整条远端分支收入路口面。
+                // 先识别命中点附近的共享端点；该局部弧是道路边缘进入节点后
+                // 向路口内凹回的部分，应优先于 H->远端 的整条分支。
+                auto localSharedEndpointBranch = [&]() {
+                    std::vector<Vec3d> empty;
+                    if (boundary_lines[i].source_ids.size() <= 1 ||
+                        boundary_lines[i].source_endpoints.size() < 2)
+                        return empty;
+
+                    auto stationOfPoint = [&](const Vec3d& point) {
+                        double best_station = 0.0;
+                        double best_distance = 1e18;
+                        double station = 0.0;
+                        for (int k = 0; k + 1 < (int)boundary_lines[i].pts.size(); ++k) {
+                            Vec2d a = xyOf(boundary_lines[i].pts[k]);
+                            Vec2d b = xyOf(boundary_lines[i].pts[k + 1]);
+                            Vec2d ab = b - a;
+                            double length = ab.norm();
+                            if (length < 1e-9)
+                                continue;
+                            double t = (xyOf(point) - a).dot(ab) / ab.squaredNorm();
+                            t = std::max(0.0, std::min(1.0, t));
+                            Vec2d projected = a + t * ab;
+                            double current_distance = dist(projected, xyOf(point));
+                            if (current_distance < best_distance) {
+                                best_distance = current_distance;
+                                best_station = station + t * length;
+                            }
+                            station += length;
+                        }
+                        return best_station;
+                    };
+
+                    std::vector<Vec3d> unique_endpoints;
+                    std::vector<int> endpoint_counts;
+                    for (const auto& source : boundary_lines[i].source_endpoints) {
+                        for (int endpoint_index = 0; endpoint_index < 2; ++endpoint_index) {
+                            const Vec3d& endpoint = endpoint_index == 0
+                                ? source.first : source.second;
+                            if (endpoint_index == 1 && dist(source.first, source.second) <= 0.03)
+                                continue;
+                            int existing = -1;
+                            for (int k = 0; k < (int)unique_endpoints.size(); ++k) {
+                                if (dist(unique_endpoints[k], endpoint) <= 0.03) {
+                                    existing = k;
+                                    break;
+                                }
+                            }
+                            if (existing < 0) {
+                                unique_endpoints.push_back(endpoint);
+                                endpoint_counts.push_back(1);
+                            } else {
+                                ++endpoint_counts[existing];
+                            }
+                        }
+                    }
+
+                    const double hit_station = std::max(0.0, std::min(total, hit.station));
+                    double best_distance = 1e18;
+                    double best_station = 0.0;
+                    for (int k = 0; k < (int)unique_endpoints.size(); ++k) {
+                        if (endpoint_counts[k] < 2)
+                            continue;
+                        const double endpoint_station = stationOfPoint(unique_endpoints[k]);
+                        const double distance = std::abs(endpoint_station - hit_station);
+                        if (distance < best_distance) {
+                            best_distance = distance;
+                            best_station = endpoint_station;
+                        }
+                    }
+
+                    if (best_distance >= 1e17)
+                        return empty;
+                    const double sample_distance = 0.10;
+                    const Vec2d shared_point = xyOf(pointAtStation(
+                        boundary_lines[i].pts, best_station));
+                    const Vec2d before = xyOf(pointAtStation(
+                        boundary_lines[i].pts,
+                        std::max(0.0, best_station - sample_distance))) - shared_point;
+                    const Vec2d after = xyOf(pointAtStation(
+                        boundary_lines[i].pts,
+                        std::min(total, best_station + sample_distance))) - shared_point;
+                    // 近共享点的局部弧只有在共享点确实是一个道路边缘转角时
+                    // 才能代表内凹返回段。近 180 度的连续/掉头形链虽然也有
+                    // 共享端点，但应继续保留其原有切点方向（100000610）。
+                    if (before.norm() <= 1e-8 || after.norm() <= 1e-8 ||
+                        before.normalized().dot(after.normalized()) <
+                            std::cos(5.0 * M_PI / 6.0))
+                        return empty;
+
+                    // 1m 是现有“道路边缘端点命中”判定使用的同一物理邻近范围；
+                    // 超出该范围仍按整条合并链的既有方向规则处理。
+                    const double branch_threshold = groupCutOffset + 0.5;
+                    if (best_distance <= 0.05 || best_distance > branch_threshold)
+                        return empty;
+                    return subPolylineByStation(
+                        boundary_lines[i].pts, hit_station, best_station);
+                };
+
+                std::vector<Vec3d> local_branch = localSharedEndpointBranch();
+                if (local_branch.size() >= 2 && polylineLength(local_branch) > 0.05) {
+                    result.boundary_lines.push_back(std::move(local_branch));
+                    continue;
+                }
+
+                // 单命中时，保留命中点朝道路外侧的一段：Entry 组的道路外侧
+                // 在链方向的反侧，Exit 组的道路外侧在链方向的同侧。不能只按
+                // 角色固定取 prefix；MergeBoundaryLines 可能把相邻 RoadEdge
+                // 合成带回折的链（100002465 的 485|703），固定取 prefix
+                // 会把另一条边的远端突尖段带入路口面。
+                bool keep_prefix = false;
+                bool direction_resolved = false;
+                for (size_t k = 0; k < hit.cut_indices.size() &&
+                                   k < hit.cut_roles.size(); ++k) {
+                    const int cut_index = hit.cut_indices[k];
+                    if (cut_index < 0 || cut_index >= (int)cut_group_dirs.size())
+                        continue;
+                    if (boundary_lines[i].source_ids.size() <= 1)
+                        continue;
+                    Vec2d group_dir = cut_group_dirs[cut_index];
+                    if (group_dir.norm() <= 1e-8 || hit.chain_dir.norm() <= 1e-8)
+                        continue;
+                    // 原始边段与合并链反向时，旧的 source-direction 规则已经
+                    // 能可靠识别链首/链尾；仅对同向且存在回折风险的链启用组方向
+                    // 判定，避免改变 100000610 等正常的反向合并链。
+                    if (hit.boundary_dir.norm() <= 1e-8 ||
+                        hit.boundary_dir.dot(hit.chain_dir) <= 0.15)
+                        continue;
+                    const double alignment = hit.chain_dir.dot(group_dir.normalized());
+                    if (std::abs(alignment) <= 0.15)
+                        continue;
+                    const bool chain_toward_outside = alignment > 0.0;
+                    keep_prefix = hit.cut_roles[k] == GroupRole::Entry
+                        ? chain_toward_outside : !chain_toward_outside;
+                    direction_resolved = true;
+                    break;
+                }
+                if (!direction_resolved) {
+                    // 兼容缺少组方向元数据的旧输入，仍使用原始 RoadEdge
+                    // 方向和组角色推断保留侧。
+                    keep_prefix = hasRole(hit, GroupRole::Exit);
+                    if (hit.boundary_dir.dot(hit.chain_dir) < 0.0)
+                        keep_prefix = !keep_prefix;
+                }
                 double station = std::max(0.0, std::min(total, hit.station));
                 if (keep_prefix && station > 0.05) {
                     result.boundary_lines.push_back(
