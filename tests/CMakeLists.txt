@@ -111,3 +111,11 @@ target_include_directories(diag_single_cubic PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_executable(diag_turning_excess diag_turning_excess.cpp)
 target_link_libraries(diag_turning_excess PRIVATE intersection_gen_lib)
 target_include_directories(diag_turning_excess PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_fence diag_fence.cpp)
+target_link_libraries(diag_fence PRIVATE intersection_gen_lib)
+target_include_directories(diag_fence PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+add_executable(diag_group_dir diag_group_dir.cpp)
+target_link_libraries(diag_group_dir PRIVATE intersection_gen_lib)
+target_include_directories(diag_group_dir PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -4936,7 +4936,6 @@ TEST_CASE("100000385-u ordinary curves stay single cubic",
     REQUIRE(gen.generate(input, output));
 
     auto curves = curveMap(output);
-    const Vec2d center = boundarySafetyCenter(input);
     const std::vector<ConnId> ordinary_ids = {"14", "16", "38", "41",
                                               "59", "67", "81", "929910"};
     for (const ConnId& id : ordinary_ids) {
@@ -4970,16 +4969,41 @@ TEST_CASE("100000385-u ordinary curves stay single cubic",
         CHECK_FALSE(curveSelfIntersectsBusiness(c, 1.0));
         CHECK(endpointG1Min(*curves[id], input) > 0.98);
 
-        // 边界：按生成侧同口径（剔除端点共线擦碰）必须完全干净。
-        // 这条断言同时锁住豁免的方向性——豁免只放行厘米级共享端点擦碰，
-        // 真正切进路缘仍会在这里报出来。
-        const BoundarySafetyResult safety = curveBoundarySafetyIgnoringEndpointGraze(
-            c, input.boundaries, center, 128, 0.15);
+        // 控制多边形不得沿弦倒序（Z/L 折）。这八条都不是被迫折形的连接，
+        // 弦向联合预算应当完全不超支（55 那类被迫折形另有评分惩罚兜底）。
+        INFO("conn " << id << " chord budget overshoot="
+             << curveChordBudgetOvershoot(c));
+        CHECK(curveChordBudgetOvershoot(c) <= 0.0);
+
+        // 边界：口径必须与生成器和最终审计一致，即 curveBoundarySafetyForInput
+        // （含共享连接点的离开楔形豁免）。原先这里用的是
+        // curveBoundarySafetyIgnoringEndpointGraze，它在"端点擦碰豁免"被废止后已经
+        // 退化成纯严格判定，与生成/审计口径不再一致：41、59、929910 收回自然单段后
+        // 都落在路缘 929910/929913/929916 的离开楔形里（厘米级、几米内交叉一次），
+        // 严格口径必然报违，用它断言等于要求这三条重新变成畸形两段曲线。
+        const BoundarySafetyResult safety =
+            curveBoundarySafetyForInput(c, input, 128, 0.15);
         INFO("conn " << id << " boundary intersects=" << safety.intersects
              << " outside_road_edge=" << safety.outside_road_edge
              << " penalty=" << safety.outside_penalty);
-        CHECK_FALSE(safety.intersects);
+        // 81 的接触不属于楔形，是仍未修复的真实穿越（审计 physical.boundary 81，
+        // HEAD 同样报错）。这里不掩盖它，只把"豁免没有把它藏起来"钉住。
+        if (id == "81") {
+            CHECK_FALSE(curveBoundaryContactsAreDepartureWedges(c, input.boundaries));
+        } else {
+            CHECK_FALSE(safety.intersects);
+        }
         CHECK_FALSE(safety.outside_road_edge);
+        // 豁免的方向性：严格口径若报违，那处接触必须确实是共享连接点的离开楔形。
+        // 真正切进路缘（深度 > 5cm 或跨度 > 6m）在这里会立刻暴露。
+        const BoundarySafetyResult strict = curveBoundaryStrictSafetyForInput(
+            c, input, 128, 0.15, 0.10, 0.05,
+            !input.area.is_rough && !input.area.geometry.outer.empty()
+                ? &input.area.geometry : nullptr);
+        if (strict.intersects && !safety.intersects) {
+            INFO("conn " << id << " was exempted, so every contact must be a wedge");
+            CHECK(curveBoundaryContactsAreDepartureWedges(c, input.boundaries));
+        }
 
         // 围栏与障碍：单段化不得把曲线甩出粗围栏或压进障碍物。
         if (!input.area.geometry.outer.empty())
@@ -5024,6 +5048,29 @@ TEST_CASE("100000385-u ordinary curves stay single cubic",
         CHECK_FALSE(curvesIntersectBusiness(
             *curves[pr.first]->curve, *curves[pr.second]->curve, 1.5));
     }
+
+    // 离开楔形豁免的收益，按用户报告的两条正向钉住。
+    // 直行 59 曾被路缘 929910 的 3.7cm 楔形否掉全部 11 个自然直行候选，被压成约
+    // 6m 的 S 形鼓包（两段、绕转 24.5°、maxk 0.044）；现在是几乎笔直的单段
+    // （绕转 2.2°）。绕转跨度是这类鼓包最灵敏的指标：门槛取 8°，S 形的 24.5° 会
+    // 立刻超出，而自然直行的余量仍有 3 倍以上。
+    REQUIRE(curves.count("59") == 1);
+    REQUIRE(curves["59"]->curve);
+    const BezierCurve& straight59 = *curves["59"]->curve;
+    INFO("straight 59 turning_span_deg=" << curveTurningSpan(straight59) * RAD2DEG
+         << " arc/chord=" << arcChordRatioForTest(straight59));
+    CHECK(curveTurningSpan(straight59) < 8.0 * DEG2RAD);
+    CHECK(arcChordRatioForTest(straight59) <= 1.01);
+    // 右转 929910 的输入折线本身就是同 ID 的 RoadEdge（坐标逐位一致），它"穿越"的
+    // 正是自己。撤保护后重生成的曲线曾被压成 maxk 0.385（R≈2.6m）、绕转 99.8° 的
+    // 两段畸形；单段自然形态的 maxk 应当回到 0.2 以内。
+    REQUIRE(curves.count("929910") == 1);
+    REQUIRE(curves["929910"]->curve);
+    const BezierCurve& right929910 = *curves["929910"]->curve;
+    INFO("right 929910 maxk=" << right929910.maxCurvature(60)
+         << " turning_span_deg=" << curveTurningSpan(right929910) * RAD2DEG);
+    CHECK(right929910.maxCurvature(60) < 0.20);
+    CHECK(curveTurningSpan(right929910) < 95.0 * DEG2RAD);
 }
 
 // curveTurningSpan 的关键用例：它必须同时做到两件事——把"同向绕满一整圈"的折返
@@ -5164,4 +5211,492 @@ TEST_CASE("boundary avoidance allows only exact curve connection points",
         near_boundary_endpoint, boundaries, center, 128, 0.15);
     INFO("a Boundary endpoint near, but not equal to, a curve endpoint cannot be exempted");
     CHECK(near_endpoint_safety.intersects);
+}
+
+// ── 共享连接点的"离开楔形"豁免 ────────────────────────────────
+// RoadEdge 折线的端点常常**就是**某条连接的连接点（路缘从车道端点起画）。两条从
+// 同一点出发、夹角不到 1° 的线必然在几米内交叉一次，随后各走各路：这不是"曲线穿越
+// 路缘"，而是折线端点重合造成的拓扑必然。100000385-u 的直行 59 与路缘 929910 实测
+// 最大偏离 3.7cm、在 3.58m 处交叉，却因此否决了全部 11 个自然直行候选，把 59 压成
+// 约 6m 的 S 形鼓包。
+//
+// 豁免因此必须同时受深度与跨度约束——corpus 实测两类样本相隔一个量级：
+//   * 真实楔形：深度 0.0001–0.087m，跨度 0.6–4.0m；
+//   * 真实贴合/切入：深度 0.10–4.22m，跨度 8–36m。
+// 取 wedge_tol = 0.05（与 roadEdgeOutsidePenalty 的 outside_tol 同值）、
+// wedge_span = 6.0。本用例把这条分界线钉死：4cm/2m 的楔形放行，12cm 深或 12m 跨的
+// 接触仍然判违，未锚定在连接点上的横穿一律判违。
+TEST_CASE("departure wedge at a shared connection point is exempt, real contacts are not",
+          "[shape][boundary][strict-contact][wedge]") {
+    // 被测曲线：从 (0,0) 沿 +x 走 30m 的直线（控制点全部落在 x 轴上）。
+    BezierCurve curve;
+    curve.segs.push_back(makeCubicG1(
+        Vec2d(0, 0), Vec2d(1, 0), Vec2d(30, 0), Vec2d(1, 0), 0.30));
+
+    auto roadEdge = [](const char* id, std::vector<Vec3d> pts) {
+        Boundary b;
+        b.id = id;
+        b.type = Boundary::Type::RoadEdge;
+        b.geometry.points = std::move(pts);
+        return b;
+    };
+    // 锚在曲线首点、4cm 深、2.25m 处交叉后一路离开：典型离开楔形。
+    const Boundary wedge = roadEdge(
+        "wedge", {Vec3d(0, 0, 0), Vec3d(2, 0.04, 0), Vec3d(6, -0.6, 0),
+                  Vec3d(30, -3, 0)});
+    // 同样锚在首点，但深度 12cm（> wedge_tol）：真实切入，不得豁免。
+    const Boundary deep = roadEdge(
+        "deep", {Vec3d(0, 0, 0), Vec3d(2, 0.12, 0), Vec3d(6, -0.6, 0),
+                 Vec3d(30, -3, 0)});
+    // 同样锚在首点、深度只有 3cm，但贴到 12m 才交叉（> wedge_span）：真实贴合。
+    const Boundary long_span = roadEdge(
+        "long-span", {Vec3d(0, 0, 0), Vec3d(10, 0.03, 0), Vec3d(14, -0.03, 0),
+                      Vec3d(30, -3, 0)});
+    // 与两个连接点都无关的横穿：快路径就该直接否掉。
+    const Boundary crossing = roadEdge(
+        "crossing", {Vec3d(10, -2, 0), Vec3d(10, 2, 0)});
+    // 整条折线与曲线逐点重合、首尾都锚在连接点上：这条 Boundary 就是曲线自身。
+    const Boundary selfsame = roadEdge(
+        "selfsame", {Vec3d(0, 0, 0), Vec3d(10, 0, 0), Vec3d(20, 0, 0),
+                     Vec3d(30, 0, 0)});
+    // 前提：五种几何在严格口径下都必须先报"非端点接触"，否则本用例什么也没验证。
+    // center 取 +y 侧，保证 4cm 级偏离不会先被 outside_road_edge 拦下——那条通道
+    // 不参与豁免，会让下面的断言失去意义。
+    const Vec2d wedge_center(15, 20);
+    for (const Boundary* b : {&wedge, &deep, &long_span, &crossing, &selfsame}) {
+        const BoundarySafetyResult strict = curveBoundarySafety(
+            curve, std::vector<Boundary>{*b}, wedge_center, 128);
+        INFO("boundary " << b->id << " must be a strict violation before exemption");
+        CHECK(strict.intersects);
+    }
+
+    CHECK(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{wedge}));
+    INFO("a 12cm cut into the curb is not a departure wedge");
+    CHECK_FALSE(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{deep}));
+    INFO("adherence that only crosses after 12m is not a departure wedge");
+    CHECK_FALSE(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{long_span}));
+    INFO("a crossing unrelated to either connection point is not a departure wedge");
+    CHECK_FALSE(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{crossing}));
+    INFO("a Boundary that is bit-identical to the curve itself cannot be crossed by it");
+    CHECK(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{selfsame}));
+    // 判据是全局的：只要有一处接触不属于楔形，整条曲线就不豁免。
+    INFO("one non-wedge contact disqualifies the whole curve");
+    CHECK_FALSE(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{wedge, crossing}));
+    // 没有任何接触时不能返回 true（豁免只在严格判定已报违后才被调用）。
+    CHECK_FALSE(curveBoundaryContactsAreDepartureWedges(
+        curve, std::vector<Boundary>{}));
+
+    // 输入级口径（生成器与最终审计共用的那一个）必须继承豁免结论。
+    auto inputWith = [](const Boundary& b) {
+        IntersectionInput inp;
+        inp.boundaries = {b};
+        // 让 boundarySafetyCenter 落在 +y 侧，理由同上。
+        Lane far_lane;
+        far_lane.id = "center-proxy";
+        far_lane.width = 3.5;
+        far_lane.geometry.points = {Vec3d(0, 20, 0), Vec3d(30, 20, 0)};
+        inp.lanes = {far_lane};
+        return inp;
+    };
+    CHECK_FALSE(curveBoundarySafetyForInput(curve, inputWith(wedge), 128).intersects);
+    CHECK_FALSE(curveBoundarySafetyForInput(curve, inputWith(selfsame), 128).intersects);
+    CHECK(curveBoundarySafetyForInput(curve, inputWith(deep), 128).intersects);
+    CHECK(curveBoundarySafetyForInput(curve, inputWith(long_span), 128).intersects);
+    CHECK(curveBoundarySafetyForInput(curve, inputWith(crossing), 128).intersects);
+    // 严格入口不受豁免影响，仍是可用的对照口径。
+    CHECK(curveBoundaryStrictSafetyForInput(
+        curve, inputWith(wedge), 128, kConnectionPointTolerance, 0.10, 0.05,
+        nullptr).intersects);
+}
+
+
+// 粗糙路口面越界判定的语料锚点：把两类"不可归因于生成器的越界"钉在真实数据上。
+//
+// intersection_cross 61 是三段式掉头，退出连接点恰好落在粗糙面外环上，且离开方向
+// 几乎与该段外环平行——sps=25 只在端点读出 0.6mm 外溢，sps=64 会在 t=0.9844（距端点
+// 4.2cm）多读出 0.23mm 一点。判据必须覆盖连接点近侧这一小段，否则同一条曲线会随
+// 采样密度翻结论（历史上 fence.containment 与 generator.fence_overflow 互相矛盾）。
+//
+// intersection_cross 7 是右转：粗糙面把各进出口喉部用直线弦连起来，直接切掉了转角，
+// 连两个固定连接点之间的**直线弦**都在面外 4.4m，任何右转都出不来。曲线实测只外溢
+// 1.8m，即优化器已经尽力向内挤压。这类外溢归因于输入面，不能算生成器形态缺陷。
+TEST_CASE("coarse fence overflow is attributed to the face, not the generator",
+          "[regression][fence][intersection_cross]") {
+    const std::string path =
+        std::string(PROJECT_ROOT_DIR) + "/datas/intersection_cross.json";
+    const IntersectionInput input = loadInputOrSkip(path);
+    REQUIRE_FALSE(input.area.geometry.outer.empty());
+    IntersectionShapeGenerator generator;
+    IntersectionOutput output;
+    REQUIRE(generator.generate(input, output));
+
+    std::unordered_map<std::string, const BezierCurve*> by_id;
+    for (const auto& cc : output.connectivity_curves)
+        if (cc.curve)
+            by_id[cc.id] = cc.curve.get();
+
+    // 一、连接点近侧的坐标舍入：加密采样也不许翻结论。
+    REQUIRE(by_id.count("61") == 1);
+    const BezierCurve& uturn = *by_id["61"];
+    for (int sps : {25, 64, 128}) {
+        INFO("conn 61 sps=" << sps);
+        CHECK(curveInsideFence(uturn, input.area.geometry, sps));
+    }
+    CHECK(curveFenceOverflow(uturn, input.area.geometry, 160) == 0.0);
+
+    // 二、面本身切掉了转角：弦外溢给出几何强制的下限，曲线不得比它更差。
+    REQUIRE(by_id.count("7") == 1);
+    const BezierCurve& right = *by_id["7"];
+    const double chord = fenceChordOverflow(
+        input.area.geometry, right.startPt(), right.endPt(), 160);
+    const double curve_out = curveFenceOverflow(right, input.area.geometry, 160);
+    INFO("conn 7 chord_overflow=" << chord << " curve_overflow=" << curve_out);
+    CHECK(chord > 3.0);                    // 直线弦确实出不来
+    CHECK(curve_out < chord);              // 曲线已比直连好
+    CHECK(fenceOverflowForcedByFace(curve_out, chord));
+}
+
+// 同组切向统一的跨臂误并保护（`kGroupDirectionForceLimitDeg` + 抗抖动基线）。
+// 三个方向都要钉住：合法抖动仍然统一、跨臂误并不许覆盖、末段过短造成的虚假偏差不许
+// 误伤。判据与定标见 `src/toolkits/toolkits.cpp` 的应用循环与 `tests/diag_group_dir.cpp`。
+namespace {
+
+// 按角色取端点切向：Entry 用末点，Exit 用首点，与库内 directionForRole 同口径。
+Vec2d endpointTangentForRoleForTest(const Lane& lane, GroupRole role) {
+    return role == GroupRole::Entry ? entryLineTangent(lane.geometry.points)
+                                    : exitLineTangent(lane.geometry.points);
+}
+
+double tangentAngleDegForTest(const IntersectionInput& input, const LaneId& id,
+                              GroupRole role) {
+    for (const auto& lane : input.lanes) {
+        if (lane.id != id) continue;
+        const Vec2d t = endpointTangentForRoleForTest(lane, role);
+        return std::atan2(t.y(), t.x()) * 180.0 / M_PI;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+}  // namespace
+
+TEST_CASE("group tangent unification skips cross-arm lanes but keeps jittering ones",
+          "[regression][group_direction]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110004764.json";
+    const IntersectionInput raw = loadInputOrSkip(path);
+    if (raw.lanes.empty()) return;
+    const IntersectionInput normalized = InputNormalizer(raw);
+
+    // 找到混入了两条物理臂的那个组：43107602 内五条朝 -11.5°、两条朝 -83°~-88°。
+    const LaneGroup* mixed = nullptr;
+    for (const auto& group : normalized.lane_groups)
+        if (group.id == "43107602") mixed = &group;
+    REQUIRE(mixed != nullptr);
+    REQUIRE(std::find(mixed->lanes.begin(), mixed->lanes.end(), LaneId("43106520")) !=
+            mixed->lanes.end());
+
+    const double before = tangentAngleDegForTest(normalized, "43106520", mixed->role);
+    REQUIRE(std::isfinite(before));
+
+    IntersectionInput guarded = normalized;
+    ConnectivityDirectionConfig cfg;  // 默认即 20° 限幅 + 3m 抗抖动基线
+    REQUIRE(cfg.group_force_limit_deg == kGroupDirectionForceLimitDeg);
+    REQUIRE(cfg.group_robust_baseline_m == kGroupDirectionRobustBaselineM);
+    ConnectivityDirectionNormalizer(guarded, cfg);
+    const double after = tangentAngleDegForTest(guarded, "43106520", mixed->role);
+    INFO("43106520 before=" << before << " after=" << after);
+    // 跨臂车道：端点切向必须原样保留。
+    CHECK(std::abs(after - before) < 1e-6);
+
+    // 同组内的多数派车道仍然要被统一：保护只针对偏差过大的少数派。
+    int unified = 0;
+    for (const auto& id : mixed->lanes) {
+        const double b = tangentAngleDegForTest(normalized, id, mixed->role);
+        const double a = tangentAngleDegForTest(guarded, id, mixed->role);
+        if (std::isfinite(a) && std::isfinite(b) && std::abs(a - b) > 1e-6) ++unified;
+    }
+    INFO("group 43107602 unified lanes=" << unified << "/" << mixed->lanes.size());
+    CHECK(unified > 0);
+
+    // 关掉保护时同一条车道会被强行扭转，证明上面的 CHECK 不是空跑。
+    IntersectionInput unguarded = normalized;
+    ConnectivityDirectionConfig off;
+    off.group_force_limit_deg = 1e9;
+    ConnectivityDirectionNormalizer(unguarded, off);
+    const double forced = tangentAngleDegForTest(unguarded, "43106520", mixed->role);
+    INFO("43106520 forced=" << forced);
+    CHECK(std::abs(forced - before) > 20.0);
+}
+
+TEST_CASE("short-tail lanes are not mistaken for cross-arm lanes",
+          "[regression][group_direction]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110000703-u.json";
+    const IntersectionInput raw = loadInputOrSkip(path);
+    if (raw.lanes.empty()) return;
+    const IntersectionInput normalized = InputNormalizer(raw);
+
+    // 43106568 的末段只有 0.31m（整条 52.67m），两点式切向被数字化噪声主导、虚报 23.8°
+    // 偏差；3m 长基线弦只差 1.87°，说明它确实属于本组，必须照常统一。
+    const LaneGroup* group = nullptr;
+    for (const auto& g : normalized.lane_groups)
+        if (std::find(g.lanes.begin(), g.lanes.end(), LaneId("43106568")) != g.lanes.end())
+            group = &g;
+    REQUIRE(group != nullptr);
+
+    const double before = tangentAngleDegForTest(normalized, "43106568", group->role);
+    REQUIRE(std::isfinite(before));
+    IntersectionInput guarded = normalized;
+    ConnectivityDirectionNormalizer(guarded, ConnectivityDirectionConfig());
+    const double after = tangentAngleDegForTest(guarded, "43106568", group->role);
+    INFO("43106568 before=" << before << " after=" << after);
+    CHECK(std::abs(after - before) > 1.0);   // 被统一了
+
+    // 若只看两点式切向（关掉长基线复核），这条车道会被误判成跨臂而漏掉统一。
+    IntersectionInput no_baseline = normalized;
+    ConnectivityDirectionConfig cfg;
+    cfg.group_robust_baseline_m = 0.0;
+    ConnectivityDirectionNormalizer(no_baseline, cfg);
+    const double naive = tangentAngleDegForTest(no_baseline, "43106568", group->role);
+    INFO("43106568 naive=" << naive);
+    CHECK(std::abs(naive - before) < 1e-6);
+}
+
+// 连接点强制的 RoadEdge 净距亏欠：判据本身 + 真实数据上的落地效果。
+// 见 `src/constraints/road_edge_clearance.h`。核心是不许把 1-Lipschitz 上界当成可达性
+// 保证——那会让判据比文档描述的更严，把唯一合法的单段三次曲线逼成绕行两段。
+TEST_CASE("endpoint-forced road-edge clearance floor uses the tangent ray, not Lipschitz",
+          "[regression][road_edge_clearance]") {
+    const double clearance = 1.0;
+
+    // 影响区内：下限就是"沿端点切向直行"的净距，全额要求不可达时不许按全额判。
+    CHECK(roadEdgeClearanceNeedsFloor(0.10));
+    CHECK(roadEdgeClearanceFloor(clearance, 0.10, 0.96) == 0.96);
+    // 端点自身欠 0.048m、采样点离端点 0.10m：`0.952+0.10 >= 1.0` 只说明距离函数允许恢复，
+    // 并不表示曲线做得到（切向近乎平行于路缘时只能按 s·sinθ 恢复）。
+    CHECK(roadEdgeClearanceFloor(clearance, 0.10, 0.9573) < clearance);
+    // 影响区外恢复全额要求，否则与路缘长距离平行的曲线会被整条豁免。
+    CHECK_FALSE(roadEdgeClearanceNeedsFloor(kRoadEdgeClearanceEndpointSpan + 0.01));
+    CHECK(roadEdgeClearanceFloor(clearance, kRoadEdgeClearanceEndpointSpan + 0.01, 0.90) ==
+          clearance);
+    // 调用方没算参考射线时按全额判定，保持保守。
+    CHECK(roadEdgeClearanceFloor(clearance, 0.10, -1.0) == clearance);
+    // 参考射线本身已满足全额时不放水。
+    CHECK(roadEdgeClearanceFloor(clearance, 0.10, 1.30) == clearance);
+
+    RoadEdgeClearanceMeasure forced;
+    forced.valid = true;
+    forced.minimum = 0.9521;          // 净距不足
+    forced.deficit = 0.0;             // 但逐点都不低于切向直行的可达下限
+    CHECK(roadEdgeClearanceDeficit(forced, clearance) == 0.0);
+    CHECK(roadEdgeClearanceForcedByEndpoint(forced, clearance));
+
+    RoadEdgeClearanceMeasure blamed = forced;
+    blamed.deficit = 0.05;            // 曲线自己贴过去的那部分照常判违规
+    CHECK(roadEdgeClearanceDeficit(blamed, clearance) == 0.05);
+    CHECK_FALSE(roadEdgeClearanceForcedByEndpoint(blamed, clearance));
+
+    RoadEdgeClearanceMeasure clean = forced;
+    clean.minimum = 1.20;             // 净距充足时既不违规也不需要豁免
+    CHECK_FALSE(roadEdgeClearanceForcedByEndpoint(clean, clearance));
+
+    RoadEdgeClearanceMeasure empty;    // 无有效采样：不判违规也不豁免
+    CHECK(roadEdgeClearanceDeficit(empty, clearance) == 0.0);
+    CHECK_FALSE(roadEdgeClearanceForcedByEndpoint(empty, clearance));
+    // 无净距要求时判据整体关闭。
+    CHECK(roadEdgeClearanceDeficit(blamed, 0.0) == 0.0);
+    CHECK_FALSE(roadEdgeClearanceForcedByEndpoint(forced, 0.0));
+}
+
+TEST_CASE("110000741-u exit connection point inside the clearance keeps single cubics",
+          "[regression][road_edge_clearance]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110000741-u.json";
+    const IntersectionInput input = loadInputOrSkip(path);
+    if (input.lanes.empty()) return;
+    REQUIRE(input.mode == 2);
+    const double clearance = roadEdgeAvoidanceClearanceForMode(input.mode);
+    REQUIRE(clearance > 0.0);
+
+    IntersectionShapeGenerator generator;
+    IntersectionOutput output;
+    REQUIRE(generator.generate(input, output));
+    const std::unordered_map<ConnId, const ConnectivityCurve*> curves = curveMap(output);
+
+    // 出口连接点 43102472 自身距 RoadEdge 仅 0.9521m < 1.0m：端点位置由输入固定、端点切向
+    // 被 G1 锁死，这笔亏欠任何曲线都还不掉。硬门若不豁免，生成侧会放弃合法单段三次曲线、
+    // 升级成两段绕行（实测 maxk 2.10、随后被形态审计判违规并与同簇 24 相交）。
+    for (const ConnId& id : {ConnId("5"), ConnId("24")}) {
+        const auto it = curves.find(id);
+        REQUIRE(it != curves.end());
+        REQUIRE(it->second->curve);
+        const BezierCurve& curve = *it->second->curve;
+        INFO("conn " << id << " segments=" << curve.numSegments());
+        CHECK(curve.numSegments() == 1);
+
+        const RoadEdgeClearanceMeasure measure = measureCurveRoadEdgeClearanceForAudit(
+            curve, input.boundaries, Boundary::Type::RoadEdge, clearance, 128,
+            kConnectionPointTolerance);
+        REQUIRE(measure.valid);
+        INFO("conn " << id << " min=" << measure.minimum
+                     << " deficit=" << measure.deficit
+                     << " end_distance=" << measure.end_distance);
+        CHECK(measure.end_distance < clearance);          // 亏欠确实来自连接点
+        CHECK(measure.deficit <= kRoadEdgeClearanceRoundingTol);
+        CHECK(roadEdgeClearanceForcedByEndpoint(measure, clearance));
+    }
+
+    // 豁免只针对端点强制的那一段。用合成场景把两个分支都钉死：路缘取 y=0 的直线，
+    // 净距要求 1.0m。
+    auto roadEdgeLine = [](std::vector<Vec3d> pts) {
+        Boundary b;
+        b.id = "edge";
+        b.type = Boundary::Type::RoadEdge;
+        b.geometry.points = std::move(pts);
+        return std::vector<Boundary>{b};
+    };
+    const std::vector<Boundary> flat =
+        roadEdgeLine({Vec3d(-5, 0, 0), Vec3d(25, 0, 0)});
+
+    // 一、端点欠 0.05m 且切向平行于路缘：影响区内还不掉，记豁免不记违规。出了影响区
+    // 只需横向让出几厘米，这条曲线在 0.31m 处就已回到 1.0m 以上。
+    BezierCurve parallel_start;
+    {
+        BezierSegment seg;
+        seg.ctrl[0] = Vec2d(0.0, 0.95);
+        seg.ctrl[1] = Vec2d(0.5, 0.95);
+        seg.ctrl[2] = Vec2d(1.0, 1.60);
+        seg.ctrl[3] = Vec2d(3.0, 2.20);
+        parallel_start.segs.push_back(seg);
+    }
+    const RoadEdgeClearanceMeasure forced_case = measureCurveRoadEdgeClearanceForAudit(
+        parallel_start, flat, Boundary::Type::RoadEdge, clearance, 128,
+        kConnectionPointTolerance);
+    REQUIRE(forced_case.valid);
+    INFO("parallel_start min=" << forced_case.minimum
+                               << " deficit=" << forced_case.deficit);
+    CHECK(forced_case.minimum < clearance);
+    CHECK(forced_case.deficit <= kRoadEdgeClearanceRoundingTol);
+    CHECK(roadEdgeClearanceForcedByEndpoint(forced_case, clearance));
+
+    // 二、两端净距充裕、中段自己贴过去：远离端点，按全额判定，必须计违规。
+    BezierCurve dipping;
+    {
+        BezierSegment seg;
+        seg.ctrl[0] = Vec2d(0.0, 2.00);
+        seg.ctrl[1] = Vec2d(3.0, 0.20);
+        seg.ctrl[2] = Vec2d(7.0, 0.20);
+        seg.ctrl[3] = Vec2d(10.0, 2.00);
+        dipping.segs.push_back(seg);
+    }
+    const RoadEdgeClearanceMeasure blamed_case = measureCurveRoadEdgeClearanceForAudit(
+        dipping, flat, Boundary::Type::RoadEdge, clearance, 128,
+        kConnectionPointTolerance);
+    REQUIRE(blamed_case.valid);
+    INFO("dipping min=" << blamed_case.minimum << " deficit=" << blamed_case.deficit
+                        << " @ (" << blamed_case.deficit_location.x() << ","
+                        << blamed_case.deficit_location.y() << ")");
+    CHECK(blamed_case.minimum < clearance);
+    CHECK(blamed_case.deficit > 0.10);
+    CHECK_FALSE(roadEdgeClearanceForcedByEndpoint(blamed_case, clearance));
+    // 违规位置应落在中段，而不是端点邻域。
+    CHECK(blamed_case.deficit_location.x() > 1.0);
+    CHECK(blamed_case.deficit_location.x() < 9.0);
+}
+
+TEST_CASE("clearance exemption expires outside the endpoint span",
+          "[regression][road_edge_clearance]") {
+    // 影响区上限的意义：与路缘平行、净距略欠的曲线不许被整条豁免。同一条 0.95m 平行线，
+    // 只要在影响区外还没爬回净距要求，就必须计违规——横向让出 5cm 是任何曲线都做得到的。
+    const double clearance = 1.0;
+    Boundary edge;
+    edge.id = "edge";
+    edge.type = Boundary::Type::RoadEdge;
+    edge.geometry.points = {Vec3d(-5, 0, 0), Vec3d(25, 0, 0)};
+    const std::vector<Boundary> flat{edge};
+
+    BezierCurve lazy;
+    {
+        BezierSegment seg;
+        seg.ctrl[0] = Vec2d(0.0, 0.95);
+        seg.ctrl[1] = Vec2d(3.0, 0.95);   // 手柄拉长到 3m：出了影响区还贴着路缘
+        seg.ctrl[2] = Vec2d(7.0, 2.00);
+        seg.ctrl[3] = Vec2d(10.0, 2.00);
+        lazy.segs.push_back(seg);
+    }
+    const RoadEdgeClearanceMeasure measure = measureCurveRoadEdgeClearanceForAudit(
+        lazy, flat, Boundary::Type::RoadEdge, clearance, 128,
+        kConnectionPointTolerance);
+    REQUIRE(measure.valid);
+    INFO("lazy min=" << measure.minimum << " deficit=" << measure.deficit
+                     << " @x=" << measure.deficit_location.x());
+    CHECK(measure.deficit > kRoadEdgeClearanceRoundingTol);
+    CHECK_FALSE(roadEdgeClearanceForcedByEndpoint(measure, clearance));
+    CHECK(measure.deficit_location.x() > kRoadEdgeClearanceEndpointSpan);
+}
+
+// ── 闭包"先窄后宽"升级重试 ──────────────────────────────────────────────
+// 共享端点族收口失败时会把跨端点阻塞者纳入有限闭包联合求解。闭包变量越多
+// 并不等于越强：每个新变量都会带来新的同簇硬约束行，AC3 可能直接清空某个
+// 成员的候选域，于是本来有解的小闭包退化为无解的大闭包，连原先已修好的对
+// 也一起丢失。因此扩张预算只在"首轮确实失败"的族上升级一次。
+// 两个数据集分别守护这条规则的两个方向：
+//   110002473-u 必须靠升级后的闭包修好 5|6、5|7、5|8（窄闭包解不开）；
+//   110003285 的 entry:43103892 必须保住窄闭包已经求得的解，不许因为
+//   一上来就开大预算而重新冒出 9|10、24|14。
+TEST_CASE("110002473-u shared-endpoint family is repaired by the escalated closure",
+          "[regression][cluster][closure][110002473]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110002473-u.json";
+    IntersectionInput input = loadInputOrSkip(path);
+    input = InputNormalizer(input);
+    ConnectivityDirectionNormalizer(input, ConnectivityDirectionConfig());
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+
+    auto curves = curveMap(output);
+    for (const ConnId& id : {"5", "6", "7", "8"}) {
+        REQUIRE(curves.count(id) == 1);
+        REQUIRE(curves[id]->curve);
+    }
+    // 判据与 diag_all_violations 的 cluster.intersection 一致：连接点容差 1.5m
+    // 之外的真实相交。这里同时用 0.30 的严格容差复核，因为该族修好后连
+    // 端点邻域也不再贴合。
+    for (const ConnId& other : {"6", "7", "8"}) {
+        INFO("同簇非端点相交 5|" << other);
+        CHECK_FALSE(curvesIntersectBusiness(
+            *curves["5"]->curve, *curves[other]->curve, 1.5));
+        CHECK_FALSE(curvesIntersectBeyondAllowedEndpointOverlapForTest(
+            *curves["5"]->curve, *curves[other]->curve, 0.30));
+    }
+}
+
+TEST_CASE("110003285 keeps the narrow-closure solution for entry:43103892",
+          "[regression][cluster][closure][110003285]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110003285.json";
+    IntersectionInput input = loadInputOrSkip(path);
+    input = InputNormalizer(input);
+    ConnectivityDirectionNormalizer(input, ConnectivityDirectionConfig());
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+
+    auto curves = curveMap(output);
+    for (const ConnId& id : {"9", "10", "14", "24"}) {
+        REQUIRE(curves.count(id) == 1);
+        REQUIRE(curves[id]->curve);
+    }
+    // 判据与 diag_all_violations 的 cluster.intersection 一致（连接点容差
+    // 1.5m）。这两对在窄闭包下干净，一上来就开大预算时会同时冒出。
+    INFO("同簇非端点相交 9|10");
+    CHECK_FALSE(curvesIntersectBusiness(
+        *curves["9"]->curve, *curves["10"]->curve, 1.5));
+    INFO("同簇非端点相交 24|14");
+    CHECK_FALSE(curvesIntersectBusiness(
+        *curves["24"]->curve, *curves["14"]->curve, 1.5));
 }

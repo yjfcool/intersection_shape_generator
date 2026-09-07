@@ -102,10 +102,71 @@ TEST_CASE("ordinary straight single cubic clamps lateral and oversized handles",
 
     constrainOrdinarySingleCubicControls(c, p0, t0, p1, t1);
     CHECK(ordinarySingleCubicControlsValid(c, p0, t0, p1, t1));
-    CHECK_THAT(c.segs.front().ctrl[1].x(), WithinAbs(8.0, 1e-6));
+    // 纯直行(a=b=1)没有前向方向交点，单侧上界各自等于整条弦；两侧同时吃满弦长
+    // 会得到 P1=(8,0)、P2=(0,0)，即控制多边形沿弦完全倒序的 Z 形。弦方向联合预算
+    // 因此把两侧在最小把手之上等比缩到 λ+μ = |chord| = 8，即各 4.0，且保持原有的
+    // 两侧等长比例（拱顶位置不变）。
+    CHECK_THAT(c.segs.front().ctrl[1].x(), WithinAbs(4.0, 1e-6));
     CHECK_THAT(c.segs.front().ctrl[1].y(), WithinAbs(0.0, 1e-6));
-    CHECK_THAT(c.segs.front().ctrl[2].x(), WithinAbs(0.0, 1e-6));
+    CHECK_THAT(c.segs.front().ctrl[2].x(), WithinAbs(4.0, 1e-6));
     CHECK_THAT(c.segs.front().ctrl[2].y(), WithinAbs(0.0, 1e-6));
+    CHECK(cubicControlPolygonMonotone(c.segs.front()));
+    CHECK_THAT(curveChordBudgetOvershoot(c), WithinAbs(0.0, 1e-12));
+}
+
+TEST_CASE("chord projection budget rejects folded control polygons",
+          "[bezier][constraints]") {
+    // 近直行几何：makeCubicG1 的两个把手都等于 alpha*|chord|，因此预算
+    // alpha*(a+b) <= 1+slack 在 a=b=1 时给出临界 alpha = (1+0.05)/2 = 0.525。
+    const Vec2d p0(0, 0), p1(50, 0), t0(1, 0), t1(1, 0);
+
+    SECTION("monotone below the critical alpha") {
+        BezierCurve c;
+        c.segs.push_back(makeCubicG1(p0, t0, p1, t1, 0.45));
+        CHECK(cubicControlPolygonMonotone(c.segs.front()));
+        CHECK(ordinarySingleCubicControlsValid(c, p0, t0, p1, t1));
+        CHECK_THAT(curveChordBudgetOvershoot(c), WithinAbs(0.0, 1e-12));
+    }
+
+    SECTION("marginal overshoot inside the 5% slack still passes") {
+        // 与 100000443 的连接 5 同量级（越界弦长的 2.4%）：形态与单调无异，
+        // 零容差会连带改变候选集，因此预算带 kChordProjectionBudgetSlack 松量。
+        BezierCurve c;
+        c.segs.push_back(makeCubicG1(p0, t0, p1, t1, 0.512));
+        CHECK(cubicControlPolygonMonotone(c.segs.front()));
+        CHECK_THAT(curveChordBudgetOvershoot(c), WithinAbs(0.0, 1e-12));
+    }
+
+    SECTION("genuine Z/L fold is rejected and its magnitude reported") {
+        // 与 100000385-u 的直行 55 同形态（两把手各占弦长 0.8，越界 55.5%）。
+        BezierCurve c;
+        c.segs.push_back(makeCubicG1(p0, t0, p1, t1, 0.80));
+        CHECK_FALSE(cubicControlPolygonMonotone(c.segs.front()));
+        CHECK_FALSE(ordinarySingleCubicControlsValid(c, p0, t0, p1, t1));
+        // used = 0.8*50 + 0.8*50 = 80，allowed = 50*1.05 = 52.5，
+        // 超支比例 = (80 - 52.5)/50 = 0.55。
+        CHECK_THAT(curveChordBudgetOvershoot(c), WithinAbs(0.55, 1e-9));
+        // 控制多边形沿弦倒序：proj(P1) = 40 > proj(P2) = 10。
+        CHECK(c.segs.front().ctrl[1].x() > c.segs.front().ctrl[2].x());
+    }
+
+    SECTION("asymmetric handles may exceed the direction intersection and stay monotone") {
+        // 弦向联合预算比逐侧上界更宽松也更准确：一侧把手越过方向交点、另一侧
+        // 相应缩短仍然单调，物理避让需要的轴向延长因此不被误杀。
+        BezierCurve c;
+        c.segs.push_back(makeCubicG1(p0, t0, p1, t1, 0.5));
+        c.segs.front().ctrl[1] = Vec2d(10.0, 0.0);
+        c.segs.front().ctrl[2] = Vec2d(10.0, 0.0);  // 尾把手 40 = 0.8*chord
+        CHECK(cubicControlPolygonMonotone(c.segs.front()));
+        CHECK_THAT(curveChordBudgetOvershoot(c), WithinAbs(0.0, 1e-12));
+    }
+
+    SECTION("overshoot is the worst segment of a multi-segment curve") {
+        BezierCurve c;
+        c.segs.push_back(makeCubicG1(p0, t0, Vec2d(25, 0), t1, 0.45));
+        c.segs.push_back(makeCubicG1(Vec2d(25, 0), t0, p1, t1, 0.80));
+        CHECK_THAT(curveChordBudgetOvershoot(c), WithinAbs(0.55, 1e-9));
+    }
 }
 
 TEST_CASE("BezierCurve G1 at join points", "[bezier]") {

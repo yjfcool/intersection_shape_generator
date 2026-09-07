@@ -204,24 +204,23 @@ bool SDFField::CacheKey::operator==(const CacheKey& other) const {
         return false;
     }
 
-    // 比较障碍物 - 基于尺寸和位置的简化检查以提高效率
+    // 比较障碍物
     if (obstacles.size() != other.obstacles.size()) {
         return false;
     }
 
-    // 对每个障碍物检查基本属性
+    // 逐顶点比较。早期实现只比对障碍物个数与首个障碍物的首个顶点，
+    // 两组"个数相同、首顶点相同"的不同障碍物会命中同一份栅格，
+    // 从而拿到错误的距离场并直接破坏障碍物避让判定。
     for (size_t i = 0; i < obstacles.size(); ++i) {
-        const auto& obs1 = obstacles[i];
-        const auto& obs2 = other.obstacles[i];
-
-        if (obs1.geometry.outer.size() != obs2.geometry.outer.size()) {
+        const auto& ring1 = obstacles[i].geometry.outer;
+        const auto& ring2 = other.obstacles[i].geometry.outer;
+        if (ring1.size() != ring2.size()) {
             return false;
         }
-
-        // 检查几个关键点判断相似性
-        if (!obs1.geometry.outer.empty() && !obs2.geometry.outer.empty()) {
-            if (std::abs(obs1.geometry.outer[0].x() - obs2.geometry.outer[0].x()) > 1e-6 ||
-                std::abs(obs1.geometry.outer[0].y() - obs2.geometry.outer[0].y()) > 1e-6) {
+        for (size_t v = 0; v < ring1.size(); ++v) {
+            if (std::abs(ring1[v].x() - ring2[v].x()) > 1e-9 ||
+                std::abs(ring1[v].y() - ring2[v].y()) > 1e-9) {
                 return false;
             }
         }
@@ -239,11 +238,14 @@ std::size_t SDFField::CacheKeyHash::operator()(const SDFField::CacheKey& k) cons
     std::size_t h6 = std::hash<double>{}(k.buffer);
     std::size_t h7 = std::hash<size_t>{}(k.obstacles.size());
 
-    // 若存在障碍物,对其关键点做哈希
+    // 全顶点折叠，与 operator== 的比较范围保持一致。
     std::size_t h8 = 0;
-    if (!k.obstacles.empty() && !k.obstacles[0].geometry.outer.empty()) {
-        h8 = std::hash<double>{}(k.obstacles[0].geometry.outer[0].x() +
-                                 k.obstacles[0].geometry.outer[0].y());
+    for (const auto& obs : k.obstacles) {
+        h8 = h8 * 1000003u + std::hash<size_t>{}(obs.geometry.outer.size());
+        for (const auto& v : obs.geometry.outer) {
+            h8 = h8 * 1000003u + std::hash<double>{}(v.x());
+            h8 = h8 * 1000003u + std::hash<double>{}(v.y());
+        }
     }
 
     // 组合哈希值

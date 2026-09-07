@@ -20,6 +20,11 @@ namespace isg {
     /// 完善输入数据缺失信息：复制输入并补齐兼容的组引用(负责groupID补全和可配置方向统一)，不修改调用方原对象
     IntersectionInput InputNormalizer(const IntersectionInput& input);
 
+    /// 跨臂误并保护的阈值与抗抖动基线定义在 `types.h`
+    /// （`kGroupDirectionForceLimitDeg` / `kGroupDirectionRobustBaselineM`，可经
+    /// `ConnectivityDirectionConfig` 覆盖）。corpus 定标见 `tests/diag_group_dir.cpp`，
+    /// 判定理由见实现处注释与架构设计文档 §6.8.9。
+
     /// 按配置统一同组车道的路口端切向，不修改车道端点位置。
     void ConnectivityDirectionNormalizer(IntersectionInput& input, const ConnectivityDirectionConfig& config);
 

@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "constraints/constraint_evaluator.h"
+#include "constraints/fence_check.h"
 #include "constraints/uturn_envelope_constraint.h"
 #include "curve/bezier.h"
 #include "curve/curve_utils.h"
@@ -84,12 +85,15 @@ TEST_CASE("InputNormalizer fills group references without mutating source") {
 TEST_CASE("ConnectivityDirectionNormalizer reuses the indexed group direction") {
     isg::IntersectionInput input;
     input.lanes.push_back(lane("E1", isg::Vec3d(-10, 1), isg::Vec3d(0, 1)));
-    input.lanes.push_back(lane("E2", isg::Vec3d(0, -10), isg::Vec3d(0, 0)));
+    // E2 与组方向只差 5.7°：同一进出口内的车道抖动，必须被统一到 +x。
+    input.lanes.push_back(lane("E2", isg::Vec3d(-10, -1), isg::Vec3d(0, 0)));
+    // E3 偏 90°：塞进同一 groupId 的另一条臂，跨臂保护必须原样保留它的端点切向。
+    input.lanes.push_back(lane("E3", isg::Vec3d(0, -10), isg::Vec3d(0, -2)));
     input.lanes.push_back(lane("X", isg::Vec3d(10, 1), isg::Vec3d(20, 1)));
     isg::LaneGroup group;
     group.id = "entry";
     group.role = isg::GroupRole::Entry;
-    group.lanes = {"E1", "E2"};
+    group.lanes = {"E1", "E2", "E3"};
     input.lane_groups.push_back(group);
     isg::Connectivity straight;
     straight.id = "straight";
@@ -99,12 +103,15 @@ TEST_CASE("ConnectivityDirectionNormalizer reuses the indexed group direction") 
     input.connectivities.push_back(straight);
 
     const isg::Vec3d endpoint = input.lanes[1].geometry.points.back();
+    const isg::Vec2d cross_arm_dir =
+        input.entryPtDir("E3").second.normalized();
     isg::ConnectivityDirectionNormalizer(
         input, isg::ConnectivityDirectionConfig());
 
     REQUIRE(input.lanes[1].geometry.points.back().xy().isApprox(endpoint.xy()));
     REQUIRE(input.lanes[1].geometry.points.back().z() == endpoint.z());
     REQUIRE(input.entryPtDir("E2").second.normalized().dot(isg::Vec2d(1, 0)) > 0.99);
+    REQUIRE(input.entryPtDir("E3").second.normalized().dot(cross_arm_dir) > 0.99);
 }
 
 TEST_CASE("FixedShapeInitializer preserves non-degenerate polyline segments") {
@@ -1371,4 +1378,109 @@ TEST_CASE("singleCubicSignedEndCurvature orders a shared-endpoint fan-out") {
     REQUIRE(isg::singleCubicSignedEndCurvature(c, false) < 0.0);
     REQUIRE(std::abs(isg::singleCubicSignedEndCurvature(isg::BezierCurve(), true))
             < 1e-12);
+}
+
+// ── 围栏（粗糙路口面）越界判定 ────────────────────────────────────────────────
+// 粗糙路口面的外环是从各进出口车道端头连出来的，所以外环恰好穿过每条曲线的连接点。
+// 由此产生两类不可归因于生成器的"越界"，必须与真实外溢分开（见 fence_check.h）。
+namespace {
+
+isg::Polygon2d makeSquareFence() {
+    isg::Polygon2d fence;
+    fence.outer = {isg::Vec2d(0, 0), isg::Vec2d(100, 0), isg::Vec2d(100, 100),
+                   isg::Vec2d(0, 100)};
+    return fence;
+}
+
+// 底边中段被切掉一块（y=0 抬到 y=5），用来构造"面本身不含两连接点之间直线弦"的情形，
+// 即粗糙面把转角切掉的等价几何。
+isg::Polygon2d makeNotchedFence() {
+    isg::Polygon2d fence;
+    fence.outer = {isg::Vec2d(0, 0),   isg::Vec2d(30, 0),   isg::Vec2d(30, 5),
+                   isg::Vec2d(70, 5),  isg::Vec2d(70, 0),   isg::Vec2d(100, 0),
+                   isg::Vec2d(100, 100), isg::Vec2d(0, 100)};
+    return fence;
+}
+
+isg::BezierCurve makeCubic(const isg::Vec2d& p0, const isg::Vec2d& c1,
+                           const isg::Vec2d& c2, const isg::Vec2d& p1) {
+    isg::BezierCurve curve;
+    isg::BezierSegment seg;
+    seg.ctrl = {p0, c1, c2, p1};
+    curve.segs.push_back(seg);
+    return curve;
+}
+
+}  // namespace
+
+TEST_CASE("fence exemption separates connection-point rounding from real overflow",
+          "[fence][constraint]") {
+    const isg::Polygon2d fence = makeSquareFence();
+    const isg::Vec2d p0(10, -0.0005);   // 连接点本身，毫米级落在外环外侧
+    const isg::Vec2d p1(90, 3.0);
+
+    // 一、连接点本身：生成器自由度为零，允许量到 kFenceEndpointOutsideTol。
+    REQUIRE(isg::fenceOutsideIsConnectionPointRounding(fence, p0, p0, p1));
+    // 但"车道端点被数据放在面外很远"仍要报出来。
+    const isg::Vec2d far_ep(10, -0.20);
+    REQUIRE_FALSE(isg::fenceOutsideIsConnectionPointRounding(fence, far_ep, far_ep, p1));
+
+    // 二、连接点近侧贴外环的一小段：允许量收紧到 kFenceConnectionRoundingTol。
+    //     实测 sps 加密后会在此处多打出 0.23mm 一点（intersection_cross 61）。
+    REQUIRE(isg::fenceOutsideIsConnectionPointRounding(
+        fence, isg::Vec2d(10.04, -0.00023), p0, p1));
+    // 同一位置但深 10mm，已超出坐标舍入尺度，不豁免。
+    REQUIRE_FALSE(isg::fenceOutsideIsConnectionPointRounding(
+        fence, isg::Vec2d(10.04, -0.010), p0, p1));
+    // 跨度之外的真实中段外溢不豁免，哪怕只有 3.7mm（intersection_cross 65 实测值）。
+    REQUIRE_FALSE(isg::fenceOutsideIsConnectionPointRounding(
+        fence, isg::Vec2d(11.9, -0.0037), p0, p1));
+}
+
+TEST_CASE("curveInsideFence tolerates endpoint rounding but not interior overflow",
+          "[fence][constraint]") {
+    const isg::Polygon2d fence = makeSquareFence();
+    // 首尾连接点各外溢 0.5mm，中段整体在面内：判为面内。
+    const isg::BezierCurve clean = makeCubic(
+        isg::Vec2d(10, -0.0005), isg::Vec2d(30, 10), isg::Vec2d(70, 10),
+        isg::Vec2d(90, -0.0005));
+    CHECK(isg::curveInsideFence(clean, fence, 25));
+    CHECK(isg::curveInsideFence(clean, fence, 64));   // 审计用密度
+    CHECK(isg::curveInsideFence(clean, fence, 160));  // 加密也不应翻结论
+    CHECK(isg::curveFenceOverflow(clean, fence, 160) == 0.0);
+
+    // 同样的端点，但中段压到外环之外：必须报出。
+    const isg::BezierCurve dipping = makeCubic(
+        isg::Vec2d(10, -0.0005), isg::Vec2d(30, -0.02), isg::Vec2d(70, -0.02),
+        isg::Vec2d(90, -0.0005));
+    CHECK_FALSE(isg::curveInsideFence(dipping, fence, 64));
+    CHECK(isg::curveFenceOverflow(dipping, fence, 160) > 0.005);
+}
+
+TEST_CASE("fence overflow forced by the face is separated from shape defects",
+          "[fence][constraint]") {
+    const isg::Polygon2d fence = makeNotchedFence();
+    const isg::Vec2d p0(20, 1), p1(80, 1);
+    // 面本身不含两连接点之间的直线弦：缺口底面在 y=5，弦却走 y=1。
+    const double chord = isg::fenceChordOverflow(fence, p0, p1, 160);
+    REQUIRE(chord > 3.9);
+
+    // 绕到缺口上方：完全在面内，不产生任何外溢。
+    const isg::BezierCurve over = makeCubic(p0, isg::Vec2d(30, 20),
+                                            isg::Vec2d(70, 20), p1);
+    CHECK(isg::curveInsideFence(over, fence, 64));
+
+    // 贴着弦走：外溢不超过弦强制的下限，归因于面画小了。
+    const isg::BezierCurve along = makeCubic(p0, isg::Vec2d(35, 1),
+                                             isg::Vec2d(65, 1), p1);
+    const double along_out = isg::curveFenceOverflow(along, fence, 160);
+    CHECK_FALSE(isg::curveInsideFence(along, fence, 64));
+    CHECK(isg::fenceOverflowForcedByFace(along_out, chord));
+
+    // 比直连还差：越过底边继续向外，超出弦强制下限，属形态缺陷。
+    const isg::BezierCurve below = makeCubic(p0, isg::Vec2d(35, -6),
+                                             isg::Vec2d(65, -6), p1);
+    const double below_out = isg::curveFenceOverflow(below, fence, 160);
+    CHECK(below_out > chord + 1.0);
+    CHECK_FALSE(isg::fenceOverflowForcedByFace(below_out, chord));
 }

@@ -1,8 +1,10 @@
 #include "constraints/shape_constraint.h"
 
+#include "constraints/boundary_safety.h"
 #include "constraints/fence_check.h"
 #include "curve/curve_utils.h"
 #include "geometry/predicates.h"
+#include "optimizer/sdf_field.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -63,6 +65,101 @@ bool segmentStraight(const BezierSegment& segment) {
                std::max(0.05, length * 0.03);
 }
 
+// 端点切向夹角(弧度)。它是 arc/chord 下限的唯一自变量，见
+// ordinaryTurnArcChordFloor。切向缺失时退化用弦向，此时夹角为 0，
+// 下限落到绝对地板。
+double endpointTurnAngle(const CurveGenerationContext& context,
+                         const Vec2d& chord) {
+    const Vec2d fallback =
+        chord.norm() > 1e-8 ? chord.normalized() : Vec2d(1.0, 0.0);
+    const Vec2d t0 = context.entry.second.norm() > 1e-8
+        ? context.entry.second.normalized() : fallback;
+    const Vec2d t1 = context.exit.second.norm() > 1e-8
+        ? context.exit.second.normalized() : t0;
+    return std::atan2(std::abs(cross2d(t0, t1)), t0.dot(t1));
+}
+
+// 两段表达的直行，其分段接点处允许的最大曲率（R >= 4m）。
+//
+// 原值 3.0 相当于允许 0.33m 转弯半径，对"直行应尽量平直"（需求 1.4①）等于没有
+// 约束：100000385-u 的直行 41 用两段绕过边缘，两段把手都只取自身弦的 0.12，
+// 中间腿却有 14m，接点曲率因此高达 0.7295（R=1.37m），肉眼是一个折角，却同时
+// 满足 arc/chord 1.013、横向 0.076 和旧的 3.0 上限。
+//
+// 4m 取自 elasticBandSmooth 的 kappa_max 缺省值 0.25——项目自身的平滑目标半径。
+// 一条直行的分段接点半径小于平滑目标半径时，接点就是折角而不是平直过渡。
+constexpr double kTwoSegmentStraightMaxCurvature = 0.25;
+
+// 普通曲线用两段表达的"必要性"判据（需求 1.3）。
+//
+// 需求只承认三类多段场景：避障、固有形态、掉头。掉头在 evaluateOrdinaryShape
+// 入口已被 isGeometricUTurn 排除，固有形态由 constraint.fixed_shape 单独把关，
+// 因此普通曲线用两段的唯一合法理由是"自然单段确实过不去
+// Obstacle / Boundary / 围栏"。原实现只检查两段形态是否"光滑合法"，一条完全
+// 干净的两段直行（如 (0,0)-(0,5)-(0,10)）因此可以无代价地通过，等于把
+// 需求 1.3 的"尽量单段"退化成"随便几段都行"。
+//
+// 这里直接沿端点切向轴扫一族单段 cubic：只要其中任意一条同时通过三项物理判据，
+// 两段形态就没有避让价值，必须判违收回单段。物理口径与 ConstraintEvaluator
+// 的 physical.* 完全一致，避免"形态放过、物理判违"的自相矛盾。
+//
+// 只在 numSegments()==2 这条稀有分支上计算：正常单段候选一次也不会走到。
+bool singleCubicAvoidanceIsPossible(const CurveGenerationContext& context,
+                                    const Vec2d& chord) {
+    if (context.scene == nullptr || chord.norm() < 1e-6)
+        return true;  // 无场景可复算时按"单段可行"处理，两段仍属多余。
+    const IntersectionInput& input = context.scene->view.input();
+    const ConstraintProfile& profile = context.profile;
+    const Vec2d p0 = context.entry.first;
+    const Vec2d p1 = context.exit.first;
+    const Vec2d t0 = context.entry.second.norm() > 1e-8
+        ? context.entry.second.normalized() : chord.normalized();
+    const Vec2d t1 = context.exit.second.norm() > 1e-8
+        ? context.exit.second.normalized() : t0;
+    const Polygon2d* fence =
+        profile.enforce_fence && !input.area.geometry.outer.empty()
+            ? &input.area.geometry : nullptr;
+    // 把手比例覆盖生成侧实际使用的整个区间（buildPreferredSingleCubic 的
+    // 0.4 回退、buildAlphaCandidates 的常用取值以及 2/3 交点升阶的上界）。
+    static const double kHandleFractions[] = {
+        0.20, 0.25, 1.0 / 3.0, 0.40, 0.50, 2.0 / 3.0};
+    for (double alpha : kHandleFractions) {
+        BezierCurve single;
+        single.segs.push_back(makeCubicG1(p0, t0, p1, t1, alpha));
+        if (single.empty())
+            continue;
+        if (fence != nullptr && !curveInsideFence(single, *fence, 64))
+            continue;
+        if (profile.check_obstacle) {
+            if (!input.obstacles.empty() &&
+                curveIntersectsObstaclesForAudit(single, input.obstacles, nullptr))
+                continue;
+            const SDFField* sdf = context.scene->sdf;
+            if (sdf != nullptr && sdf->valid()) {
+                bool clear = true;
+                for (const Vec2d& point :
+                     single.sampleByArcLength(std::max(32, profile.samples))) {
+                    if (sdf->queryWithGrad(point).first <
+                        profile.obstacle_clearance) {
+                        clear = false;
+                        break;
+                    }
+                }
+                if (!clear)
+                    continue;
+            }
+        }
+        if (profile.check_boundary && !input.boundaries.empty()) {
+            const BoundarySafetyResult safety = curveBoundarySafetyForInput(
+                single, input, std::max(32, profile.samples * 2), 0.75, 0.10, 0.05);
+            if (safety.intersects || safety.outside_road_edge)
+                continue;
+        }
+        return true;  // 找到一条物理可行的单段：两段没有避让理由。
+    }
+    return false;
+}
+
 bool twoSegmentWaypointShapeAcceptable(const BezierCurve& curve,
                                        const CurveGenerationContext& context,
                                        const Vec2d& chord,
@@ -87,6 +184,11 @@ bool twoSegmentWaypointShapeAcceptable(const BezierCurve& curve,
         (first.ctrl[3] - first.ctrl[0]).norm() < 0.30 ||
         (second.ctrl[3] - second.ctrl[0]).norm() < 0.30)
         return false;
+    // 每段控制多边形必须沿自身弦单调，理由同单段的弦方向联合预算，
+    // 见 cubicControlPolygonMonotone。
+    if (!cubicControlPolygonMonotone(first) ||
+        !cubicControlPolygonMonotone(second))
+        return false;
 
     const double ratio = curve.arcLength() / chord.norm();
     double max_lateral = 0.0;
@@ -98,8 +200,9 @@ bool twoSegmentWaypointShapeAcceptable(const BezierCurve& curve,
 
     if (turn_strength <= 0.25)
         return ratio <= 1.12 && max_lateral / chord.norm() <= 0.12 &&
-               curve.maxCurvature(40) <= 3.0;
-    return ratio >= (chord.norm() < 12.0 ? 1.02 : 1.06) &&
+               curve.maxCurvature(40) <= kTwoSegmentStraightMaxCurvature;
+    return ratio >= ordinaryTurnArcChordFloor(
+                        endpointTurnAngle(context, chord), chord.norm()) &&
            ratio <= 1.45 && max_lateral / chord.norm() <= 0.45 &&
            curve.maxCurvature(40) <= 2.5 &&
            curveTurningSpan(curve) <= 200.0 * M_PI / 180.0 &&
@@ -186,6 +289,10 @@ ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
                 curve, context, chord, turn_strength))
             return violated("shape.ordinary.waypoint",
                             "ordinary two-segment waypoint curve is not a smooth legal arch");
+        // 形态合法还不够：需求 1.3 只在单段确实表达不出来时才允许多段。
+        if (singleCubicAvoidanceIsPossible(context, chord))
+            return violated("shape.ordinary.single_segment",
+                            "ordinary curve uses two segments while a single cubic is feasible");
         return satisfied("shape.ordinary.waypoint");
     }
     if (curve.numSegments() != 1)
@@ -218,7 +325,11 @@ ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
         if (ratio > 1.08 || lateral > 0.08 || curve.maxCurvature(40) > 3.0)
             return violated("shape.ordinary.straight", "straight curve is not sufficiently straight");
     } else {
-        const double minimum_ratio = chord.norm() < 12.0 ? 1.02 : 1.06;
+        // arc/chord 下限按端点转角折算（见 ordinaryTurnArcChordFloor）：
+        // 需求写的常数是按 90° 折算出来的，浅转时常数超过同转角圆弧的
+        // 理论比例，任何合规单拱都不可能达到。
+        const double minimum_ratio = ordinaryTurnArcChordFloor(
+            endpointTurnAngle(context, chord), chord.norm());
         const double maximum_ratio = chord.norm() <= 15.0 ? 1.40 : 1.35;
         if (ratio < minimum_ratio || ratio > maximum_ratio ||
             curve.maxCurvature(40) > 2.5 || signFlip(curve))

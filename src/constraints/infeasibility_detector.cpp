@@ -51,17 +51,25 @@ bool bfsReachable(const SDFField& sdf, const Polygon2d& fence,
     auto key = [&](int r, int c) { return r * cols + c; };
     std::unordered_set<int> vis;
     std::queue<std::pair<int, int>> q;
+    // 起终点由连接关系强制指定，其所在栅格必须视为可行域的一部分：连接点通常
+    // 就落在围栏（路口面）边界上，格心因半格偏移常常落到围栏外，若一并套用
+    // 围栏/净距门禁，任何干净通道都会被误判成拓扑死锁。
+    auto isEndpointCell = [&](int r, int c) {
+        return (r == sr && c == sc_) || (r == gr && c == gc_);
+    };
     auto push = [&](int r, int c) {
         if (r < 0 || r >= rows || c < 0 || c >= cols)
             return;
         if (vis.count(key(r, c)))
             return;
-        Vec2d w = sdf.cellToWorld(r, c);
-        std::pair<double, Vec2d> _q = sdf.queryWithGrad(w);
-        if (_q.first < mc)
-            return;
-        if (!fence.outer.empty() && !polygonContains(fence, w))
-            return;
+        if (!isEndpointCell(r, c)) {
+            Vec2d w = sdf.cellToWorld(r, c);
+            std::pair<double, Vec2d> _q = sdf.queryWithGrad(w);
+            if (_q.first < mc)
+                return;
+            if (!fence.outer.empty() && !polygonContains(fence, w))
+                return;
+        }
         vis.insert(key(r, c));
         q.push({r, c});
     };
@@ -85,10 +93,16 @@ bool detectSandwich(const SDFField& sdf, const Polygon2d& fence, double cl) {
         return false;
     auto& ring = fence.outer;
     int n = (int)ring.size();
+    // 内法向依赖环绕方向：CCW 环（有符号面积 > 0）的内法向是 (-e_y, e_x)，
+    // CW 环取反。早期实现固定用 (e_y, -e_x)，在 CCW 输入上探到围栏外侧，
+    // 使贴住围栏的障碍物永远检不出夹断。
+    const double inward_sign = polygonSignedArea(ring) >= 0.0 ? 1.0 : -1.0;
     for (int i = 0; i < n; ++i) {
         Vec2d a = ring[i], b = ring[(i + 1) % n], mid = 0.5 * (a + b);
+        if ((b - a).norm() < 1e-12)
+            continue;
         Vec2d edge = (b - a).normalized();
-        Vec2d inward{edge[1], -edge[0]};
+        Vec2d inward = inward_sign * Vec2d(-edge[1], edge[0]);
         Vec2d inner = mid + cl * inward;
         std::pair<double, Vec2d> _q2 = sdf.queryWithGrad(inner);
         if (_q2.first < cl)

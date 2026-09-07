@@ -36,11 +36,24 @@ ConstraintReport ConstraintEvaluator::evaluate(const BezierCurve& curve,
     }
     if (profile.enforce_fence && !context.view.input().area.geometry.outer.empty() &&
         !curveInsideFence(curve, context.view.input().area.geometry, profile.samples)) {
+        // 越界分两类：面本身不含"两个固定连接点之间的直线弦"时，任何曲线都出不来，
+        // 外溢是输入面画小了（右转被切角尤甚），记 Exempt 并带上定量证据；反之才是
+        // 生成器把曲线画到了比直连还差的位置，记 Violated。判据见 fence_check.h。
+        const Polygon2d& fence = context.view.input().area.geometry;
+        const int n = std::max(32, profile.samples * 2);
+        const double curve_overflow = curveFenceOverflow(curve, fence, n);
+        const double chord_overflow =
+            fenceChordOverflow(fence, curve.startPt(), curve.endPt(), n);
+        const bool forced = fenceOverflowForcedByFace(curve_overflow, chord_overflow);
         ConstraintResult result;
         result.id = "fence.containment";
         result.severity = ConstraintSeverity::Hard;
-        result.state = ConstraintState::Violated;
-        result.reason = "curve leaves coarse intersection fence";
+        result.state = forced ? ConstraintState::Exempt : ConstraintState::Violated;
+        result.violation = forced ? 0.0 : curve_overflow - chord_overflow;
+        result.reason = forced
+            ? "curve leaves coarse intersection fence, but the fence itself excludes "
+              "the straight chord between the two fixed connection points"
+            : "curve leaves coarse intersection fence beyond the chord-forced floor";
         report.results.push_back(result);
     }
 
@@ -97,19 +110,30 @@ ConstraintReport ConstraintEvaluator::evaluate(const BezierCurve& curve,
             report.results.push_back(result);
         }
         if (profile.road_edge_clearance > 0.0) {
-            Vec2d location(0, 0);
-            const double distance = minimumCurveBoundaryDistanceForAudit(
-                curve, context.view.input().boundaries, Boundary::Type::RoadEdge,
-                std::max(32, profile.samples * 2), kConnectionPointTolerance,
-                &location);
-            if (distance < profile.road_edge_clearance) {
+            // 连接点位置由输入固定、端点切向被 G1 锁定在车道朝向上：连接点自身就落在净距
+            // 之内时（corpus 里 110000741-u 出口连接点距 RoadEdge 仅 0.9521m，要求 1.0m），
+            // 端点邻域的亏欠不可能由曲线形状消除。逐点判据见 road_edge_clearance.h。
+            const RoadEdgeClearanceMeasure measure =
+                measureCurveRoadEdgeClearanceForAudit(
+                    curve, context.view.input().boundaries, Boundary::Type::RoadEdge,
+                    profile.road_edge_clearance, std::max(32, profile.samples * 2),
+                    kConnectionPointTolerance);
+            const double deficit = roadEdgeClearanceDeficit(
+                measure, profile.road_edge_clearance);
+            const bool forced = roadEdgeClearanceForcedByEndpoint(
+                measure, profile.road_edge_clearance);
+            if (deficit > kRoadEdgeClearanceRoundingTol || forced) {
                 ConstraintResult result;
                 result.id = "physical.road_edge_clearance";
                 result.severity = ConstraintSeverity::Hard;
-                result.state = ConstraintState::Violated;
-                result.violation = profile.road_edge_clearance - distance;
-                result.locations.push_back(location);
-                result.reason = "curve violates non-endpoint road-edge clearance";
+                result.state = forced ? ConstraintState::Exempt
+                                      : ConstraintState::Violated;
+                result.violation = forced ? 0.0 : deficit;
+                result.locations.push_back(
+                    forced ? measure.location : measure.deficit_location);
+                result.reason = forced
+                    ? "road-edge clearance deficit forced by connection point"
+                    : "curve violates non-endpoint road-edge clearance";
                 report.results.push_back(result);
             }
         }

@@ -746,6 +746,191 @@ inline BoundarySafetyResult curveBoundarySafetyIgnoringEndpointGraze(
         boundary_endpoint_tol, outside_tol, fence_outline);
 }
 
+/// 输入级边界口径的严格判定部分（不含离开楔形豁免）。
+inline BoundarySafetyResult curveBoundaryStrictSafetyForInput(
+        const BezierCurve& curve, const IntersectionInput& input,
+        int min_samples, double curve_endpoint_tol,
+        double boundary_endpoint_tol, double outside_tol,
+        const Polygon2d* fence_outline) {
+    return curveBoundarySafety(
+        curve, input.boundaries, boundarySafetyCenter(input), min_samples,
+        curve_endpoint_tol, boundary_endpoint_tol, outside_tol, fence_outline);
+}
+
+// ── 共享连接点的"离开楔形"豁免 ────────────────────────────────────────────
+//
+// 数据里的 RoadEdge 常以连接的**连接点本身**为折线端点（路口四角的路缘从车道
+// 停止点起画，甚至与某条右转连接的固有形态逐位相同）。这样一条 Boundary 与该
+// 连接的任何曲线都从同一点出发：两者初始方向哪怕只差不到 1°，也会先分开厘米级、
+// 再随路缘弯折发生**一次**穿越。这一次穿越是"折线锚在连接点上"的拓扑后果，
+// 不是产品要禁止的贴合（沿路缘走一段）或穿行（切过路缘进入不可行驶区）。
+//
+// 100000385-u 的直行 59 与 RoadEdge 929910 就是如此：929910 的折线首点正是 59 的
+// 进入连接点，两者夹角 0.9°，59 最大只越界 0.037m、3.58m 后就穿回路口一侧并越拉越
+// 远（6.8m 处 0.72m、9.9m 处 1.93m）。这 3.7cm 却否决了 59 全部 11 个自然单段候选
+// （实测 phys_obs=0 phys_fence=0 phys_bnd=11），迫使 59 向南鼓出约 6m 的 S 形。
+// 直行 41(0.018m)、23(0.003m)、56(0.0001m) 同因同源。
+//
+// 豁免要求三件事同时成立，任一不满足即照常判违：
+//   1. Boundary 折线的某个端点与曲线自身的首/尾连接点重合（anchor_tol 内）；
+//   2. 自该连接点到最远接触点之间，曲线到该 Boundary 的最大距离 <= wedge_tol；
+//   3. 该窗口的弧长 <= wedge_span。
+//
+// wedge_tol 取 0.05m，与 roadEdgeOutsidePenalty 的 outside_tol 同值：路缘"中心侧
+// 越界"判定本来就容忍 5cm，穿越判定没有理由对同一个 5cm 更严。实测语料里 66 处
+// 锚定接触的深度分布把两类清楚分开——真正的贴合/穿行是 0.10~4.22m、窗口 8~36m，
+// 楔形是 0.0001~0.087m、窗口 0.6~4.0m，相差一个量级以上。
+//
+// 这不是恢复已被废止的 endpointGraze 豁免：那一条按"切向共线段"豁免、容差 0.25m，
+// 会放过真实的沿缘贴合，因此被改为一律判违。本判据不看切向、容差小 5 倍，并且
+// 窗口以最远接触点为界——曲线只要在窗口内偏离超过 5cm 再穿回来，深度判据就会失败。
+
+// 曲线采样区间 [lo,hi] 到折线的最大距离。
+inline double curveToPolylineMaxDistance(
+        const std::vector<Vec2d>& pts, const std::vector<Vec2d>& bpts,
+        int lo, int hi) {
+    double worst = 0.0;
+    const int n = (int)pts.size();
+    for (int i = std::max(0, lo); i <= hi && i < n; ++i) {
+        double d = std::numeric_limits<double>::infinity();
+        for (std::size_t j = 0; j + 1 < bpts.size(); ++j)
+            d = std::min(d, pointToSegment(pts[i], bpts[j], bpts[j + 1]).first);
+        if (std::isfinite(d))
+            worst = std::max(worst, d);
+    }
+    return worst;
+}
+
+/// 曲线与 Boundary 的**全部**判违接触是否都属于共享连接点的离开楔形。
+/// 只有确实找到接触且逐条都被豁免时返回 true；调用方只在严格判定已经报违时
+/// 才调用它，因此常见路径不付任何代价。
+inline bool curveBoundaryContactsAreDepartureWedges(
+        const BezierCurve& curve, const std::vector<Boundary>& boundaries,
+        bool road_edges_only = false,
+        double curve_endpoint_tol = kConnectionPointTolerance,
+        double wedge_tol = 0.05, double wedge_span = 6.0,
+        double anchor_tol = 0.20) {
+    if (curve.empty() || boundaries.empty())
+        return false;
+    // 快路径：豁免的必要条件是"某条 Boundary 的折线端点落在曲线自身的连接点上"。
+    // 先用 O(B) 次端点距离筛掉不满足的整批调用，避免采样和 O(Ns×Nb) 扫描。
+    // 110004764 有 91 条 boundary，绝大多数候选一条也锚不上，这一步直接返回。
+    const Vec2d q0 = curve.startPt();
+    const Vec2d q1 = curve.endPt();
+    bool has_anchor = false;
+    for (const auto& bnd : boundaries) {
+        if (road_edges_only && bnd.type != Boundary::Type::RoadEdge)
+            continue;
+        if (bnd.geometry.points.size() < 2)
+            continue;
+        const Vec2d bf = xyOf(bnd.geometry.points.front());
+        const Vec2d bb = xyOf(bnd.geometry.points.back());
+        if ((bf - q0).norm() <= anchor_tol || (bb - q0).norm() <= anchor_tol ||
+            (bf - q1).norm() <= anchor_tol || (bb - q1).norm() <= anchor_tol) {
+            has_anchor = true;
+            break;
+        }
+    }
+    if (!has_anchor)
+        return false;
+    const double endpoint_tol = std::min(
+        std::max(0.0, curve_endpoint_tol), kConnectionPointTolerance);
+    const std::vector<Vec2d> pts = curve.sampleByArcLength(std::max(
+        64, std::min(240, (int)std::ceil(curve.arcLength() / 0.18) + 1)));
+    if (pts.size() < 2)
+        return false;
+    std::vector<double> station(pts.size(), 0.0);
+    for (std::size_t i = 1; i < pts.size(); ++i)
+        station[i] = station[i - 1] + (pts[i] - pts[i - 1]).norm();
+    const double total = station.back();
+    const Vec2d p0 = pts.front();
+    const Vec2d p1 = pts.back();
+
+    // 与 curveRawIntersectsBoundariesImpl 同样的包围盒剪枝：
+    // segmentHasForbiddenBoundaryContact 的首个判据是 segmentsIntersect，
+    // 包围盒不相交时必然返回 false，因此剪枝不改变任何结论。
+    const double box_slack = 1e-9;
+    const std::size_t nseg = pts.size() - 1;
+    std::vector<BoundingBox2d> sample_box(nseg);
+    BoundingBox2d curve_box;
+    for (std::size_t i = 0; i < nseg; ++i) {
+        sample_box[i].expand(pts[i]);
+        sample_box[i].expand(pts[i + 1]);
+        curve_box.expand(pts[i]);
+    }
+    curve_box.expand(pts.back());
+    const auto boxesApart = [box_slack](const BoundingBox2d& x,
+                                       const BoundingBox2d& y) {
+        return x.max_pt[0] < y.min_pt[0] - box_slack ||
+               y.max_pt[0] < x.min_pt[0] - box_slack ||
+               x.max_pt[1] < y.min_pt[1] - box_slack ||
+               y.max_pt[1] < x.min_pt[1] - box_slack;
+    };
+
+    bool any_contact = false;
+    std::vector<BoundingBox2d> bnd_box;
+    for (const auto& bnd : boundaries) {
+        if (road_edges_only && bnd.type != Boundary::Type::RoadEdge)
+            continue;
+        if (bnd.geometry.points.size() < 2)
+            continue;
+        if (!curve_box.intersects(bnd.geometry.bbox()))
+            continue;
+        const std::vector<Vec2d> bpts = toVec2dArray(bnd.geometry.points);
+        const std::size_t nbseg = bpts.size() - 1;
+        bnd_box.assign(nbseg, BoundingBox2d());
+        for (std::size_t j = 0; j < nbseg; ++j) {
+            bnd_box[j].expand(bpts[j]);
+            bnd_box[j].expand(bpts[j + 1]);
+        }
+        int first_hit = -1;
+        int last_hit = -1;
+        for (std::size_t i = 0; i < nseg; ++i) {
+            bool hit = false;
+            for (std::size_t j = 0; j < nbseg && !hit; ++j) {
+                if (boxesApart(sample_box[i], bnd_box[j]))
+                    continue;
+                hit = segmentHasForbiddenBoundaryContact(
+                    pts[i], pts[i + 1], bpts[j], bpts[j + 1], p0, p1, endpoint_tol);
+            }
+            if (!hit)
+                continue;
+            if (first_hit < 0)
+                first_hit = (int)i;
+            last_hit = (int)i + 1;
+        }
+        if (first_hit < 0)
+            continue;
+        any_contact = true;
+        const bool anchor_start = (bpts.front() - p0).norm() <= anchor_tol ||
+                                  (bpts.back() - p0).norm() <= anchor_tol;
+        const bool anchor_end = (bpts.front() - p1).norm() <= anchor_tol ||
+                                (bpts.back() - p1).norm() <= anchor_tol;
+        bool covered = false;
+        if (anchor_start && station[last_hit] <= wedge_span &&
+            curveToPolylineMaxDistance(pts, bpts, 0, last_hit) <= wedge_tol)
+            covered = true;
+        if (!covered && anchor_end && total - station[first_hit] <= wedge_span &&
+            curveToPolylineMaxDistance(pts, bpts, first_hit,
+                                       (int)pts.size() - 1) <= wedge_tol)
+            covered = true;
+        // 整条曲线与该 Boundary 逐点重合、且首尾连接点都落在折线端点上：这条
+        // Boundary 就是这条连接自身的几何。100000385-u / 100000012* 的输入把同一
+        // 条折线同时声明为 RoadEdge 和右转连接的固有形态（ID 也相同，坐标逐位
+        // 一致：929910/929913/929914/929916、43285424/25/26），于是这些连接"穿越"
+        // 的正是自己。曲线不可能穿越自身，这类接触必须豁免；否则这些连接永远
+        // status=Degraded，且它们作为"边缘"还会把同簇邻居（直行 59）挤出自然形态。
+        // 判据要求两端连接点都落在折线端点上、且全程偏差 <= wedge_tol，普通连接
+        // 不可能满足，因此不会放宽任何真实路缘约束。
+        if (!covered && anchor_start && anchor_end &&
+            curveToPolylineMaxDistance(pts, bpts, 0, (int)pts.size() - 1) <= wedge_tol)
+            covered = true;
+        if (!covered)
+            return false;
+    }
+    return any_contact;
+}
+
 /// 生成、优化后审计与公共约束验证共用的输入级边界口径。只有精细路口面可作为
 /// RoadEdge 重复轮廓证据；粗糙包络不参与该判断，避免放宽真实道路边界。
 inline BoundarySafetyResult curveBoundarySafetyForInput(
@@ -755,10 +940,17 @@ inline BoundarySafetyResult curveBoundarySafetyForInput(
     const Polygon2d* fence_outline =
         !input.area.is_rough && !input.area.geometry.outer.empty()
             ? &input.area.geometry : nullptr;
-    return curveBoundarySafetyIgnoringEndpointGraze(
-        curve, input.boundaries, boundarySafetyCenter(input), min_samples,
-        curve_endpoint_tol, boundary_endpoint_tol, outside_tol,
-        0.60, 0.70, 0.25, fence_outline);
+    BoundarySafetyResult result = curveBoundaryStrictSafetyForInput(
+        curve, input, min_samples, curve_endpoint_tol, boundary_endpoint_tol,
+        outside_tol, fence_outline);
+    // 只在严格判定报"穿越"且不涉及路缘中心侧越界时，才检查离开楔形豁免。
+    // outside_road_edge 表示曲线确实落到路缘的不可行驶一侧，那是真实物理违约，
+    // 不参与豁免。
+    if (result.intersects && !result.outside_road_edge &&
+        curveBoundaryContactsAreDepartureWedges(
+            curve, input.boundaries, false, curve_endpoint_tol))
+        result.intersects = false;
+    return result;
 }
 
 } // 命名空间 isg

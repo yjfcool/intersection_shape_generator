@@ -20,6 +20,7 @@
 //                       [--road-edge-clearance 米]
 #include "constraints/cluster_order.h"
 #include "constraints/constraint_evaluator.h"
+#include "constraints/fence_check.h"
 #include "curve/curve_utils.h"
 #include "domain/scene_context.h"
 #include "generation/connectivity_generation_context.h"
@@ -492,10 +493,23 @@ void auditCurves(const std::string& name, const IntersectionInput& raw_input,
             emitNum("generator_report", "generator.obstacle_penetration", name, cc.id,
                     "error", "生成器自报障碍穿透", "penetration",
                     cc.violation.max_obstacle_penetration, 0.0);
-        if (cc.violation.max_fence_overflow > 1e-3)
+        if (cc.violation.max_fence_overflow > 1e-3) {
+            // 与 fence.containment 同口径：面本身不含两连接点之间的直线弦时，外溢是
+            // 输入面画小了而非曲线画歪了，降为 info 并把弦外溢一并报出以便定标。
+            const double chord = cc.curve
+                ? fenceChordOverflow(input.area.geometry, cc.curve->startPt(),
+                                     cc.curve->endPt(), 160)
+                : 0.0;
+            const bool forced =
+                fenceOverflowForcedByFace(cc.violation.max_fence_overflow, chord);
+            char detail[192];
+            std::snprintf(detail, sizeof(detail),
+                          "生成器自报围栏外溢（弦外溢=%.4fm，%s）", chord,
+                          forced ? "面不含该弦，几何强制" : "超出弦强制下限");
             emitNum("generator_report", "generator.fence_overflow", name, cc.id,
-                    "error", "生成器自报围栏外溢", "overflow",
-                    cc.violation.max_fence_overflow, 0.0);
+                    forced ? "info" : "error", detail, "overflow",
+                    cc.violation.max_fence_overflow, chord);
+        }
         if (cc.violation.type != ViolationInfo::InfeasibilityType::None)
             emit("generator_report", "generator.infeasibility", name, cc.id, "error",
                  std::string("生成器自报不可行类型=") +

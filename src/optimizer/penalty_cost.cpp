@@ -190,16 +190,27 @@ double PenaltyCost::evalBoundary(const BezierCurve& c) const {
 }
 
 /// 围栏越界惩罚: 越界点距围栏距离×2倍权重
+///
+/// 首尾连接点由输入固定、优化器无法移动。若它因坐标舍入落在粗糙路口面外环外侧
+/// （实测毫米级），无豁免时会给出一个恒定且不可消除的残差，自适应权重每轮都据此
+/// 上调围栏权重（上限 96），逼着优化器扭曲曲线中段去偿还一笔本就还不掉的账。
+/// 故此处与 curveInsideFence 共用同一连接点舍入豁免。
 double PenaltyCost::evalFence(const BezierCurve& c) const {
     if (cache_.fence_empty)
         return 0;
+    if (c.empty())
+        return 0;
+    const Vec2d p0 = c.startPt(), p1 = c.endPt();
     double cost = 0;
     constexpr int S = 10;  // 性能优化: 从20降至10
     for (auto& seg : c.segs)
         for (int i = 0; i <= S; ++i) {
             Vec2d pt = seg.evaluate((double)i / S);
-            if (!polygonContains(fence, pt))
-                cost += pointToPolygonDist(pt, fence) * 2.0;
+            if (polygonContains(fence, pt))
+                continue;
+            if (fenceOutsideIsConnectionPointRounding(fence, pt, p0, p1))
+                continue;
+            cost += pointToPolygonDist(pt, fence) * 2.0;
         }
     return cost;
 }

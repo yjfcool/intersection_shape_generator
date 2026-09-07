@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "constraints/road_edge_clearance.h"
 
 namespace isg {
 
@@ -32,5 +33,13 @@ double minimumCurveBoundaryDistanceForAudit(const BezierCurve& curve,
                                             int samples = 64,
                                             double endpoint_exclusion = 1e-4,
                                             Vec2d* location = nullptr);
+
+/// 测量曲线对指定类型边界的净距，并把"端点邻域"与"内部"分开统计，供
+/// `constraints/road_edge_clearance.h` 的统一口径判定使用。clearance 参与端点邻域
+/// 判定下限的计算，故必须与调用方最终使用的净距要求一致。
+RoadEdgeClearanceMeasure measureCurveRoadEdgeClearanceForAudit(
+    const BezierCurve& curve, const std::vector<Boundary>& boundaries,
+    Boundary::Type type, double clearance, int samples = 64,
+    double endpoint_exclusion = 1e-4);
 
 }  // 命名空间 isg

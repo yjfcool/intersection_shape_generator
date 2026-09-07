@@ -410,11 +410,24 @@ enum class UTurnAlignmentScope {
     LaneGroup = 1      ///< 按 enterGroupId / exitGroupId 归并
 };
 
+/// 同组切向统一允许强制转过的最大角度（度）。超过它说明该 groupId 混进了物理方向不同的
+/// 另一条路口臂或转向专用道，此时保留车道自身端点朝向。定标见 `tests/diag_group_dir.cpp`
+/// 与架构设计文档 §6.8.9。
+const double kGroupDirectionForceLimitDeg = 20.0;
+
+/// 判断"车道自身朝向"时用于抗抖动的最短基线长度（米）。端点两点式切向在末段只有几十厘米
+/// 时会被数字化噪声主导，此时改用自端点回溯该长度的弦方向作裁判依据，详见 §6.8.9。
+const double kGroupDirectionRobustBaselineM = 3.0;
+
 /// 连通方向配置
 struct ConnectivityDirectionConfig {
     ConnectivityDirectionMode mode = ConnectivityDirectionMode::GroupUnified;
     double group_similarity_angle_deg = 5.0;  ///< 同组车道方向相似性阈值（度）
     UTurnAlignmentScope uturn_alignment_scope = UTurnAlignmentScope::LaneEndpoint;
+    /// 跨臂误并保护阈值（度）：组方向与车道自身朝向差超过它就不覆盖该车道端点切向。
+    double group_force_limit_deg = kGroupDirectionForceLimitDeg;
+    /// 抗抖动基线（米）：<=0 表示退回端点两点式切向，不做长基线复核。
+    double group_robust_baseline_m = kGroupDirectionRobustBaselineM;
 };
 
 /// LBFGS优化器配置

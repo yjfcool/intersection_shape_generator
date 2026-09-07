@@ -3,6 +3,7 @@
 #include "curve/curve_utils.h"
 #include "constraints/boundary_safety.h"
 #include "constraints/fence_check.h"
+#include "constraints/road_edge_clearance.h"
 #include "utils.h"
 #include "optimizer/sdf_field.h"
 #include "constraints/infeasibility_detector.h"
@@ -251,6 +252,12 @@ static bool curveRawIntersectsBoundariesImpl(
                         pts[i], pts[i + 1], bpts[j], bpts[j + 1],
                         pts.front(), pts.back(), endpoint_tol))
                     continue;
+                // 共享连接点的"离开楔形"不判违（见 boundary_safety.h）。
+                // 判据是全局的（要求所有接触都属于楔形），因此在第一处接触上
+                // 求值一次即可定论；严格路径因此不付任何额外代价。
+                if (curveBoundaryContactsAreDepartureWedges(
+                        curve, boundaries, road_edges_only, curve_endpoint_tol))
+                    return false;
                 return true;
             }
         }
@@ -384,14 +391,10 @@ void ConnectivityGenerationSession::validate(
     audit.obstacle_intersection =
         curveIntersectsObstacles(c, input.obstacles, &obstacle_hit);
     if (!input.area.geometry.outer.empty()) {
-        double ov = 0;
         // 性能优化: 上限从240降至80,降低采样数
         int n = std::max(20, std::min(80, (int)std::ceil(c.arcLength() / 0.25) + 1));
-        for (auto& pt : c.sampleByArcLength(n))
-            if (!polygonContains(input.area.geometry, pt))
-                ov = std::max(ov, pointToPolygonDist(pt, input.area.geometry));
         audit.update_fence_overflow = true;
-        audit.max_fence_overflow = ov;
+        audit.max_fence_overflow = curveFenceOverflow(c, input.area.geometry, n);
     }
     audit.self_intersection = curveSelfIntersectsBusiness(c, 1.0);
 
@@ -1157,15 +1160,16 @@ static bool naturalCubicHitsObstacle(
     return sdf.valid() && minSDFAlongCurveAdaptive(trial, sdf) < 0.0;
 }
 
-// 采样曲线内部点并计算其到所有 RoadEdge 的最小距离。
-// 仅跳过曲线真实首/尾连接点的浮点误差，连接点之后的贴合、重叠和近边缘段
-// 都必须参与净距评估。
-static double minRoadEdgeDistanceAlongCurve(
+// 采样曲线内部点并测量其到所有 RoadEdge 的净距，逐点按"该点可达净距下限"折算亏欠。
+// 仅跳过曲线真实首/尾连接点的浮点误差，连接点之后的贴合、重叠和近边缘段都必须参与
+// 净距评估；可达下限由连接点自身净距与端点切向共同决定，详见
+// `constraints/road_edge_clearance.h`。
+static RoadEdgeClearanceMeasure measureRoadEdgeClearanceAlongCurve(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries,
-    double endpoint_skip = kConnectionPointTolerance) {
+    double clearance, double endpoint_skip = kConnectionPointTolerance) {
+    RoadEdgeClearanceMeasure measure;
     if (curve.empty() || boundaries.empty())
-        return std::numeric_limits<double>::infinity();
-    double min_edge_dist = std::numeric_limits<double>::infinity();
+        return measure;
     const double endpoint_tol = std::min(
         std::max(0.0, endpoint_skip), kConnectionPointTolerance);
     int n = std::max(32, std::min(160, (int)std::ceil(curve.arcLength() / 0.20) + 1));
@@ -1175,10 +1179,9 @@ static double minRoadEdgeDistanceAlongCurve(
         if (boundaries[bi].type == Boundary::Type::RoadEdge)
             road_edge_boxes[bi] = boundaries[bi].geometry.bbox();
     }
-    for (auto& pt : samples) {
-        if ((pt - curve.startPt()).norm() <= endpoint_tol ||
-            (pt - curve.endPt()).norm() <= endpoint_tol)
-            continue;
+    // 逐点求到 RoadEdge 的最小距离；bound 为已知上界，用于 bbox 剪枝。
+    auto nearestEdge = [&](const Vec2d& pt, double bound) -> double {
+        double best = bound;
         for (std::size_t boundary_index = 0;
              boundary_index < boundaries.size(); ++boundary_index) {
             const auto& bnd = boundaries[boundary_index];
@@ -1193,29 +1196,67 @@ static double minRoadEdgeDistanceAlongCurve(
                 ? boundary_box.min_pt.y() - pt.y()
                 : (pt.y() > boundary_box.max_pt.y()
                     ? pt.y() - boundary_box.max_pt.y() : 0.0);
-            if (std::isfinite(min_edge_dist) &&
-                dx * dx + dy * dy >= min_edge_dist * min_edge_dist)
+            if (std::isfinite(best) && dx * dx + dy * dy >= best * best)
                 continue;
             for (int bi = 0; bi + 1 < (int)bnd.geometry.points.size(); ++bi) {
-                min_edge_dist = std::min(
-                    min_edge_dist, pointToSegment(pt, bnd.geometry.points[bi],bnd.geometry.points[bi + 1]).first);
+                best = std::min(
+                    best, pointToSegment(pt, bnd.geometry.points[bi],
+                                         bnd.geometry.points[bi + 1]).first);
             }
         }
+        return best;
+    };
+    const double inf = std::numeric_limits<double>::infinity();
+    measure.start_distance = nearestEdge(curve.startPt(), inf);
+    measure.end_distance = nearestEdge(curve.endPt(), inf);
+    const Vec2d start_tan = curve.startTan().norm() > 1e-12
+        ? curve.startTan().normalized() : Vec2d(1, 0);
+    const Vec2d end_tan = curve.endTan().norm() > 1e-12
+        ? curve.endTan().normalized() : Vec2d(1, 0);
+    for (auto& pt : samples) {
+        const double to_start = (pt - curve.startPt()).norm();
+        const double to_end = (pt - curve.endPt()).norm();
+        if (to_start <= endpoint_tol || to_end <= endpoint_tol)
+            continue;
+        const double distance = nearestEdge(pt, inf);
+        if (!std::isfinite(distance))
+            continue;
+        measure.valid = true;
+        if (distance < measure.minimum) {
+            measure.minimum = distance;
+            measure.location = pt;
+        }
+        if (distance >= clearance)
+            continue;
+        const bool near_start = to_start <= to_end;
+        const double span = near_start ? to_start : to_end;
+        double ray_distance = -1.0;
+        if (roadEdgeClearanceNeedsFloor(span)) {
+            const Vec2d origin = near_start ? curve.startPt() : curve.endPt();
+            const Vec2d direction = near_start ? start_tan : -end_tan;
+            ray_distance = nearestEdge(origin + direction * span, inf);
+        }
+        const double floor_value = roadEdgeClearanceFloor(
+            clearance, span, ray_distance);
+        if (floor_value - distance > measure.deficit) {
+            measure.deficit = floor_value - distance;
+            measure.deficit_location = pt;
+        }
     }
-    return min_edge_dist;
+    return measure;
 }
 
-// 将曲线到 RoadEdge 的最小距离转换为当前 mode 下的净距违规量。
-// 无需净距约束或没有有效边界时返回零。
+// 将曲线到 RoadEdge 的净距转换为当前 mode 下可归责于曲线的净距违规量。
+// 无需净距约束或没有有效边界时返回零。端点邻域的亏欠若完全由连接点位置强制，
+// 则不计入违规——否则生成侧会为一笔还不掉的账把每个候选都判成物理风险。
 static double roadEdgeClearanceViolation(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries, int mode) {
     double clearance = roadEdgeAvoidanceClearanceForMode(mode);
     if (clearance <= 0.0)
         return 0.0;
-    double min_edge_dist = minRoadEdgeDistanceAlongCurve(curve, boundaries);
-    if (!std::isfinite(min_edge_dist))
-        return 0.0;
-    return std::max(0.0, clearance - min_edge_dist);
+    const RoadEdgeClearanceMeasure measure =
+        measureRoadEdgeClearanceAlongCurve(curve, boundaries, clearance);
+    return roadEdgeClearanceDeficit(measure, clearance);
 }
 
 // 计算候选曲线的边界避让代价，合并道路边缘净距和真实边界穿越惩罚。
@@ -1364,7 +1405,10 @@ static bool isNonUTurnTurnShapeAcceptable(
         return true;
     // 普通左/右转不能为避障或排序被压成近直线。中长距离转向要求
     // 保留更明显的弧长余量，短小转向则放宽以避免过约束。
-    double min_arc = chord_len < 12.0 ? 1.02 : 1.06;
+    // 下限按端点转角折算（见 ordinaryTurnArcChordFloor）：常数是按 90° 写的，
+    // 浅转时超过同转角圆弧的理论比例，会把合规单拱判成"被压平"。
+    double min_arc = ordinaryTurnArcChordFloor(
+        curveEndpointTurnAngle(curve), chord_len);
     // A short turn next to a Boundary chain can need a slightly longer smooth
     // arch to remain on the legal side of the edge. Long turns keep the
     // original 1.35 limit and all turns still pass curvature and sign checks.
@@ -1434,6 +1478,25 @@ static bool isStraightLikeShapeAcceptable(
 // 严格同簇闭包在单段域无解时允许的最小多段普通表达。它只用于长距离
 // 近直行连接的有限路点绕行；端点切向、内部 G1、弧长、曲率和单向形态仍
 // 必须满足，正常普通连接继续使用单段 cubic。
+//
+// 直行分支的曲率上限取 R>=4m（口径与 shape_constraint.cpp 的
+// kTwoSegmentStraightMaxCurvature 一致）：原值 3.0 允许 0.33m 半径，对
+// 需求 1.4① 等于没有约束，100000385-u 的直行 41 就是这样折出 R=1.37m 接点的。
+static constexpr double kTwoSegmentStraightMaxCurvature = 0.25;
+
+// 物理修复搜索里"折形"的打分权重（乘 curveChordBudgetOvershoot 的返回比例）。
+//
+// Boundary / Obstacle / Fence 修复的候选网格里含 alpha 0.55~1.30，这些候选的
+// 控制多边形沿弦倒序、曲线被折成 Z 形/L 形。修复搜索原先只按"物理是否安全 +
+// 交叉数 + 弧长 + 曲率"打分，完全看不见折形，于是只要折形候选物理安全就可能胜出
+// （100000385-u 的直行 55 折了 55.5% 弦长、左转 21 的两段各折 24.1%/16.2%）。
+//
+// 折形不能一律淘汰：左转 21 的折形两段候选是唯一能绕开 Boundary 的表达，淘汰它
+// 只是把形态问题换成更严重的物理违规。所以折形按幅度计惩罚——权重取 50，
+// 使它压过同一打分里的弧长（0.03/m，长曲线约 1.5）与曲率（约 0.1~1）项，
+// 但远低于交叉数项（1000/条）：能不折就不折，物理上必须折才折。
+static constexpr double kChordBudgetOvershootPenalty = 50.0;
+
 static bool isTwoSegmentOrdinaryWaypointShapeAcceptable(
     const BezierCurve& curve, const Vec2d& p0, const Vec2d& t0,
     const Vec2d& p1, const Vec2d& t1, double chord_len,
@@ -1456,6 +1519,12 @@ static bool isTwoSegmentOrdinaryWaypointShapeAcceptable(
         (first.ctrl[3] - first.ctrl[0]).norm() < 0.30 ||
         (second.ctrl[3] - second.ctrl[0]).norm() < 0.30)
         return false;
+    // 每段控制多边形必须沿自身弦单调，理由同单段的弦方向联合预算
+    // （见 cubicControlPolygonMonotone）：两段各自把手吃满自身弦时同样
+    // 会折出 Z 形控制多边形。
+    if (!cubicControlPolygonMonotone(first) ||
+        !cubicControlPolygonMonotone(second))
+        return false;
     const double ratio = curve.arcLength() / chord_len;
     double max_lateral = 0.0;
     const Vec2d chord_dir = (p1 - p0).normalized();
@@ -1464,8 +1533,9 @@ static bool isTwoSegmentOrdinaryWaypointShapeAcceptable(
             max_lateral, std::abs(cross2d(chord_dir, point - p0)));
     if (turn_strength <= 0.25)
         return ratio <= 1.12 && max_lateral / chord_len <= 0.12 &&
-               curve.maxCurvature(40) <= 3.0;
-    return ratio >= (chord_len < 12.0 ? 1.02 : 1.06) &&
+               curve.maxCurvature(40) <= kTwoSegmentStraightMaxCurvature;
+    return ratio >= ordinaryTurnArcChordFloor(
+                        curveEndpointTurnAngle(curve), chord_len) &&
            ratio <= 1.45 && max_lateral / chord_len <= 0.45 &&
            curve.maxCurvature(40) <= 2.5 &&
            curveTurningSpan(curve) <= 200.0 * M_PI / 180.0 &&
@@ -1491,7 +1561,8 @@ static bool isNonUTurnTurnShapeRisk(
     if (isNonUTurnTurnShapeAcceptable(curve, chord_len, turn_strength))
         return false;
     double arc_chord = curve.arcLength() / chord_len;
-    double min_arc = chord_len < 12.0 ? 1.03 : 1.08;
+    double min_arc = ordinaryTurnArcChordRestoreFloor(
+        curveEndpointTurnAngle(curve), chord_len);
     return arc_chord < min_arc || curve.maxCurvature(20) > 2.0 ||
            curveHasCurvatureSignFlip(curve);
 }
@@ -1564,6 +1635,24 @@ static CurveRisk assessCurveRisk(
 // 当当前曲线存在物理风险时，在有限把手长度集合中寻找安全的单段 G1 三次曲线。
 // 候选必须消除障碍物、边界和围栏风险，并在 U-turn 拓扑场景下保持同簇无交叉；
 // 成功时原地替换 curve，失败时保持输入不变并返回 false。
+//
+// 本函数是**捷径**而非修复搜索：它的语义是"一条朴素的单段三次曲线已经把物理问题
+// 解决了，那就直接采用、跳过后续昂贵搜索"。因此折形候选必须在此被排除——沿弦倒序
+// 的 Z/L 形控制多边形本身就不是"朴素的单段三次曲线"，而是审计会直接报
+// `ordinary single cubic control points leave endpoint direction axes` 的形态违约。
+// 100000385-u 的直行 55 正是这样产生的：grid 里 alpha=0.80 使两个把手各占弦长 0.8
+// （弦 53.958、把手 43.167、弦向用量 83.923，超支 29.964 即弦长的 55.5%），它以
+// "同簇交叉数最少"胜出（录取是 sibling_crosses 的字典序，打分惩罚只在同交叉数内
+// 比较，因此加权惩罚对它无效）。
+//
+// 排除折形并不等于"在物理路径上一律禁止折形"：本函数返回 false 只是放弃捷径，
+// 后续 tryObstacleBypassCandidate / 优化器 / tryBoundarySafeCandidate 依旧可以
+// 输出折形曲线——它们的表达力更强（两侧把手可不等长、可用两段），实测 55 由此
+// 得到单调且 Boundary 安全的非对称把手形态（h0 10.25 / h1 43.17，弦向富余
+// 2.035m，maxk 0.0971）。真正"折形是唯一物理安全形态"的场景仍然保留：左转 21 在
+// tryBoundarySafeCandidate 的 4649 个候选中只有一个 full_safe 候选，且它是折形的
+// （两段分别超支弦长的 24.1% / 16.2%），那条路径按 curveChordBudgetOvershoot 打分
+// 惩罚而不淘汰，因此不受本处影响。
 static bool tryPhysicalSafeSingleCubic(
     const Vec2d& p0, const Vec2d& t0, const Vec2d& p1, const Vec2d& t1,
     const IntersectionInput& input, const SDFField& sdf,
@@ -1586,6 +1675,10 @@ static bool tryPhysicalSafeSingleCubic(
                          0.46, 0.50, 0.55, 0.60, 0.70, 0.80}) {
         BezierCurve candidate;
         candidate.segs.push_back(makeCubicG1(p0, T0, p1, T1, alpha));
+        // 弦方向联合预算：先做这一步（O(1)，无采样），既排除折形捷径，
+        // 也省下近直行几何上必然折形的大 alpha 候选的风险评估开销。
+        if (!cubicControlPolygonMonotone(candidate.segs.front()))
+            continue;
         if (curveSelfIntersectsBusiness(candidate, 1.0))
             continue;
         CurveRisk risk = assessCurveRisk(candidate, input, sdf, sampled_siblings);
@@ -1769,7 +1862,8 @@ static bool tryNaturalSingleCubicIfSafe(
             continue;
         if (!isNonUTurnTurnShapeAcceptable(candidate, chord_len, turn_strength))
             continue;
-        double pure_min_arc = chord_len < 12.0 ? 1.03 : 1.08;
+        double pure_min_arc = ordinaryTurnArcChordRestoreFloor(
+            curveEndpointTurnAngle(candidate), chord_len);
         if (candidate.arcLength() / chord_len < pure_min_arc)
             continue;
         CurveRisk risk = assessCurveRisk(
@@ -1837,6 +1931,9 @@ static bool tryNaturalStraightSingleCubicIfSafe(
     int dbg_shape = 0;
     int dbg_phys = 0;
     int dbg_cross = 0;
+    int dbg_obstacle = 0;
+    int dbg_boundary = 0;
+    int dbg_fence = 0;
     auto consider_single = [&](const BezierCurve& candidate) {
         ++dbg_total;
         if (candidate.empty() ||
@@ -1848,6 +1945,9 @@ static bool tryNaturalStraightSingleCubicIfSafe(
             candidate, input, sdf, sampled_siblings, include_fence);
         if (candidate_risk.physical()) {
             ++dbg_phys;
+            dbg_obstacle += candidate_risk.obstacle ? 1 : 0;
+            dbg_boundary += candidate_risk.boundary ? 1 : 0;
+            dbg_fence += candidate_risk.fence ? 1 : 0;
             return;
         }
         if (candidate_risk.sibling_crosses > current_risk.sibling_crosses) {
@@ -1885,10 +1985,11 @@ static bool tryNaturalStraightSingleCubicIfSafe(
     if (!have_best) {
         if (debug_straight_repair) {
             fprintf(stderr,
-                    "[STRAIGHT-NATURAL] reject p0=(%.2f,%.2f) p1=(%.2f,%.2f) current_cross=%d total=%d shape=%d phys=%d cross=%d\n",
+                    "[STRAIGHT-NATURAL] reject p0=(%.2f,%.2f) p1=(%.2f,%.2f) current_cross=%d total=%d shape=%d phys=%d cross=%d phys_obs=%d phys_bnd=%d phys_fence=%d\n",
                     p0.x(), p0.y(), p1.x(), p1.y(),
                     current_risk.sibling_crosses,
-                    dbg_total, dbg_shape, dbg_phys, dbg_cross);
+                    dbg_total, dbg_shape, dbg_phys, dbg_cross,
+                    dbg_obstacle, dbg_boundary, dbg_fence);
         }
         return false;
     }
@@ -2051,6 +2152,8 @@ static bool tryBoundarySafeCandidate(
         double score = 1000.0 * risk.sibling_crosses
                      + 8.0 * std::abs(arc_chord - target_arc)
                      + shape_k + 0.03 * candidate.arcLength()
+                     + kChordBudgetOvershootPenalty *
+                           curveChordBudgetOvershoot(candidate)
                      + 0.05 * extra_bias;
         if (!have_best ||
             risk.sibling_crosses < best_cross ||
@@ -2870,8 +2973,20 @@ static std::unordered_set<ConnId> collectConflictingPreservedFixedIds(
 
 // 为普通非 U-turn 连接构造不依赖环境约束的自然单段候选。
 // 仅返回切向有效、无自交且弧长形态合理的候选，供固定形态阻塞预判使用。
+//
+// 候选还必须**物理可达**（不穿障、不穿 Boundary/RoadEdge、不出精围栏）。
+// 本函数唯一的用途是回答"保留这条固有形态，是否会挡住另一条连接的自然单段形态"，
+// 而牺牲固有形态的理由（架构设计文档 6.8.4：非 U 型固有形态原则上保留）只有
+// "被牺牲后另一条真的能拿到自然单段形态"。若该自然候选本身就因物理原因不可用，
+// 那条连接无论如何都会走避让路径、永远不会采用这个形态，此时撤销固有形态保护
+// 是纯粹的损失：100000385-u 的右转 929910（fixed_shape=1，18 点输入折线）就是因为
+// 同入的直行 59 的"自然直行候选"与它相交而被撤保护并重新生成，偏离输入形态 1.829m
+// 且被压成 maxk 0.385（R 2.6m）的两段畸形；而 59 的自然单段候选实测 11 个全部因
+// 物理风险被拒（tryNaturalStraightSingleCubicIfSafe 报 phys=11/11），59 最终仍是
+// 两段曲线，`59|929910` 的同簇相交也依然存在——牺牲没有换到任何东西。
 static bool naturalSingleSegmentCandidate(
-    const Connectivity& conn, const IntersectionInput& input, BezierCurve& out_curve) {
+    const Connectivity& conn, const IntersectionInput& input, const SDFField& sdf,
+    BezierCurve& out_curve) {
     if (hasFixedGeometry(conn))
         return false;
     auto entry = input.entryPtDir(conn.entry_lane_id);
@@ -2906,6 +3021,12 @@ static bool naturalSingleSegmentCandidate(
         } else if (arc_chord < 1.05 || arc_chord > 1.35) {
             continue;
         }
+        // 物理可达性：不穿障、不穿 Boundary/RoadEdge、不出精围栏。
+        // 放在形态过滤之后，避免对必然被形态淘汰的候选做 SDF 采样。
+        // 同簇交叉不在此判定（siblings 传空）：本函数问的正是"若不被这条固有形态
+        // 挡住，它能否取到自然形态"，把同簇交叉算进来会自我循环。
+        if (assessCurveRisk(candidate, input, sdf, {}).physical())
+            continue;
         double score = candidate.maxCurvature(20) + 0.02 * candidate.arcLength();
         if (score < best_score) {
             best = candidate;
@@ -2920,15 +3041,20 @@ static bool naturalSingleSegmentCandidate(
 
 // 检查固定形态是否会阻塞其它连接的自然单段形态，并收集需要取消保护的固定 ID。
 // 只处理非结构性交叉，且不会直接修改结果数组。
+//
+// 自然候选必须物理可达（见 naturalSingleSegmentCandidate）：撤销固有形态保护的
+// 唯一收益是让被挡的连接取到自然单段形态，若那条连接因物理原因根本取不到，
+// 撤保护就只剩形态损失。
 static std::unordered_set<ConnId> collectFixedIdsBlockingNaturalShapes(
-    const IntersectionInput& input, const std::vector<ConnectivityCurve>& fixed_results,
+    const IntersectionInput& input, const SDFField& sdf,
+    const std::vector<ConnectivityCurve>& fixed_results,
     const ClusterOrderSolver& cs, const std::unordered_set<ConnId>& preserved_fixed_ids,
     double endpoint_tol = kClusterEndpointTol) {
     std::unordered_set<ConnId> drop_ids;
     auto idx = resultIndexById(fixed_results);
     for (const auto& conn : input.connectivities) {
         BezierCurve natural;
-        if (!naturalSingleSegmentCandidate(conn, input, natural))
+        if (!naturalSingleSegmentCandidate(conn, input, sdf, natural))
             continue;
         for (const auto& p : cs.pairs()) {
             if (p.exempt == CrossExemption::StructuralCross)
@@ -3121,7 +3247,8 @@ static bool tryPureGeometryShapeRestore(
         if (!isNonUTurnTurnShapeAcceptable(candidate, chord_len, turn_strength))
             continue;
         double arc_chord = candidate.arcLength() / chord_len;
-        double pure_min_arc = chord_len < 12.0 ? 1.03 : 1.08;
+        double pure_min_arc = ordinaryTurnArcChordRestoreFloor(
+            curveEndpointTurnAngle(candidate), chord_len);
         if (arc_chord < pure_min_arc)
             continue;
         int cross_count = constrainedCrossCountForId(
@@ -4453,7 +4580,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
     auto conflicting_fixed_ids = collectConflictingPreservedFixedIds(
         results, cluster_solver_, preserved_fixed_ids, kClusterEndpointTol);
     auto shape_blocking_fixed_ids = collectFixedIdsBlockingNaturalShapes(
-        input, results, cluster_solver_, preserved_fixed_ids, kClusterEndpointTol);
+        input, sdf, results, cluster_solver_, preserved_fixed_ids, kClusterEndpointTol);
     conflicting_fixed_ids.insert(
         shape_blocking_fixed_ids.begin(), shape_blocking_fixed_ids.end());
     if (!conflicting_fixed_ids.empty()) {
@@ -4992,6 +5119,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     double score = 1000.0 * cross_count +
                         500.0 * cand_uturn_cross + offset +
                         50.0 * candidate.maxCurvature(40) +
+                        kChordBudgetOvershootPenalty *
+                            curveChordBudgetOvershoot(candidate) +
                         0.02 * candidate.arcLength();
                     if (!have_best || cross_count < best_cross ||
                         (cross_count == best_cross &&
@@ -5136,7 +5265,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 double score = 1000.0 * std::max(cross_count, shared_cross) +
                     0.25 * offset +
                     2.0 * std::abs(candidate.arcLength() / chord_len - 1.10) +
-                    candidate.maxCurvature(40) + 0.02 * candidate.arcLength();
+                    candidate.maxCurvature(40) +
+                    kChordBudgetOvershootPenalty *
+                        curveChordBudgetOvershoot(candidate) +
+                    0.02 * candidate.arcLength();
                 // 段数在交叉数、固定形态交叉数之后、综合分之前参与比较。新行为下
                 // 候选全是单段，这个键恒相等；它只在 ISG_LEGACY_SEGTIE=1 的旧行为
                 // 里生效——保留它是为了让 A/B 的两侧都可复现，而不是为了兜底：
@@ -5382,7 +5514,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 bool straight_like = turn_strength < 0.25;
                 const BezierCurve& current = *results[ri->second].curve;
                 double arc_chord_current = current.arcLength() / chord_len;
-                double pure_turn_min_arc = chord_len < 12.0 ? 1.03 : 1.08;
+                double pure_turn_min_arc = ordinaryTurnArcChordRestoreFloor(
+                    curveEndpointTurnAngle(current), chord_len);
                 bool shape_bad = straight_like
                     ? !isStraightLikeShapeAcceptable(current, chord_len)
                     : (isNonUTurnTurnShapeRisk(current, chord_len, turn_strength) ||
@@ -5543,7 +5676,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         : isNonUTurnTurnShapeAcceptable(
                               candidate, chord_len, turn_strength);
                     if (!straight_like && shape_ok) {
-                        double pure_min_arc = chord_len < 12.0 ? 1.03 : 1.08;
+                        double pure_min_arc = ordinaryTurnArcChordRestoreFloor(
+                            curveEndpointTurnAngle(candidate), chord_len);
                         double arc_chord = candidate.arcLength() / chord_len;
                         shape_ok = arc_chord >= pure_min_arc &&
                                    (chord_len >= 12.0 || arc_chord <= 1.08);
@@ -8768,6 +8902,36 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
         // 组合空间。
         const std::vector<double> long_pair_handle_fractions = {
             0.36, 0.40, 0.418, 0.41812, 0.42, 0.44, 0.46};
+        // 族级保序参照形态：普通转向的首选单段表达（转向按端点方向交点距离
+        // 的 2/3 升阶，见 OrdinaryCurveInitializer::buildPreferredSingleCubic）
+        // 只由本成员自身的端点位置与切向决定，与生成次序、兄弟形态和优化器
+        // 无关。因此同一共享端点扇出族的全体成员在该表达下天然按转弯半径
+        // 单调嵌套：110004764 的入口族 8/10/11/12/13/14 在首选表达下 15 对
+        // 全部互不相交（曲线与控制折线都不交），而逐条 L-BFGS 沿把手轴各自
+        // 挪动后出现 8|10、11|12、11|14、13|14 四对非端点相交。
+        //
+        // 下面的把手网格是围绕"当前形态"展开的等分档位，一般表达不出这个
+        // 参照形态（11 的首选把手占弦长 0.655/0.622，网格相邻档位只有 0.48
+        // 与 0.68），族内联合回溯因此无论怎样换档都回不到它。把它显式放进
+        // 候选池并排在首位：回溯的第一个组合就是"全族同时回到首选表达"，
+        // 命中即一次性恢复整族次序；未命中则继续按原档位回溯，行为不变。
+        const auto strict_natural_reference_candidate =
+            [&](const Vec2d& entry_point, const Vec2d& t0,
+                const Vec2d& exit_point, const Vec2d& t1,
+                double chord_len, double turn_strength,
+                BezierCurve& out) {
+                out = OrdinaryCurveInitializer().buildPreferredSingleCubic(
+                    entry_point, t0, exit_point, t1);
+                if (out.numSegments() != 1)
+                    return false;
+                if (!ordinarySingleCubicControlsValid(
+                        out, entry_point, t0, exit_point, t1, 1e-5, false) ||
+                    curveSelfIntersectsBusiness(out, 1.0))
+                    return false;
+                return turn_strength <= 0.25
+                    ? isStraightLikeShapeAcceptable(out, chord_len)
+                    : isNonUTurnTurnShapeAcceptable(out, chord_len, turn_strength);
+            };
         constexpr std::size_t kMaxStrictPoolCandidates = 24;
         // 二元共享端点族需要先从完整物理安全候选中寻找兼容对；否则
         // 5|9 这类可行对可能在两边独立按当前几何排序时同时被截掉。
@@ -8920,6 +9084,19 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 std::size_t control_rejects = 0;
                 std::size_t shape_rejects = 0;
                 std::size_t physical_rejects = 0;
+                {
+                    // 参照形态排在闭包池首位，理由见
+                    // strict_natural_reference_candidate 的说明。
+                    BezierCurve natural;
+                    if (strict_natural_reference_candidate(
+                            entry.first, t0, exit_.first, t1, chord.norm(),
+                            turn_strength, natural)) {
+                        StrictOrdinaryCandidate item;
+                        item.curve = std::move(natural);
+                        item.score = -1.0;
+                        pending.push_back(std::move(item));
+                    }
+                }
                 for (double f0 : fractions) {
                     for (double f1 : fractions) {
                         const double h0 = std::max(
@@ -9035,15 +9212,34 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 return false;
             };
         std::unordered_set<ConnId> strict_changed_last_pass;
+        // 闭包扩张必须"先窄后宽"。把发现预算一次性开到最大不是单调更强：
+        // 更多变量会引入更多硬约束行，AC3 可能直接清空某个成员的候选域，
+        // 于是本来 5 成员有解的闭包退化成 10 成员无解，连原先修好的对也
+        // 一起丢失（110003285 的 entry:43103892 就从 committed members=5
+        // 退化为 closure_nodes=0，重新冒出 9|10 与 24|14 同簇相交）。
+        // 因此首轮一律用最小闭包；只有确实失败的族才在后续轮次升级一次
+        // 预算重试，成功过的窄解不会被更宽的搜索推翻。
+        std::unordered_set<std::string> strict_failed_last_pass;
+        std::unordered_set<std::string> strict_escalated_families;
         bool family_pass_changed = false;
         for (int family_pass = 0; family_pass < 3; ++family_pass) {
             family_pass_changed = false;
             std::unordered_set<ConnId> strict_changed_this_pass;
+            std::unordered_set<std::string> strict_failed_this_pass;
             for (const auto& family_item : endpoint_families) {
             std::vector<ConnId> family = family_item.second;
-            if (family_pass > 0 && !strict_family_affected_by(
+            if (family_pass > 0 &&
+                !strict_failed_last_pass.count(family_item.first) &&
+                !strict_family_affected_by(
                     family, strict_changed_last_pass))
                 continue;
+            // 本族是否处于"升级重试"轮：仅对上一轮失败且尚未升级过的族生效。
+            const bool closure_escalate =
+                family_pass > 0 &&
+                strict_failed_last_pass.count(family_item.first) != 0 &&
+                strict_escalated_families.count(family_item.first) == 0;
+            if (closure_escalate)
+                strict_escalated_families.insert(family_item.first);
             StrictFamilyProfileScope family_profile{
                 family_item.first.c_str()};
             if (isgDebugPairRepair() && family.size() >= 2) {
@@ -9220,6 +9416,19 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     member_fractions.begin(), member_fractions.end()),
                     member_fractions.end());
                 std::vector<StrictOrdinaryCandidate> pending;
+                {
+                    // 参照形态排在族候选池首位：DFS 首个探测叶子即"整族回到
+                    // 自然表达"，见 strict_natural_reference_candidate 说明。
+                    BezierCurve natural;
+                    if (strict_natural_reference_candidate(
+                            entry.first, t0, exit_.first, t1, chord.norm(),
+                            turn_strength, natural)) {
+                        StrictOrdinaryCandidate item;
+                        item.curve = std::move(natural);
+                        item.score = -1.0;
+                        pending.push_back(std::move(item));
+                    }
+                }
                 for (double f0 : member_fractions) {
                     for (double f1 : member_fractions) {
                         const double h0 = std::max(
@@ -9806,7 +10015,15 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 // 某个外部阻塞者明显偏离当前形态。只在实际触发闭包时扩大到
                 // 小闭包最多使用 64 个代表候选；更大的闭包收敛到 32 个，且仍
                 // 受完整物理、形态和同簇矩阵约束。
-                constexpr std::size_t kMaxStrictClosureMembers = 6;
+                // 共享入口扇出族的成员数本身就可能达到 6（110004764 的
+                // 43106530 有 8,10,11,12,13,14）。此时闭包上限若仍是 6，
+                // 扩张循环的 closure_ids.size() < kMaxStrictClosureMembers
+                // 直接为假，跨端点阻塞者（41、47）永远进不了变量集，而族内
+                // 搜索的叶子判定要求对外部关系也彻底干净，于是整族必然失败。
+                // 上限放宽到 10 只在升级重试轮生效，即只影响首轮已经失败的
+                // 族，且闭包矩阵仍有 32 候选/成员的截断和 50000 的节点预算兜底。
+                const std::size_t kMaxStrictClosureMembers =
+                    closure_escalate ? 10u : 6u;
                 const std::size_t closure_pool_limit =
                     closure_ids.size() <= 2 ? kMaxStrictClosurePoolCandidates : 32;
                 auto is_movable_closure_member = [&](const ConnId& id) {
@@ -10083,14 +10300,22 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 // 候选实际相交”的边扩展一轮，并限制变量总数；固定形态、
                 // U-turn 和不可变连接留在后续矩阵中作为硬约束。这样既能
                 // 覆盖 5/9 的分裂阻塞，又不会把全路口关系图展开成全局穷举。
+                // 大族往往被多个跨端点阻塞者同时挡住（43106530 的候选分别
+                // 被 41 和 47 挡住），每轮只纳入一个新变量无法解锁。轮数与
+                // 每轮发现数只在升级重试轮放宽，仍受 kMaxStrictClosureMembers
+                // 与节点预算约束。
+                const std::size_t closure_discovery_per_round =
+                    (closure_escalate && family.size() >= 4) ? 2u : 1u;
+                const int closure_max_rounds =
+                    (closure_escalate && family.size() >= 4) ? 3 : 1;
                 for (int closure_round = 0;
-                     closure_pool_ok && closure_round < 1 &&
+                     closure_pool_ok && closure_round < closure_max_rounds &&
                      closure_ids.size() < kMaxStrictClosureMembers;
                      ++closure_round) {
                     std::vector<ConnId> discovered;
                     std::unordered_set<ConnId> discovered_set;
                     for (const ConnId& variable_id : closure_ids) {
-                        if (discovered.size() >= 1)
+                        if (discovered.size() >= closure_discovery_per_round)
                             break;
                         const auto pool_it = closure_pools.find(variable_id);
                         if (pool_it == closure_pools.end())
@@ -10100,10 +10325,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         if (neighbor_it == strict_pair_neighbors.end())
                             continue;
                         for (const auto& candidate : pool_it->second) {
-                            if (discovered.size() >= 1)
+                            if (discovered.size() >= closure_discovery_per_round)
                                 break;
                             for (const CurvePair* pair_ptr : neighbor_it->second) {
-                                if (discovered.size() >= 1)
+                                if (discovered.size() >= closure_discovery_per_round)
                                     break;
                                 const CurvePair& pair = *pair_ptr;
                                 ConnId other_id;
@@ -10636,6 +10861,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             "[STRICT-FAMILY] %s search failed nodes=%zu closure=%zu closure_nodes=%zu\n",
                             family_item.first.c_str(), search_nodes,
                             closure_ids.size(), closure_nodes);
+                if (!closure_escalate)
+                    strict_failed_this_pass.insert(family_item.first);
                 continue;
             }
 
@@ -10659,9 +10886,12 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
             for (const ConnId& id : family)
                 strict_changed_this_pass.insert(id);
             }
-            if (!family_pass_changed)
+            // 即使本轮没有任何族改写，只要还有"待升级重试"的失败族，就必须
+            // 再走一轮：升级预算的唯一入口就是下一轮的 closure_escalate。
+            if (!family_pass_changed && strict_failed_this_pass.empty())
                 break;
             strict_changed_last_pass.swap(strict_changed_this_pass);
+            strict_failed_last_pass.swap(strict_failed_this_pass);
         }
     }
     if (isgProfile()) {

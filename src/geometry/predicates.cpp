@@ -4,6 +4,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace isg {
 namespace {
@@ -138,6 +139,63 @@ double minimumCurveBoundaryDistanceForAudit(const BezierCurve& curve,
         }
     }
     return minimum;
+}
+
+RoadEdgeClearanceMeasure measureCurveRoadEdgeClearanceForAudit(
+    const BezierCurve& curve, const std::vector<Boundary>& boundaries,
+    Boundary::Type type, double clearance, int samples,
+    double endpoint_exclusion) {
+    RoadEdgeClearanceMeasure measure;
+    const std::vector<Vec2d> points = sampleCurveForAudit(curve, samples);
+    if (points.size() < 3) return measure;
+    auto nearestEdge = [&](const Vec2d& p) -> double {
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& boundary : boundaries) {
+            if (boundary.type != type) continue;
+            best = std::min(best, pointToPolyline(p, boundary.geometry.points));
+        }
+        return best;
+    };
+    measure.start_distance = nearestEdge(points.front());
+    measure.end_distance = nearestEdge(points.back());
+    const Vec2d start_tan = curve.startTan().norm() > 1e-12
+        ? curve.startTan().normalized() : Vec2d(1, 0);
+    const Vec2d end_tan = curve.endTan().norm() > 1e-12
+        ? curve.endTan().normalized() : Vec2d(1, 0);
+    const double endpoint_tol = std::min(
+        std::max(0.0, endpoint_exclusion), 1e-4);
+    for (size_t i = 1; i + 1 < points.size(); ++i) {
+        const double to_start = (points[i] - points.front()).norm();
+        const double to_end = (points[i] - points.back()).norm();
+        if (to_start <= endpoint_tol || to_end <= endpoint_tol)
+            continue;
+        const double distance = nearestEdge(points[i]);
+        if (!std::isfinite(distance))
+            continue;
+        measure.valid = true;
+        if (distance < measure.minimum) {
+            measure.minimum = distance;
+            measure.location = points[i];
+        }
+        if (distance >= clearance)
+            continue;
+        // 取较近的端点作为参照：它决定这一点上净距的可达下限。
+        const bool near_start = to_start <= to_end;
+        const double span = near_start ? to_start : to_end;
+        double ray_distance = -1.0;
+        if (roadEdgeClearanceNeedsFloor(span)) {
+            const Vec2d origin = near_start ? points.front() : points.back();
+            const Vec2d direction = near_start ? start_tan : -end_tan;
+            ray_distance = nearestEdge(origin + direction * span);
+        }
+        const double floor_value = roadEdgeClearanceFloor(
+            clearance, span, ray_distance);
+        if (floor_value - distance > measure.deficit) {
+            measure.deficit = floor_value - distance;
+            measure.deficit_location = points[i];
+        }
+    }
+    return measure;
 }
 
 }  // 命名空间 isg

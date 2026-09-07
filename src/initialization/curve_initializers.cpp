@@ -35,6 +35,26 @@ double leadForChordWithLateralOffset(const Vec2d& dir, const Vec2d& offset,
     return std::max(0.0, -b + std::sqrt(disc));
 }
 
+// 首/尾直行段横向偏移相对该侧直段长度的上限。
+//
+// 三段式掉头的首直段是 p0 -> q0，其弦向为 (lead*T0 + lat) 的方向，相对车道切向
+// T0 偏转 atan(|lat|/lead)。shape.uturn.leads 要求 dot(弦向, 车道切向) >= 0.98，
+// 即 |lat|/lead <= tan(acos(0.98)) = 0.2031。取 0.18 留出约 10% 余量，覆盖
+// 轴向(axis)与切向(T0)不严格平行带来的耦合项以及采样/浮点误差。
+//
+// 关键点是这个上限必须作用在**该侧横向偏移的总量**上，而不是分别作用在每一个
+// 来源上。历史实现给三个来源各自设了 0.14*lead 的上限：
+//   1) 家族横向阶梯的相向内缩(entry_inset/exit_inset)，
+//   2) 调用方下发的有符号横向偏置(entry_lateral_bias/exit_lateral_bias)，
+//   3) enforceStationCorridorFloor 的出口侧相背拓宽，
+// 三者同向叠加后总量可达 0.28~0.42*lead，直段弦向偏转 16°~23°，必然击穿
+// dot >= 0.98 的门禁。100000385-u 的掉头 5/7/29/31 正是如此：家族阶梯只有
+// 0.10~0.22m，但家族级联合搜索(connectivity_generation_session 的
+// family_bias_values)会下发 ±2.0m 的绝对偏置，叠加后入口侧总偏移
+// 1.796~1.898m，除以 8.5~8.9m 的直段长度恰好是 0.203~0.215——刚刚越过门禁，
+// 于是四条掉头同时报 shape.uturn.leads，端点切向审计也随之失败。
+constexpr double kMaxLeadLateralFraction = 0.18;
+
 // 平齐站位处中弧走廊的下限。中弧的弦就是 q1-q0，它必须宽到能撑起
 // segmentedUTurnMiddleArcLooksRound 的绝对鼓包下限 0.25m：对称拱的鼓包约为
 // 0.75 * arc_alpha * gap，候选搜索的最大把手 arc_alpha = 2.0，因此几何可行的
@@ -365,6 +385,10 @@ BezierCurve UTurnCurveInitializer::buildSegmented(
     bool exit_stagger_orders_family = false;
     double realized_entry_inset = 0.0;
     double realized_exit_inset = 0.0;
+    // 家族阶梯落到 lateral 上的有符号系数。它承载家族半径次序，是横向总预算里
+    // 优先保留的部分：总量超预算时先削横向偏置，绝不反过来削阶梯。
+    double ladder_coeff0 = 0.0;
+    double ladder_coeff1 = 0.0;
     if (std::abs(entry_stagger) > 1e-9 || std::abs(exit_stagger) > 1e-9) {
         Vec2d chord = q1 - q0;
         double gap = chord.norm();
@@ -421,8 +445,10 @@ BezierCurve UTurnCurveInitializer::buildSegmented(
                 }
                 double side = corridor >= 0.0 ? 1.0 : -1.0;
                 // 相向内缩：打散同家族多条调头的首尾直行段重叠。
-                q0_offset += side * entry_inset * lateral;
-                q1_offset -= side * exit_inset * lateral;
+                ladder_coeff0 = side * entry_inset;
+                ladder_coeff1 = -side * exit_inset;
+                q0_offset += ladder_coeff0 * lateral;
+                q1_offset += ladder_coeff1 * lateral;
                 const double dominant =
                     std::abs(entry_inset) >= std::abs(exit_inset)
                         ? entry_inset : exit_inset;
@@ -494,8 +520,30 @@ BezierCurve UTurnCurveInitializer::buildSegmented(
                 std::min(std::abs(exit_bias_eff), exit_slot), exit_bias_eff);
         }
     }
-    q0_offset += entry_bias_eff * lateral;
-    q1_offset += exit_bias_eff * lateral;
+    // 横向总预算：把"家族阶梯 + 横向偏置"的合计偏移钳在 kMaxLeadLateralFraction
+    // * 该侧直段长度以内，使首/尾直段弦向相对车道切向的偏差始终满足
+    // shape.uturn.leads 的 dot >= 0.98。必须钳总量而不是分别钳每个来源：两者
+    // 同向叠加时各自合规、合计违约，这正是 100000385-u 掉头 5/7/29/31 的成因。
+    //
+    // 削减顺序固定为"先削偏置、绝不削阶梯"：阶梯承载家族半径次序（小径在里侧），
+    // 它本身已被 min(0.25*走廊, 0.14*lead) 限制在预算内，按比例缩放整体偏移会
+    // 连带压小阶梯，让家族相邻名次的横向间距塌陷而重新相交。偏置只承担与同簇
+    // 直行/转向兄弟的分侧职责，缩短它只是让分侧余量变小，不会破坏家族次序。
+    auto clampLateralBudget = [](double ladder_coeff, double total,
+                                 double lead_len) {
+        const double budget = kMaxLeadLateralFraction * std::max(0.0, lead_len);
+        if (total > budget)
+            return std::max(ladder_coeff, budget);
+        if (total < -budget)
+            return std::min(ladder_coeff, -budget);
+        return total;
+    };
+    const double total_coeff0 = clampLateralBudget(
+        ladder_coeff0, ladder_coeff0 + entry_bias_eff, (q0 - p0).norm());
+    const double total_coeff1 = clampLateralBudget(
+        ladder_coeff1, ladder_coeff1 + exit_bias_eff, (p1 - q1).norm());
+    q0_offset = total_coeff0 * lateral;
+    q1_offset = total_coeff1 * lateral;
     // 按当前偏移量反解补偿后的 lead，并把两侧重新对齐到共同轴向站位。
     // 横向偏移垂直于轴，不改变站位本身，但补偿后的 lead 会加长，因此每次
     // 改动偏移量都必须重跑一遍——下面的走廊下限修复正是靠这一点迭代收敛。

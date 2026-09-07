@@ -121,7 +121,10 @@ double localCurvature(const Vec2d& a, const Vec2d& b, const Vec2d& c) {
     double ab = (b - a).norm(), bc = (c - b).norm(), ac = (c - a).norm();
     double area = 0.5 * std::abs(cross2d(b - a, c - a));
     double den = ab * bc * ac;
-    return den > 1e-12 ? (2 * area / den) : 0.0;
+    // 外接圆半径 R = |ab|·|bc|·|ac| / (4·S)，故曲率 κ = 1/R = 4·S / den。
+    // 早期实现写作 2·S/den，只有真实曲率的一半，使
+    // `elasticBandSmooth` 的 kappa_max 门槛在实际尺度上被放大一倍。
+    return den > 1e-12 ? (4 * area / den) : 0.0;
 }
 
 Vec2d circumcenter(const Vec2d& a, const Vec2d& b, const Vec2d& c) {
@@ -475,6 +478,51 @@ bool curveSelfIntersectsBusiness(const BezierCurve& c, double ep) {
 
 namespace {
 
+constexpr double kMinOrdinaryHandle = 0.05;
+
+// 弦方向联合预算的判定松量：与 makeCubicG1 的裁剪共用同一比例常量，
+// 保证「构造时裁剪到的形态」必然通过「闸门与审计的判定」。
+// 松量的取值依据见 bezier.h 的 kChordProjectionBudgetSlack。
+//
+// 注意这是闸门的松量；修复路径 applyChordProjectionBudget 仍按等号裁剪，
+// 即修复结果严格单调，比闸门更严。
+constexpr double kChordBudgetSlackFraction = kChordProjectionBudgetSlack;
+
+/// 弦方向联合预算的系数：`a = T0·u`、`b = T1·u`（u 为弦方向）。
+/// 返回 false 表示不适用（弦退化，或某侧方向轴不朝弦前方）。
+bool chordProjectionCoeffs(const Vec2d& p0, const Vec2d& start_dir,
+                           const Vec2d& p1, const Vec2d& end_dir,
+                           double* a, double* b, double* chord_len) {
+    const Vec2d chord = p1 - p0;
+    const double len = chord.norm();
+    if (len < 1e-6) return false;
+    const Vec2d u = chord / len;
+    const double pa = start_dir.dot(u);
+    const double pb = end_dir.dot(u);
+    if (pa <= 1e-6 || pb <= 1e-6) return false;
+    *a = pa;
+    *b = pb;
+    *chord_len = len;
+    return true;
+}
+
+/// 超支时在最小把手之上等比缩放，保持两侧把手比例（拱顶位置）不变，且两侧
+/// 仍不小于最小把手。缩放后恒有 `λ·a + μ·b == chord_len`。
+void applyChordProjectionBudget(double a, double b, double chord_len,
+                                double* lambda, double* mu) {
+    const double used = *lambda * a + *mu * b;
+    if (used <= chord_len) return;
+    const double floor_used = kMinOrdinaryHandle * (a + b);
+    if (floor_used >= chord_len) {
+        *lambda = kMinOrdinaryHandle;
+        *mu = kMinOrdinaryHandle;
+        return;
+    }
+    const double scale = (chord_len - floor_used) / (used - floor_used);
+    *lambda = kMinOrdinaryHandle + (*lambda - kMinOrdinaryHandle) * scale;
+    *mu = kMinOrdinaryHandle + (*mu - kMinOrdinaryHandle) * scale;
+}
+
 OrdinarySingleCubicHandleBounds makeOrdinarySingleCubicHandleBounds(
     const Vec2d& p0, const Vec2d& start_tan,
     const Vec2d& p1, const Vec2d& end_tan,
@@ -490,6 +538,9 @@ OrdinarySingleCubicHandleBounds makeOrdinarySingleCubicHandleBounds(
         : (chord_len > 1e-8 ? chord.normalized() : bounds.start_dir);
     bounds.start_max = std::max(0.05, chord_len);
     bounds.end_max = std::max(0.05, chord_len);
+    bounds.has_chord_budget = chordProjectionCoeffs(
+        p0, bounds.start_dir, p1, bounds.end_dir, &bounds.start_chord_proj,
+        &bounds.end_chord_proj, &bounds.chord_len);
     if (!cap_at_direction_intersection || chord_len < 1e-8)
         return bounds;
 
@@ -532,6 +583,44 @@ OrdinarySingleCubicHandleBounds ordinarySingleCubicHandleBounds(
         p0, start_tan, p1, end_tan, cap_at_direction_intersection);
 }
 
+bool cubicControlPolygonMonotone(const BezierSegment& segment, double tol) {
+    const Vec2d start_handle = segment.ctrl[1] - segment.ctrl[0];
+    const Vec2d end_handle = segment.ctrl[3] - segment.ctrl[2];
+    if (start_handle.norm() < 1e-9 || end_handle.norm() < 1e-9)
+        return true;
+    double a = 0.0;
+    double b = 0.0;
+    double chord_len = 0.0;
+    if (!chordProjectionCoeffs(segment.ctrl[0], start_handle.normalized(),
+                               segment.ctrl[3], end_handle.normalized(),
+                               &a, &b, &chord_len))
+        return true;
+    return start_handle.norm() * a + end_handle.norm() * b <=
+           chord_len * (1.0 + kChordBudgetSlackFraction) + tol;
+}
+
+double curveChordBudgetOvershoot(const BezierCurve& curve) {
+    double worst = 0.0;
+    for (const BezierSegment& segment : curve.segs) {
+        const Vec2d start_handle = segment.ctrl[1] - segment.ctrl[0];
+        const Vec2d end_handle = segment.ctrl[3] - segment.ctrl[2];
+        if (start_handle.norm() < 1e-9 || end_handle.norm() < 1e-9)
+            continue;
+        double a = 0.0;
+        double b = 0.0;
+        double chord_len = 0.0;
+        if (!chordProjectionCoeffs(segment.ctrl[0], start_handle.normalized(),
+                                   segment.ctrl[3], end_handle.normalized(),
+                                   &a, &b, &chord_len))
+            continue;
+        const double used = start_handle.norm() * a + end_handle.norm() * b;
+        const double allowed = chord_len * (1.0 + kChordBudgetSlackFraction);
+        if (used > allowed)
+            worst = std::max(worst, (used - allowed) / chord_len);
+    }
+    return worst;
+}
+
 void constrainOrdinarySingleCubicControls(
     BezierCurve& curve, const Vec2d& p0, const Vec2d& start_tan,
     const Vec2d& p1, const Vec2d& end_tan,
@@ -545,12 +634,16 @@ void constrainOrdinarySingleCubicControls(
     seg.ctrl[0] = p0;
     seg.ctrl[3] = p1;
 
-    const double lambda = std::max(
+    double lambda = std::max(
         0.05, std::min(bounds.start_max,
                        startHandleStation(seg.ctrl[1], p0, bounds.start_dir)));
-    const double mu = std::max(
+    double mu = std::max(
         0.05, std::min(bounds.end_max,
                        (p1 - seg.ctrl[2]).dot(bounds.end_dir)));
+    if (bounds.has_chord_budget)
+        applyChordProjectionBudget(bounds.start_chord_proj,
+                                   bounds.end_chord_proj, bounds.chord_len,
+                                   &lambda, &mu);
     seg.ctrl[1] = p0 + lambda * bounds.start_dir;
     seg.ctrl[2] = p1 - mu * bounds.end_dir;
 }
@@ -574,6 +667,12 @@ bool ordinarySingleCubicControlsValid(
         std::abs(cross2d(bounds.start_dir, seg.ctrl[1] - p0));
     const double end_lateral =
         std::abs(cross2d(bounds.end_dir, p1 - seg.ctrl[2]));
+    // 弦方向联合预算：控制多边形必须沿弦单调（允许 kChordBudgetSlackFraction
+    // 的比例松量），否则曲线被折成 Z / L 形。
+    if (bounds.has_chord_budget &&
+        lambda * bounds.start_chord_proj + mu * bounds.end_chord_proj >
+            bounds.chord_len * (1.0 + kChordBudgetSlackFraction) + tol)
+        return false;
     return start_lateral <= tol && end_lateral <= tol &&
            lambda >= 0.05 - tol && lambda <= bounds.start_max + tol &&
            mu >= 0.05 - tol && mu <= bounds.end_max + tol;
@@ -755,6 +854,51 @@ double curveTurningSpan(const BezierCurve& curve, int samples_per_seg) {
         hi = std::max(hi, running);
     }
     return hi - lo;
+}
+
+namespace {
+
+// arc/chord 下限的公共口径：documented 是需求按 90° 折算出来的业务常数，
+// 它只作上界；真正的阈值是"同转角圆弧比例的固定百分比"，两者取小。
+double arcChordFloorWithCap(double turn_angle_rad, double chord_len,
+                            double documented) {
+    constexpr double kAbsoluteFloor = 1.005;
+    const double theta = std::abs(turn_angle_rad);
+    if (!std::isfinite(theta) || theta < 1e-6)
+        return kAbsoluteFloor;
+    // 同转角圆弧的 arc/chord = θ / (2 sin(θ/2))。θ >= π 时（几何掉头）该式
+    // 退化，掉头由 evaluateUTurnShape 单独裁定，这里按 π 截断即可。
+    const double clamped = std::min(theta, M_PI - 1e-9);
+    const double ideal = clamped / (2.0 * std::sin(0.5 * clamped));
+    // 长弦取圆弧的 97%、短弦取 93%：θ=90° 时分别还原 1.08 / 1.03 这两个
+    // 需求写明的"长距离/短距离"数字。
+    const double fraction = chord_len < 12.0 ? 0.93 : 0.97;
+    return std::max(kAbsoluteFloor, std::min(documented, fraction * ideal));
+}
+
+}  // namespace
+
+double ordinaryTurnArcChordFloor(double turn_angle_rad, double chord_len) {
+    return arcChordFloorWithCap(turn_angle_rad, chord_len,
+                                chord_len < 12.0 ? 1.02 : 1.06);
+}
+
+double ordinaryTurnArcChordRestoreFloor(double turn_angle_rad,
+                                        double chord_len) {
+    return arcChordFloorWithCap(turn_angle_rad, chord_len,
+                                chord_len < 12.0 ? 1.03 : 1.08);
+}
+
+double curveEndpointTurnAngle(const BezierCurve& curve) {
+    if (curve.empty())
+        return 0.0;
+    const Vec2d t0 = curve.startTan();
+    const Vec2d t1 = curve.endTan();
+    if (t0.norm() < 1e-9 || t1.norm() < 1e-9)
+        return 0.0;
+    const Vec2d a = t0.normalized();
+    const Vec2d b = t1.normalized();
+    return std::atan2(std::abs(cross2d(a, b)), a.dot(b));
 }
 
 }

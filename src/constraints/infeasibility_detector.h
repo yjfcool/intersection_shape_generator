@@ -34,7 +34,7 @@ struct FenceRelaxResult {
     double max_expansion = 0;
 
     FenceRelaxResult(bool success, const Polygon2d& relaxed_fence, double max_expansion)
-        : success(success), relaxed_fence(relaxed_fence) {}
+        : success(success), relaxed_fence(relaxed_fence), max_expansion(max_expansion) {}
 };
 
 /// 尝试放松围栏以避开夹断

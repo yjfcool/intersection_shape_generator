@@ -24,9 +24,12 @@ TEST_CASE("BFS: open corridor is reachable", "[infeasibility]") {
 }
 
 TEST_CASE("BFS: blocked by obstacle spanning full width", "[infeasibility]") {
-    // Obstacle fills the entire corridor
+    // Obstacle fills the entire corridor. The fence below spans y in [-6,6], so
+    // the obstacle must reach past +/-6 to actually seal it; an obstacle of only
+    // y in [-5,5] leaves a 1m gap under the fence roof that BFS legitimately
+    // walks through.
     Polygon2d obs_poly;
-    obs_poly.outer = {{3,-5},{7,-5},{7,5},{3,5}};
+    obs_poly.outer = {{3,-6.5},{7,-6.5},{7,6.5},{3,6.5}};
     Obstacle obs; obs.geometry = obs_poly;
 
     BoundingBox2d roi; roi.min_pt={-1,-6}; roi.max_pt={11,6};

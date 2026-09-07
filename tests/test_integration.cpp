@@ -285,6 +285,9 @@ TEST_CASE("Integration: connectivity direction can be unified by lane group", "[
     IntersectionShapeGenerator::Config cfg;
     cfg.connectivity_direction.mode = ConnectivityDirectionMode::GroupUnified;
     cfg.connectivity_direction.group_similarity_angle_deg = 5.0;
+    // 本夹具里 E2 自身朝向偏组方向 78.7°，正是跨臂误并保护要拦下的量级。这个用例考的是
+    // 统一机制本身，故显式放开限幅；默认 20° 限幅下的行为由下一个用例钉住。
+    cfg.connectivity_direction.group_force_limit_deg = 90.0;
     IntersectionShapeGenerator group_gen(cfg);
     IntersectionOutput group_out;
     REQUIRE(group_gen.generate(inp, group_out));
@@ -292,6 +295,31 @@ TEST_CASE("Integration: connectivity direction can be unified by lane group", "[
     REQUIRE(group_curve);
     REQUIRE(group_curve->curve);
     REQUIRE(group_curve->curve->startTan().normalized().dot(Vec2d(1, 0)) > 0.95);
+}
+
+TEST_CASE("Integration: group unification leaves cross-arm lanes alone by default",
+          "[integration][direction][cluster]") {
+    // E2 从 (-2,-6) 走到 (0,4)，朝向偏组方向 78.7°：这不是同一进出口内的车道抖动，而是
+    // 被塞进同一 groupId 的另一条臂。默认配置必须保留它自身的端点切向，否则以它为端点的
+    // 曲线全都在错误切向上做 G1。判据见 `src/toolkits/toolkits.cpp` 与架构设计文档 §6.8.9。
+    auto inp = makeGroupedDirectionInput();
+    IntersectionShapeGenerator::Config cfg;
+    cfg.connectivity_direction.mode = ConnectivityDirectionMode::GroupUnified;
+    IntersectionShapeGenerator gen(cfg);
+    IntersectionOutput out;
+    REQUIRE(gen.generate(inp, out));
+
+    auto* e2 = findCurveByEntryLane(out, "E2");
+    REQUIRE(e2);
+    REQUIRE(e2->curve);
+    const Vec2d own = Vec2d(2, 10).normalized();
+    CHECK(e2->curve->startTan().normalized().dot(own) > 0.95);
+
+    // 组内真正的同臂车道照常被统一到 +x。
+    auto* e1 = findCurveByEntryLane(out, "E1");
+    REQUIRE(e1);
+    REQUIRE(e1->curve);
+    CHECK(e1->curve->startTan().normalized().dot(Vec2d(1, 0)) > 0.95);
 }
 
 TEST_CASE("Integration: CON_NUM=1 lane keeps its own direction under group unification",
@@ -325,6 +353,9 @@ TEST_CASE("Integration: group-unified direction falls back to leftmost lane with
 
     IntersectionShapeGenerator::Config cfg;
     cfg.connectivity_direction.mode = ConnectivityDirectionMode::GroupUnified;
+    // 无直行时组方向退回最左车道 E2（自身朝向偏其余车道 78.7°），此处考的是回退选择，
+    // 故同样放开跨臂限幅；否则 E0/E1 会因偏离过大而各自保留原朝向。
+    cfg.connectivity_direction.group_force_limit_deg = 90.0;
     IntersectionShapeGenerator gen(cfg);
     IntersectionOutput out;
     REQUIRE(gen.generate(inp, out));

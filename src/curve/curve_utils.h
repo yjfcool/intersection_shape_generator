@@ -17,6 +17,13 @@ struct OrdinarySingleCubicHandleBounds {
     bool has_direction_intersection = false;
     double direction_intersection_start = 0.0;
     double direction_intersection_end = 0.0;
+    /// 弦方向联合预算：`start_chord_proj * λ + end_chord_proj * μ <= chord_len`
+    /// （λ/μ 为首/尾把手长度）。`has_chord_budget=false` 表示该几何不适用
+    /// （弦退化，或某侧方向轴不朝弦前方，例如掉头）。
+    bool has_chord_budget = false;
+    double chord_len = 0.0;
+    double start_chord_proj = 0.0;
+    double end_chord_proj = 0.0;
 };
 
 /// 三点局部曲率（基于外接圆半径倒数）
@@ -76,14 +83,59 @@ OrdinarySingleCubicHandleBounds ordinarySingleCubicHandleBounds(
     const Vec2d& p1, const Vec2d& end_tan,
     bool cap_at_direction_intersection = true);
 
+/// 单段三次 Bezier 的控制多边形是否沿自身弦单调，即 `proj(P1) <= proj(P2)`
+/// （投影取到弦方向上）。
+///
+/// 这是需求 1.3.1「不得越过端点弦长的有效范围」的**联合**读法。原有实现只给
+/// 两个把手各自的上界（各自可吃满整条弦），两侧同时吃满时控制多边形沿弦倒序，
+/// 曲线被折成 Z 形或 L 形：110000385-u 的直行 55 弦长 53.96m、两个把手各
+/// 43.17m，`proj(P1)=41.97 > proj(P2)=12.00`，弦向净退 29.96m；两段避让曲线
+/// 21 的两段同样各超支 7.91m 和 3.11m。它们都逐个满足旧的单侧上界。
+///
+/// 展开成把手长度：`λ·(T0·u) + μ·(T1·u) <= |chord|`（u 为弦方向单位向量），
+/// 即两个把手在弦方向上的投影之和不得超过弦长——一个天然的联合预算。
+///
+/// 它与方向交点上限相容而非冲突：设方向交点距两端点为 s、e，则恒有
+/// `s·(T0·u) + e·(T1·u) = |chord|`（把交点分别沿两条射线投影到弦上即得）。
+/// 于是 `λ<=s 且 μ<=e` 必然满足本预算，交点上限生效时本预算自动成立；本预算
+/// 只在直行、无前向交点、或调用方显式关闭交点上限（密集 Boundary 链需要沿轴
+/// 延长把手）时才起作用——正是那些原本完全没有联合约束的场景。同时它比单侧
+/// 交点上限更宽松也更准确：一侧把手越过交点、另一侧相应缩短仍可保持单调，
+/// 避让需要的轴向延长因此不被误杀。
+///
+/// 某侧方向轴不朝弦前方时（掉头及极端反向几何）返回 true——该场景下弦向单调
+/// 没有意义，由掉头专用约束负责。
+///
+/// 判定带弦长比例松量（实现里的 kChordBudgetSlackFraction = 5%）：等号形态就是
+/// 把手正好落在方向交点，零容差会把只越界百分之几的候选一并淘汰、连带改变候选
+/// 集（实测使 100000443 的连接 5 退到粗围栏外）。真正折形的越界量是弦长的
+/// 16%~56%，与 5% 松量相差一个量级。
+bool cubicControlPolygonMonotone(const BezierSegment& segment, double tol = 1e-6);
+
+/// 曲线折形的**幅度**：各段控制多边形沿自身弦的倒退量占该段弦长的比例，取最大值；
+/// `0` 表示全部段都沿弦单调（含预算松量内的临界形态）。
+///
+/// `cubicControlPolygonMonotone` 只回答"是否折形"，物理修复搜索需要的是"折得多狠"：
+/// Boundary / Obstacle / Fence 修复的候选里，折形候选有时是唯一物理安全的选择
+/// （100000385-u 的左转 21 只有折形两段候选能绕开 Boundary），一律淘汰会把形态问题
+/// 换成更严重的物理违规。因此修复搜索按本函数的返回值给折形候选加打分惩罚，
+/// 让"能不折就不折"，而不是"一折就否"。
+///
+/// 比例口径与 kChordProjectionBudgetSlack 一致：返回值已扣除松量，因此
+/// `overshoot > 0` 与形态闸门判定的"折形"完全同义。段的某侧把手方向不朝弦前方时
+/// （掉头轴向段等）该段不计入。
+double curveChordBudgetOvershoot(const BezierCurve& curve);
+
 /// 将普通单段三次Bezier的两个内部控制点限制在端点切向轴的有效范围内。
+/// 除单侧上下界外还施加弦方向联合预算（见 cubicControlPolygonMonotone）：
+/// 超支时在最小把手之上等比缩放两侧，保持两侧把手比例即拱顶位置不变。
 /// U型调头和物理避让候选由调用方显式跳过本约束。
 void constrainOrdinarySingleCubicControls(
     BezierCurve& curve, const Vec2d& p0, const Vec2d& start_tan,
     const Vec2d& p1, const Vec2d& end_tan,
     bool cap_at_direction_intersection = true);
 
-/// 检查普通单段三次Bezier是否满足端点方向轴和有效范围约束。
+/// 检查普通单段三次Bezier是否满足端点方向轴、有效范围和弦方向联合预算约束。
 bool ordinarySingleCubicControlsValid(
     const BezierCurve& curve, const Vec2d& p0, const Vec2d& start_tan,
     const Vec2d& p1, const Vec2d& end_tan, double tol = 1e-6,
@@ -193,5 +245,42 @@ bool curvesIntersectBusinessOutsideBalls(const BezierCurve& a,
 ///
 /// 曲线为空、`samples_per_seg < 1`、或有效切向不足两个时返回 0。
 double curveTurningSpan(const BezierCurve& curve, int samples_per_seg = 48);
+
+/// 普通转弯曲线 arc/chord 比例的下限（同侧单拱形态的"够弧"口径）。
+///
+/// `turn_angle_rad` 是进入切向与退出切向之间的夹角，`chord_len` 是端点弦长。
+///
+/// 需求 1.4② 把下限写成常数："长距离普通转弯 arc/chord 原则上不低于 1.08，
+/// 短距离不低于 1.03"。但 arc/chord 的下界由转角唯一决定、与"长短"无关：给定
+/// 弦长 c 和首尾切向夹角 θ，弧长最短的 G1 单拱就是圆弧，此时
+/// arc/chord = θ / (2 sin(θ/2))。θ=90° 时该值是 1.1107，1.08 恰好是它的
+/// 97%，1.03 恰好是它的 93%——常数阈值真正表达的是"不低于圆弧的 97%/93%"，
+/// 只是被按 90° 折算成了数字。
+///
+/// 一旦转角变浅，常数就变成不可达的：θ=52° 的圆弧只有 1.036，θ=66° 只有
+/// 1.058，任何满足 1.08 的曲线都必须比圆弧更长，也就是必须鼓包或走 S 形，
+/// 与同一条需求"不能被压成 S 弯"直接矛盾。100000385-u 的 69/70/71/83/84/85/86
+/// 就是这样被误判的：它们的转角只有 52°~67°，实测比例 1.037~1.049 已经达到
+/// 甚至超过同转角圆弧（83/84/85/86 分别为圆弧的 100.1%~100.7%），却因为
+/// 弦长大于 12m 而被拿去和 1.06 比较。
+///
+/// 因此这里以"按转角折算的圆弧基准比例"为准：长弦取圆弧的 97%、短弦（<12m，
+/// 起停段占比大、几何余量小）取 93%，θ=90° 时与需求写明的 1.08 / 1.03 完全
+/// 一致。同时把需求原有的业务常数（长弦 1.06、短弦 1.02）保留为**上界**：转角
+/// 足够大时仍按常数裁定，只有圆弧本身都达不到常数的浅转才让位给圆弧基准。
+/// 于是这条口径只做一件事——把不可达的阈值降到可达，不放松任何原本可达的场景。
+/// 另有 1.005 的绝对地板，使近乎直行的浅转不会退化成"任意比例合法"。
+double ordinaryTurnArcChordFloor(double turn_angle_rad, double chord_len);
+
+/// 形态恢复目标的 arc/chord 下限，口径同 ordinaryTurnArcChordFloor，但业务常数
+/// 上界取需求里更严的一档（长弦 1.08、短弦 1.03）。它用于"这条曲线是否值得再
+/// 试一次纯几何恢复"的判定：目标不可达时恢复永远不会被接受，既白花修复预算，
+/// 又会把已经合规的浅转当成待修对象反复改形。
+double ordinaryTurnArcChordRestoreFloor(double turn_angle_rad,
+                                        double chord_len);
+
+/// 曲线首尾切向之间的夹角(弧度, [0, π])。用于把 arc/chord 下限按转角折算。
+/// 端点 G1 由独立约束保证，因此对合规曲线它与车道端点切向夹角一致。
+double curveEndpointTurnAngle(const BezierCurve& curve);
 
 }

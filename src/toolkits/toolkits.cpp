@@ -112,6 +112,41 @@ namespace isg {
             return direction.norm() > 1e-10 ? direction.normalized() : Vec2d(1, 0);
         };
 
+        // 抗抖动的"车道自身朝向"：自路口端点沿折线回溯至累计长度达到 baseline，取该点到端点
+        // 的弦。端点两点式切向只看最后两点，末段短到几十厘米时（corpus 里最短 0.31m）方向被
+        // 数字化噪声主导，不足以据此判定"这条车道属于另一条臂"。baseline <= 0 或折线长度不足
+        // 时退回整条车道的弦。注意本函数只在插入合成点之前调用（normalizer 每次运行只处理
+        // 每条车道一次，见下方 applied 去重）。
+        auto robustDirectionForRole = [&](const Lane& lane, GroupRole role,
+                                          double baseline) -> Vec2d {
+            const auto& points = lane.geometry.points;
+            if (baseline <= 0.0 || points.size() < 2)
+                return Vec2d(0, 0);
+            const bool from_back = role == GroupRole::Entry;
+            const Vec2d endpoint = from_back ? Vec2d(points.back()) : Vec2d(points.front());
+            Vec2d anchor = endpoint;
+            double accumulated = 0.0;
+            for (std::size_t step = 1; step < points.size(); ++step) {
+                const std::size_t i = from_back ? points.size() - 1 - step : step;
+                const Vec2d current(points[i]);
+                const std::size_t prev = from_back ? i + 1 : i - 1;
+                accumulated += (current - Vec2d(points[prev])).norm();
+                anchor = current;
+                if (accumulated >= baseline)
+                    break;
+            }
+            const Vec2d chord = from_back ? endpoint - anchor : anchor - endpoint;
+            return chord.norm() > 1e-10 ? chord.normalized() : Vec2d(0, 0);
+        };
+
+        auto directionAngleDiff = [&](const Vec2d& a, const Vec2d& b) -> double {
+            if (a.norm() < 1e-10 || b.norm() < 1e-10)
+                return M_PI;
+            double cosine = a.normalized().dot(b.normalized());
+            cosine = std::max(-1.0, std::min(1.0, cosine));
+            return std::acos(cosine);
+        };
+
         auto findLane = [&](const LaneIndex& lanes, const LaneId& id) -> Lane* {
             const auto it = lanes.find(id);
             return it == lanes.end() ? nullptr : it->second;
@@ -146,14 +181,6 @@ namespace isg {
         auto unifiedDirection = [&](
                 const LaneGroup& group, const LaneIndex& lanes,
                 const std::vector<Connectivity>& connectivities) -> Vec2d {
-
-            auto directionAngleDiff = [&](const Vec2d& a, const Vec2d& b) -> double {
-                if (a.norm() < 1e-10 || b.norm() < 1e-10)
-                    return M_PI;
-                double cosine = a.normalized().dot(b.normalized());
-                cosine = std::max(-1.0, std::min(1.0, cosine));
-                return std::acos(cosine);
-            };
 
             auto collectDirections = [&](
                     const LaneGroup& group, const LaneIndex& lanes) -> std::vector<LaneDirectionSample> {
@@ -292,9 +319,46 @@ namespace isg {
             const auto direction = group_directions.find(group.id);
             if (direction == group_directions.end())
                 continue;
+            std::unordered_set<LaneId> applied;
             for (const auto& lane_id : group.lanes) {
+                if (!applied.insert(lane_id).second)
+                    continue;  // group.lanes 存在重复 id，重复覆盖只会插入冗余点
                 Lane* lane = findLane(lanes, lane_id);
                 if (!lane || hasSingleConnectivity(*lane))
+                    continue;
+                // 跨臂误并保护：统一切向的用途是抹掉**同一路口臂内平行车道**的数字化抖动，
+                // 不是把车道重新指向。若某条车道自身朝向与组方向差过大，说明这个
+                // groupId 里混进了物理方向不同的另一条臂（或本车道是转向专用道），此时
+                // 覆盖会让所有以它为端点的曲线在错误的切向上做 G1——曲线从连接点起就偏出
+                // 车道数十度，随后必然自交、越路缘、与同簇兄弟成片相交，而审计读的是同一份
+                // 规范化输入，反而看不出端点 G1 异常。这类车道保留自身朝向。
+                //
+                // 判据取两点式切向与长基线弦**二者与组方向夹角的较小值**，只有两个估计都
+                // 认定"方向不同"才放弃统一。原因是两者各有失效模式：末段仅 0.31m 的车道
+                // （`110000703-u` 的 `43106568`）两点式切向被噪声主导，虚报 23.8° 偏差；
+                // 而弯曲的转向专用道整条弦又会偏离端点切向。取较小值使保护只在"无歧义的
+                // 跨臂"上触发，其余一律沿用统一，避免把真实抖动误判成跨臂。
+                //
+                // corpus 定标（`diag_group_dir`，575 条车道）：被强制转过的角度
+                // `<0.5° 420 条、<1° 55、<2° 59、<5° 19`，即 96.2% 在 5° 以内，属真实抖动；
+                // 5°~20° 共 14 条；20° 以上 8 条，全部经查为"一个 groupId 装了两条臂"或
+                // 转向专用道（`110004764` 的 `43107602` 把朝 -11.5° 的五条车道与朝
+                // -83°/-88° 的两条并到一起，后者被整整扭转 71.8°/76.6°）。阈值取
+                // `kGroupDirectionForceLimitDeg = 20°`：既是真实抖动上限的 4 倍，也低于
+                // 实测最小的跨臂偏差；换算成几何量，3.5m 长的车道末段偏 20° 才产生 1.2m
+                // 横向漂移，不可能来自数字化误差。
+                //
+                // 刻意不做"把离群车道再按方向聚类后组内统一"：`110000741-u` 的
+                // `43100884` 只有两条车道且相差 34.7°，任何再统一都会把两条各扭 17°，
+                // 比保留自身朝向更糟。
+                const Vec2d own = directionForRole(*lane, group.role);
+                const Vec2d robust = robustDirectionForRole(
+                        *lane, group.role, config.group_robust_baseline_m);
+                double deviation = directionAngleDiff(own, direction->second);
+                if (robust.norm() > 1e-10)
+                    deviation = std::min(
+                            deviation, directionAngleDiff(robust, direction->second));
+                if (deviation > config.group_force_limit_deg * M_PI / 180.0)
                     continue;
                 if (group.role == GroupRole::Entry)
                     setEntryDirection(*lane, direction->second);
