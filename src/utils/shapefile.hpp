@@ -27,15 +27,15 @@ static constexpr int SHP_POLYLINEZ = 13;
 static constexpr int SHP_POLYGONZ = 15;
 
 // DBF 字段描述符
-struct DbfField {
+struct IsgDbfField {
     std::string name; // 字段名（最大 11 个字节）
     char type = 'C'; // 'C'=字符串(Character), 'N'=数值(Numeric), 'F'=浮点数(Float)
     uint8_t length = 254; // 字段总长度
     uint8_t decimals = 0; // 小数位数（仅在 N 或 F 类型时有效）
 
-    DbfField() {};
+    IsgDbfField() {};
 
-    DbfField(std::string _name, char _type, uint8_t _length, uint8_t _decimals)
+    IsgDbfField(std::string _name, char _type, uint8_t _length, uint8_t _decimals)
             : name(_name), type(_type), length(_length), decimals(_decimals) {}
 };
 
@@ -169,7 +169,7 @@ public:
     // Reader（自适应同步读取 .shp 与 .dbf）
     // =============================================================================
     static bool read(const std::string &dir, const std::string &fname,
-                     std::vector<DbfField> &outFields, std::vector<ShapeRecord> &outRecords,
+                     std::vector<IsgDbfField> &outFields, std::vector<ShapeRecord> &outRecords,
                      int32_t &outGlobalShapeType, double outGlobalBoxXYZ[6] = 0) {
         std::string shpPath = dir + "/" + fname + ".shp";
         std::string shxPath = changeExtension(shpPath, ".shx");
@@ -319,7 +319,7 @@ public:
     // Writer（同步生成 .shp, .shx .dbf）
     // =============================================================================
     static bool write(const std::string &dir, const std::string &fname, int32_t globalShapeType,
-                      const std::vector<DbfField> &fields, std::vector<ShapeRecord> &records) {
+                      const std::vector<IsgDbfField> &fields, std::vector<ShapeRecord> &records) {
         std::string shpPath = dir + "/" + fname + ".shp";
         std::string shxPath = changeExtension(shpPath, ".shx");
         std::string dbfPath = changeExtension(shpPath, ".dbf");

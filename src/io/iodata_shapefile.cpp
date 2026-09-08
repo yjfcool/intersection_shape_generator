@@ -9,7 +9,7 @@ namespace {
 
 namespace fs = ghc::filesystem;
 
-const std::vector<DbfField> kLaneFields = {
+const std::vector<IsgDbfField> kLaneFields = {
         {"ID", 'C', 64, 0},
         {"LANE_ORDER", 'C', 64, 0},
         {"LEDGE", 'C', 64, 0},
@@ -17,7 +17,7 @@ const std::vector<DbfField> kLaneFields = {
         {"GROUP_ID", 'C', 64, 0},
         {"GROUP_TYPE", 'C', 64, 0},
 };
-const std::vector<DbfField> kConnectivityFields = {
+const std::vector<IsgDbfField> kConnectivityFields = {
         {"ID", 'C', 64, 0},
         {"TURN_TYPE", 'C', 64, 0},
         {"FLANE", 'C', 64, 0},
@@ -25,22 +25,22 @@ const std::vector<DbfField> kConnectivityFields = {
         {"LANE_TYPE", 'C', 64, 0},
         {"FIXED_SHAPE", 'C', 64, 0},
 };
-const std::vector<DbfField> kLaneEdgeFields = {
+const std::vector<IsgDbfField> kLaneEdgeFields = {
         {"ID", 'C', 64, 0},
         {"GROUP_ID", 'C', 64, 0},
         {"GROUP_TYPE", 'C', 64, 0},
         {"LEFT_CLINE_ID", 'C', 64, 0},
         {"RIGHT_CLINE_ID", 'C', 64, 0},
 };
-const std::vector<DbfField> kIdTypeFields = {
+const std::vector<IsgDbfField> kIdTypeFields = {
         {"ID", 'C', 64, 0},
         {"TYPE", 'C', 64, 0},
 };
-const std::vector<DbfField> kStopLineFields = {
+const std::vector<IsgDbfField> kStopLineFields = {
         {"ID", 'C', 64, 0},
         {"ENTRY_GROUP_ID", 'C', 64, 0},
 };
-const std::vector<DbfField> kControlPointFields = {
+const std::vector<IsgDbfField> kControlPointFields = {
         {"ID", 'C', 64, 0},
         {"NUM_SEGS", 'C', 64, 0},
         {"TURN_TYPE", 'C', 64, 0},
@@ -69,7 +69,7 @@ template <typename T, typename AttributeBuilder, typename GeometryBuilder>
 void writeShapes(const std::string& dir,
                  const std::string& name,
                  int shape_type,
-                 const std::vector<DbfField>& fields,
+                 const std::vector<IsgDbfField>& fields,
                  const std::vector<T>& items,
                  AttributeBuilder attributes,
                  GeometryBuilder geometry) {
