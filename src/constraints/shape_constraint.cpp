@@ -1,10 +1,13 @@
 #include "constraints/shape_constraint.h"
 
 #include "constraints/boundary_safety.h"
+#include "constraints/cluster_order.h"
 #include "constraints/fence_check.h"
+#include "constraints/road_edge_clearance.h"
 #include "curve/curve_utils.h"
 #include "geometry/predicates.h"
 #include "optimizer/sdf_field.h"
+#include "preprocessing/crosswalk_clearance_calculator.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -105,6 +108,7 @@ constexpr double kTwoSegmentStraightMaxCurvature = 0.25;
 //
 // 只在 numSegments()==2 这条稀有分支上计算：正常单段候选一次也不会走到。
 bool singleCubicAvoidanceIsPossible(const CurveGenerationContext& context,
+                                    const GenerationState& state,
                                     const Vec2d& chord) {
     if (context.scene == nullptr || chord.norm() < 1e-6)
         return true;  // 无场景可复算时按"单段可行"处理，两段仍属多余。
@@ -153,6 +157,63 @@ bool singleCubicAvoidanceIsPossible(const CurveGenerationContext& context,
             const BoundarySafetyResult safety = curveBoundarySafetyForInput(
                 single, input, std::max(32, profile.samples * 2), 0.75, 0.10, 0.05);
             if (safety.intersects || safety.outside_road_edge)
+                continue;
+            // BoundarySafety 只判断真实穿越/中心侧越界；mode=2 的 1m
+            // RoadEdge 净距是另一条硬约束。两段候选的“单段可行性”复算
+            // 必须与生成期和最终审计使用同一清距口径，否则会把仅仅避开
+            // 边缘折线、却仍违反 1m 净距的单段误判成两段化无必要。
+            if (profile.road_edge_clearance > 0.0) {
+                const RoadEdgeClearanceMeasure measure =
+                    measureCurveRoadEdgeClearanceForAudit(
+                        single, input.boundaries, Boundary::Type::RoadEdge,
+                        profile.road_edge_clearance,
+                        std::max(32, profile.samples * 2),
+                        kConnectionPointTolerance);
+                if (roadEdgeClearanceDeficit(
+                        measure, profile.road_edge_clearance) >
+                    kRoadEdgeClearanceRoundingTol)
+                    continue;
+            }
+        }
+
+        // “单段可行”还必须包含同簇拓扑约束。否则单段虽然避开了物理
+        // 边界，却可能穿过已经接受的同簇曲线；这会把本应采用两段绕行的
+        // 候选错误地判成普通形态可行。这里使用最终审计的 1.5m 端点
+        // 容差，与 diag_all_violations 的业务相交口径一致。
+        if (context.scene->cluster_topology && context.connectivity) {
+            constexpr double kOrdinaryClusterEndpointTolerance = 1.5;
+            const ClusterTopology& topology = *context.scene->cluster_topology;
+            bool cluster_blocked = false;
+            for (const auto& pair : topology.pairs) {
+                ConnId sibling_id;
+                if (pair.id_a == context.connectivity->id)
+                    sibling_id = pair.id_b;
+                else if (pair.id_b == context.connectivity->id)
+                    sibling_id = pair.id_a;
+                else
+                    continue;
+                if (sibling_id == context.connectivity->id)
+                    continue;
+                const auto sibling = state.accepted_curves.find(sibling_id);
+                if (sibling == state.accepted_curves.end())
+                    continue;
+
+                const bool adherence = curvesHaveForbiddenAdherenceForAudit(
+                    single, sibling->second, kOrdinaryClusterEndpointTolerance);
+                const bool crossing = curvesIntersectBusiness(
+                    single, sibling->second, kOrdinaryClusterEndpointTolerance);
+                if (adherence)
+                    cluster_blocked = true;
+                else if (crossing &&
+                         !(pair.exempt == CrossExemption::StructuralCross &&
+                           profile.allow_structural_cross) &&
+                         !(pair.exempt == CrossExemption::ObstacleCross &&
+                           profile.allow_obstacle_cross_exemption))
+                    cluster_blocked = true;
+                if (cluster_blocked)
+                    break;
+            }
+            if (cluster_blocked)
                 continue;
         }
         return true;  // 找到一条物理可行的单段：两段没有避让理由。
@@ -215,26 +276,11 @@ bool pointInCrosswalks(const Vec2d& point, const std::vector<Crosswalk>& crosswa
     return false;
 }
 
-bool crosswalkNearTurnChord(const Crosswalk& crosswalk,
-                            const Vec2d& p0, const Vec2d& p1,
-                            double max_distance) {
-    const std::vector<Vec2d> points = toVec2dArray(crosswalk.geometry.outer);
-    for (size_t i = 1; i < points.size(); ++i) {
-        const Vec2d& a = points[i - 1];
-        const Vec2d& b = points[i];
-        if (pointToSegment(a, p0, p1).first <= max_distance ||
-            pointToSegment(b, p0, p1).first <= max_distance ||
-            pointToSegment(p0, a, b).first <= max_distance ||
-            pointToSegment(p1, a, b).first <= max_distance)
-            return true;
-    }
-    return false;
-}
-
 double requiredCrosswalkLead(const Vec2d& origin, const Vec2d& direction,
                              const std::vector<Crosswalk>& crosswalks,
                              const Vec2d* turn_exit = nullptr,
-                             bool apply_turn_corridor_filter = false) {
+                             bool apply_turn_corridor_filter = false,
+                             const CrosswalkClearanceResult* paired_choice = nullptr) {
     if (direction.norm() < 1e-8) return 0.0;
     const Vec2d forward = direction.normalized();
     const Vec2d lateral(-forward.y(), forward.x());
@@ -252,9 +298,6 @@ double requiredCrosswalkLead(const Vec2d& origin, const Vec2d& direction,
             const double edge_far = std::max(a_forward, b_forward);
             if (edge_far <= 0.0 || edge_near > 12.0)
                 continue;
-            if (apply_turn_corridor_filter && turn_exit && !crosswalkNearTurnChord(
-                    crosswalk, origin, *turn_exit, 4.0))
-                continue;
             const double a_lateral = (points[i] - origin).dot(lateral);
             const double b_lateral = (points[i + 1] - origin).dot(lateral);
             const double minimum_lateral = a_lateral * b_lateral <= 0.0 ? 0.0 :
@@ -263,6 +306,17 @@ double requiredCrosswalkLead(const Vec2d& origin, const Vec2d& direction,
             near = std::min(near, std::max(0.0, edge_near));
             far = std::max(far, edge_far);
             found = true;
+        }
+        if (found && apply_turn_corridor_filter && turn_exit) {
+            CrosswalkClearanceResult candidate;
+            candidate.found = true;
+            candidate.crosswalk_id = crosswalk.id;
+            candidate.near = near;
+            candidate.far = far;
+            if (!crosswalkRelevantToUTurn(
+                    crosswalk, origin, *turn_exit, candidate,
+                    paired_choice, 4.0, 1.0))
+                continue;
         }
         if (found && (near < best_near - 1e-6 ||
                       (std::abs(near - best_near) <= 1e-6 && far < best_far))) {
@@ -276,7 +330,8 @@ double requiredCrosswalkLead(const Vec2d& origin, const Vec2d& direction,
 }  // namespace
 
 ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
-                                       const CurveGenerationContext& context) {
+                                       const CurveGenerationContext& context,
+                                       const GenerationState& state) {
     if (!context.connectivity || isGeometricUTurn(context))
         return satisfied("shape.ordinary.not_applicable");
     if (curve.empty()) return violated("shape.ordinary", "ordinary curve is empty");
@@ -290,7 +345,7 @@ ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
             return violated("shape.ordinary.waypoint",
                             "ordinary two-segment waypoint curve is not a smooth legal arch");
         // 形态合法还不够：需求 1.3 只在单段确实表达不出来时才允许多段。
-        if (singleCubicAvoidanceIsPossible(context, chord))
+        if (singleCubicAvoidanceIsPossible(context, state, chord))
             return violated("shape.ordinary.single_segment",
                             "ordinary curve uses two segments while a single cubic is feasible");
         return satisfied("shape.ordinary.waypoint");
@@ -355,14 +410,23 @@ ConstraintResult evaluateUTurnShape(const BezierCurve& curve,
         &context.scene->view.input().crosswalks : nullptr;
     const bool apply_turn_corridor_filter = context.scene &&
         context.scene->view.input().mode == 2;
+    CrosswalkClearanceCalculator calculator;
+    const CrosswalkClearanceResult entry_choice = crosswalks
+        ? calculator.ahead(context.entry.first, context.entry.second,
+                           context.scene->view.input())
+        : CrosswalkClearanceResult();
+    const CrosswalkClearanceResult exit_choice = crosswalks
+        ? calculator.behind(context.exit.first, context.exit.second,
+                            context.scene->view.input())
+        : CrosswalkClearanceResult();
     const double required0 = crosswalks ?
         requiredCrosswalkLead(context.entry.first, context.entry.second, *crosswalks,
                               &context.exit.first,
-                              apply_turn_corridor_filter) : 0.0;
+                              apply_turn_corridor_filter, &exit_choice) : 0.0;
     const double required1 = crosswalks ?
         requiredCrosswalkLead(context.exit.first, -context.exit.second, *crosswalks,
                               &context.entry.first,
-                              apply_turn_corridor_filter) : 0.0;
+                              apply_turn_corridor_filter, &entry_choice) : 0.0;
     if (required0 <= 0.0 && required1 <= 0.0 &&
         (first_chord.norm() < 2.0 || last_chord.norm() < 2.0))
         return violated("shape.uturn.leads", "U-turn without Crosswalk needs 2m straight leads");
@@ -392,14 +456,21 @@ ConstraintResult evaluateUTurnCrosswalk(const BezierCurve& curve,
         if (pointInCrosswalks(point, context.scene->view.input().crosswalks))
             return violated("shape.crosswalk.arc", "U-turn middle arc enters Crosswalk");
     }
+    CrosswalkClearanceCalculator calculator;
+    const CrosswalkClearanceResult entry_choice = calculator.ahead(
+        context.entry.first, context.entry.second,
+        context.scene->view.input());
+    const CrosswalkClearanceResult exit_choice = calculator.behind(
+        context.exit.first, context.exit.second,
+        context.scene->view.input());
     const double required0 = requiredCrosswalkLead(
         context.entry.first, context.entry.second,
         context.scene->view.input().crosswalks, &context.exit.first,
-        context.scene->view.input().mode == 2);
+        context.scene->view.input().mode == 2, &exit_choice);
     const double required1 = requiredCrosswalkLead(
         context.exit.first, -context.exit.second,
         context.scene->view.input().crosswalks, &context.entry.first,
-        context.scene->view.input().mode == 2);
+        context.scene->view.input().mode == 2, &entry_choice);
     if ((curve.segs.front().ctrl[3] - curve.segs.front().ctrl[0]).norm() + 1e-6 < required0 ||
         (curve.segs.back().ctrl[3] - curve.segs.back().ctrl[0]).norm() + 1e-6 < required1)
         return violated("shape.crosswalk.lead", "U-turn straight lead does not clear Crosswalk");

@@ -60,7 +60,8 @@ bool hasPhysicalViolation(const BezierCurve& curve,
     context.profile.check_uturn_shape = false;
     context.profile.check_crosswalk = false;
     context.profile.check_cluster = false;
-    context.profile.road_edge_clearance = 0.0;
+    context.profile.road_edge_clearance =
+        std::getenv("ISG_DIAG_ROAD_EDGE") ? 1.0 : 0.0;
     const ConstraintReport report = ConstraintEvaluator().evaluate(
         curve, context, GenerationState());
     for (const auto& result : report.results)
@@ -147,6 +148,7 @@ int main(int argc, char** argv) {
     const int kSteps = 16;
     int feasible = 0;
     int clean = 0;
+    const GenerationState empty_state;
     for (int i = 0; i <= kSteps; ++i) {
         const double h0 = bounds.start_min +
             (bounds.start_max - bounds.start_min) * i / kSteps;
@@ -159,7 +161,8 @@ int main(int argc, char** argv) {
                                                   entry.second, exit.first,
                                                   exit.second))
                 continue;
-            const ConstraintResult shape = evaluateOrdinaryShape(candidate, context);
+            const ConstraintResult shape = evaluateOrdinaryShape(
+                candidate, context, empty_state);
             if (shape.state == ConstraintState::Violated) {
                 if (std::getenv("ISG_DIAG_SHOW_REJECT"))
                     printf("  h0=%8.3f h1=%8.3f REJECT %s\n", h0, h1,
@@ -312,6 +315,85 @@ int main(int argc, char** argv) {
             }
             printf("  physical-safe triples=%d\n", triples);
         }
+    }
+
+    // 可选的少段绕行扫描：用于区分“单段受物理/同簇联合约束无解”和
+    // “多段绕行候选本身也无解”。它只做诊断，不参与生成器决策。
+    if (std::getenv("ISG_DIAG_MULTI")) {
+        const Vec2d p0 = entry.first;
+        const Vec2d p1 = exit.first;
+        const Vec2d T0 = entry.second.norm() > 1e-8
+            ? entry.second.normalized() : (p1 - p0).normalized();
+        const Vec2d T1 = exit.second.norm() > 1e-8
+            ? exit.second.normalized() : (p1 - p0).normalized();
+        const Vec2d chord_dir = (p1 - p0).norm() > 1e-8
+            ? (p1 - p0).normalized() : Vec2d(1, 0);
+        const Vec2d perp(-chord_dir.y(), chord_dir.x());
+        int physical_safe = 0;
+        int clean = 0;
+        const auto reports_clean = [&](const BezierCurve& candidate) {
+            for (const ConnId& sibling_id : sibling_ids) {
+                auto it = finals.find(sibling_id);
+                if (it == finals.end() || !it->second)
+                    continue;
+                if (curvesIntersectBusiness(candidate, *it->second, 1.5))
+                    return false;
+            }
+            return true;
+        };
+        const auto report_candidate = [&](const BezierCurve& candidate,
+                                          const char* tag) {
+            if (candidate.empty() || curveSelfIntersectsBusiness(candidate, 1.0) ||
+                hasPhysicalViolation(candidate, scene, *target))
+                return false;
+            ++physical_safe;
+            if (!reports_clean(candidate))
+                return false;
+            ++clean;
+            if (clean <= 10) {
+                std::printf("  multi CLEAN %s segs=%d arc/chord=%.4f maxk=%.4f\n",
+                            tag, candidate.numSegments(),
+                            candidate.arcLength() / std::max(1e-9, chord),
+                            candidate.maxCurvature(60));
+                for (const auto& segment : candidate.segs) {
+                    std::printf("    ");
+                    for (int k = 0; k < 4; ++k)
+                        std::printf("(%.3f,%.3f) ", segment.ctrl[k].x(),
+                                    segment.ctrl[k].y());
+                    std::printf("\n");
+                }
+            }
+            return true;
+        };
+        for (double fraction : {0.12, 0.20, 0.28, 0.36, 0.44, 0.52,
+                                0.60, 0.68, 0.76, 0.84, 0.90}) {
+            for (double offset : {-12.0, -9.0, -6.0, -4.0, -3.0, -2.0,
+                                  -1.0, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0,
+                                  12.0}) {
+                const Vec2d waypoint = p0 + (p1 - p0) * fraction + perp * offset;
+                const Vec2d from_start = waypoint - p0;
+                const Vec2d to_end = p1 - waypoint;
+                if (from_start.norm() < 0.30 || to_end.norm() < 0.30)
+                    continue;
+                std::vector<Vec2d> mid_tangents;
+                if (to_end.norm() > 1e-8)
+                    mid_tangents.push_back(to_end.normalized());
+                if (from_start.norm() > 1e-8 && to_end.norm() > 1e-8) {
+                    const Vec2d bisector = from_start.normalized() + to_end.normalized();
+                    if (bisector.norm() > 1e-8)
+                        mid_tangents.push_back(bisector.normalized());
+                }
+                mid_tangents.push_back(chord_dir);
+                for (const Vec2d& mid_tangent : mid_tangents) {
+                    for (double alpha : {0.12, 0.18, 0.24, 0.30, 0.36, 0.42}) {
+                        const BezierCurve candidate = makeCurveFromKnots(
+                            {p0, waypoint, p1}, {T0, mid_tangent, T1}, alpha);
+                        report_candidate(candidate, "two-knot");
+                    }
+                }
+            }
+        }
+        std::printf("  multi physical-safe=%d clean=%d\n", physical_safe, clean);
     }
     return 0;
 }

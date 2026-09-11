@@ -464,6 +464,26 @@ TEST_CASE("CrosswalkClearanceCalculator selects nearest crossing and far project
         isg::Vec2d(0, 10), isg::Vec2d(0, 1), input);
     REQUIRE(behind.found);
     REQUIRE(behind.crosswalk_id == "far");
+
+    isg::Crosswalk long_turn_crosswalk;
+    long_turn_crosswalk.id = "long-turn";
+    long_turn_crosswalk.geometry.outer = {
+        isg::Vec3d(8, -1), isg::Vec3d(10, -1),
+        isg::Vec3d(10, 11), isg::Vec3d(8, 11),
+        isg::Vec3d(8, -1)};
+    isg::CrosswalkClearanceResult long_entry;
+    long_entry.found = true;
+    long_entry.crosswalk_id = "long-turn";
+    long_entry.near = 8.0;
+    long_entry.far = 10.0;
+    isg::CrosswalkClearanceResult long_exit = long_entry;
+    REQUIRE(isg::crosswalkRelevantToUTurn(
+        long_turn_crosswalk, isg::Vec2d(0, 0), isg::Vec2d(0, 10),
+        long_entry, &long_exit));
+    long_exit.near = 12.0;
+    REQUIRE_FALSE(isg::crosswalkRelevantToUTurn(
+        long_turn_crosswalk, isg::Vec2d(0, 0), isg::Vec2d(0, 10),
+        long_entry, &long_exit));
 }
 
 TEST_CASE("UTurnFamilyBuilder derives one-sided and fallback lead floors") {

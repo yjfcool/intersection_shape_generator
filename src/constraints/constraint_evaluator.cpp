@@ -191,7 +191,7 @@ ConstraintReport ConstraintEvaluator::evaluate(const BezierCurve& curve,
     }
     report = evaluate(curve, *context.scene, context.profile);
     if (context.profile.check_ordinary_shape)
-        report.results.push_back(evaluateOrdinaryShape(curve, context));
+        report.results.push_back(evaluateOrdinaryShape(curve, context, state));
     if (context.profile.check_uturn_shape)
         report.results.push_back(evaluateUTurnShape(curve, context));
     if (context.profile.check_crosswalk)

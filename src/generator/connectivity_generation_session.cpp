@@ -38,14 +38,11 @@
 
 namespace isg {
 
-// U型调头硬形态约束：进入/退出两侧都没有人行横道约束时，首尾直行段才使用2m保底距离进入中间单段掉头弧。
-static constexpr double kUTurnNoCrosswalkMinLead = 2.0;
 // 同配置家族U-turn的首/尾平齐点沿轴向法线相向微移，避免直行段完全重叠/贴合。
 // 该量必须与需求中的家族分档一致：按短径到长径逆序 N，沿两个
 // 平齐点连线相向移动 N*0.01m。不能使用分米级偏移再由单条曲线
 // 独立截断，否则会把短径中弧挤成尖弧并破坏家族嵌套关系。
 static constexpr double kUTurnSharedEndpointLeadStagger = 0.01;
-static constexpr double kUTurnSharedEndpointPairLeadStagger = 0.01;
 // 同簇曲线只允许在真实连接点相遇；连接点外的贴合/重叠/相交都按违规处理。
 static constexpr double kClusterEndpointTol = 0.30;
 // 多段严格避让回退的同簇端点容差。该口径只豁免真实连接点的浮点误差，
@@ -183,15 +180,56 @@ static bool curveIntersectsBoundaries(
     return safety.intersects || safety.outside_road_edge;
 }
 
+struct RawBoundarySegment {
+    Vec2d a{0, 0};
+    Vec2d b{0, 0};
+    BoundingBox2d bbox;
+    bool road_edge = false;
+};
+
+static const std::vector<RawBoundarySegment>& cachedRawBoundarySegments(
+        const std::vector<Boundary>& boundaries) {
+    struct Entry {
+        std::uint64_t key = 0;
+        bool valid = false;
+        std::vector<RawBoundarySegment> segments;
+    };
+    static thread_local std::vector<Entry> cache(8);
+    static thread_local std::size_t next_slot = 0;
+    const std::uint64_t key = boundarySafetyFingerprint(
+        boundaries, Vec2d(0, 0), nullptr);
+    for (const Entry& entry : cache)
+        if (entry.valid && entry.key == key)
+            return entry.segments;
+
+    Entry& slot = cache[next_slot];
+    next_slot = (next_slot + 1) % cache.size();
+    slot.segments.clear();
+    for (const auto& boundary : boundaries) {
+        const auto& points = boundary.geometry.points;
+        for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+            RawBoundarySegment segment;
+            segment.a = points[i];
+            segment.b = points[i + 1];
+            if ((segment.b - segment.a).norm() < 1e-10)
+                continue;
+            segment.bbox.expand(segment.a);
+            segment.bbox.expand(segment.b);
+            segment.road_edge = boundary.type == Boundary::Type::RoadEdge;
+            slot.segments.push_back(std::move(segment));
+        }
+    }
+    slot.key = key;
+    slot.valid = true;
+    return slot.segments;
+}
+
 // 对曲线进行采样后的线段级边界相交检查。
 // 只允许交点落在曲线真实首点或尾点的浮点误差内；Boundary 端点和端点后的
 // 共线贴合/重叠不属于连接点豁免。返回 true 表示存在一个非端点真实接触。
 static bool curveRawIntersectsBoundariesImpl(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
-        bool road_edges_only, double curve_endpoint_tol, double boundary_endpoint_tol,
-        const std::vector<std::vector<bool>>* exempt_masks = nullptr) {
-    (void)boundary_endpoint_tol;
-    (void)exempt_masks;
+        bool road_edges_only, double curve_endpoint_tol) {
     if (curve.empty())
         return false;
     const double endpoint_tol = std::min(
@@ -225,41 +263,27 @@ static bool curveRawIntersectsBoundariesImpl(
                x.max_pt[1] < y.min_pt[1] - kBoxSlack ||
                y.max_pt[1] < x.min_pt[1] - kBoxSlack;
     };
-    std::vector<BoundingBox2d> bnd_seg_box;
-    for (size_t bi = 0; bi < boundaries.size(); ++bi) {
-        const auto& bnd = boundaries[bi];
-        if ((road_edges_only && bnd.type != Boundary::Type::RoadEdge) ||
-            bnd.geometry.points.size() < 2)
+    const auto& boundary_segments = cachedRawBoundarySegments(boundaries);
+    for (const auto& boundary_segment : boundary_segments) {
+        if (road_edges_only && !boundary_segment.road_edge)
             continue;
-        const BoundingBox2d bnd_box = bnd.geometry.bbox();
-        if (!curve_box.intersects(bnd_box))
+        if (!curve_box.intersects(boundary_segment.bbox))
             continue;
-        const auto& bpts = bnd.geometry.points;
-        const std::size_t nbseg = bpts.size() - 1;
-        bnd_seg_box.assign(nbseg, BoundingBox2d());
-        for (std::size_t j = 0; j < nbseg; ++j) {
-            bnd_seg_box[j].expand(bpts[j]);
-            bnd_seg_box[j].expand(bpts[j + 1]);
-        }
         for (std::size_t i = 0; i < nseg; ++i) {
             const BoundingBox2d& abox = curve_seg_box[i];
-            if (boxesApart(abox, bnd_box))
+            if (boxesApart(abox, boundary_segment.bbox))
                 continue;
-            for (std::size_t j = 0; j < nbseg; ++j) {
-                if (boxesApart(abox, bnd_seg_box[j]))
-                    continue;
-                if (!segmentHasForbiddenBoundaryContact(
-                        pts[i], pts[i + 1], bpts[j], bpts[j + 1],
-                        pts.front(), pts.back(), endpoint_tol))
-                    continue;
-                // 共享连接点的"离开楔形"不判违（见 boundary_safety.h）。
-                // 判据是全局的（要求所有接触都属于楔形），因此在第一处接触上
-                // 求值一次即可定论；严格路径因此不付任何额外代价。
-                if (curveBoundaryContactsAreDepartureWedges(
-                        curve, boundaries, road_edges_only, curve_endpoint_tol))
-                    return false;
-                return true;
-            }
+            if (!segmentHasForbiddenBoundaryContact(
+                    pts[i], pts[i + 1], boundary_segment.a, boundary_segment.b,
+                    pts.front(), pts.back(), endpoint_tol))
+                continue;
+            // 共享连接点的"离开楔形"不判违（见 boundary_safety.h）。
+            // 判据是全局的（要求所有接触都属于楔形），因此在第一处接触上
+            // 求值一次即可定论；严格路径因此不付任何额外代价。
+            if (curveBoundaryContactsAreDepartureWedges(
+                    curve, boundaries, road_edges_only, curve_endpoint_tol))
+                return false;
+            return true;
         }
     }
     return false;
@@ -270,9 +294,9 @@ static bool curveRawIntersectsBoundariesImpl(
 // kConnectionPointTolerance，避免调用者重新打开 Boundary 端点或端点贴合豁免。
 static bool curveRawIntersectsAnyBoundary(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
-        double curve_endpoint_tol, double boundary_endpoint_tol) {
+        double curve_endpoint_tol) {
     return curveRawIntersectsBoundariesImpl(
-            curve, boundaries, false, curve_endpoint_tol, boundary_endpoint_tol);
+            curve, boundaries, false, curve_endpoint_tol);
 }
 
 // 三段式 U-turn 的首尾直行段可能位于短 RoadEdge 的中心反侧，但仍在
@@ -284,7 +308,7 @@ static bool curveIntersectsBoundariesUTurn(
         const BezierCurve& curve, const IntersectionInput& input) {
     if (curve.numSegments() != 3)
         return curveIntersectsBoundaries(curve, input);
-    return curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15, 0.10);
+    return curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15);
 }
 
 ////////////////////////////////////////////////////////////
@@ -312,9 +336,16 @@ std::vector<SiblingCurve> ConnectivityGenerationSession::buildSiblings(
     const ClusterOrderSolver& cs, const std::vector<Connectivity>& conns,
     bool constrained_only, const std::unordered_set<ConnId>* fixed_shape_ids) const {
     std::vector<SiblingCurve> sibs;
-    for (auto& kv : done) {
-        auto& cid = kv.first;
-        auto& curve = kv.second;
+    std::vector<ConnId> ordered_ids;
+    ordered_ids.reserve(done.size());
+    for (const auto& kv : done)
+        ordered_ids.push_back(kv.first);
+    std::sort(ordered_ids.begin(), ordered_ids.end());
+    for (const ConnId& cid : ordered_ids) {
+        const auto curve_it = done.find(cid);
+        if (curve_it == done.end())
+            continue;
+        const BezierCurve& curve = curve_it->second;
         if (cid == id)
             continue;
 
@@ -420,7 +451,7 @@ void ConnectivityGenerationSession::validate(
     } else {
         boundary_cross =
             curveIntersectsBoundaries(c, input) ||
-            curveRawIntersectsAnyBoundary(c, input.boundaries, 0.15, 0.10);
+            curveRawIntersectsAnyBoundary(c, input.boundaries, 0.15);
     }
     audit.boundary_intersection = boundary_cross;
 
@@ -1020,10 +1051,9 @@ static bool sharedTurnStraightConvergenceOnly(
 // 一律打开会外溢：实测 100000643 的 125-113、115-103 会被一并放行。
 static bool curvesHaveForbiddenSameClusterIntersection(
     const BezierCurve& a, const BezierCurve& b, double endpoint_tol,
-    bool allow_merge_funnel) {
+    bool /*allow_merge_funnel*/) {
     // StructuralCross 只在调用方根据 CurvePair 拓扑关系跳过；几何层不再根据
     // 曲线形态推断任何结构性豁免。除真实首/尾连接点误差外，相交与重叠均违规。
-    (void)allow_merge_funnel;
     return curvesIntersectBusiness(a, b, endpoint_tol);
 }
 
@@ -1256,6 +1286,10 @@ static double roadEdgeClearanceViolation(
         return 0.0;
     const RoadEdgeClearanceMeasure measure =
         measureRoadEdgeClearanceAlongCurve(curve, boundaries, clearance);
+    // 端点强制亏欠由 roadEdgeClearanceDeficit() 的统一 floor 判定处理。
+    // 生成阶段不能根据边缘首端的局部几何另行豁免，否则候选会通过
+    // assessCurveRisk()，却在最终 ConstraintEvaluator 中再次触发 mode=2
+    // 的非端点 1m 清距错误。
     return roadEdgeClearanceDeficit(measure, clearance);
 }
 
@@ -1269,7 +1303,7 @@ static double boundaryAvoidancePenalty(
     // 额外要求RoadEdge非端点1m净距。
     if ((is_uturn ? curveIntersectsBoundariesUTurn(curve, input)
                   : curveIntersectsBoundaries(curve, input)) ||
-        curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15, 0.10))
+        curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15))
         penalty = std::max(penalty, 0.10);
     return penalty;
 }
@@ -1277,16 +1311,15 @@ static double boundaryAvoidancePenalty(
 // 仅检查曲线与 RoadEdge 的非端点真实相交，忽略其它 Boundary 类型。
 static bool curveRawIntersectsRoadEdge(
     const BezierCurve& curve, const std::vector<Boundary>& boundaries,
-    double curve_endpoint_tol = 0.15, double boundary_endpoint_tol = 0.10) {
+    double curve_endpoint_tol = 0.15) {
     return curveRawIntersectsBoundariesImpl(
-        curve, boundaries, true, curve_endpoint_tol, boundary_endpoint_tol);
+        curve, boundaries, true, curve_endpoint_tol);
 }
 
 // 检查一条直线段是否真实穿越 RoadEdge；只忽略曲线侧真实首/尾连接点。
 static bool segmentRawIntersectsRoadEdge(
     const Vec2d& a, const Vec2d& b, const std::vector<Boundary>& boundaries,
-    double endpoint_tol = 0.15, double boundary_endpoint_tol = 0.10) {
-    (void)boundary_endpoint_tol;
+    double endpoint_tol = 0.15) {
     const double strict_endpoint_tol = std::min(
         std::max(0.0, endpoint_tol), kConnectionPointTolerance);
     for (const auto& bnd : boundaries) {
@@ -1587,6 +1620,37 @@ struct CurveRisk {
     }
 };
 
+static bool hasRoadEdgeEndpointDeparture(const BezierCurve& curve,
+                                         const IntersectionInput& input) {
+    if (curve.empty()) return false;
+    const Vec2d p0 = curve.startPt();
+    const Vec2d t0 = curve.startTan().norm() > 1e-8
+        ? curve.startTan().normalized() : Vec2d(1, 0);
+    for (const auto& bnd : input.boundaries) {
+        if (bnd.type != Boundary::Type::RoadEdge || bnd.geometry.points.size() < 2)
+            continue;
+        const auto& pts = bnd.geometry.points;
+        if ((xyOf(pts.front()) - p0).norm() > 4.0)
+            continue;
+        double along = 0.0;
+        for (std::size_t i = 0; i + 1 < pts.size() && along <= 30.0; ++i) {
+            const Vec2d a = xyOf(pts[i]);
+            const Vec2d b = xyOf(pts[i + 1]);
+            const Vec2d d = b - a;
+            const double len = d.norm();
+            if (len < 1e-8) continue;
+            const Vec2d mid = 0.5 * (a + b);
+            const Vec2d delta = mid - p0;
+            if (delta.dot(t0) >= -1.0 && delta.dot(t0) <= 30.0 &&
+                std::abs(cross2d(t0, delta)) <= 5.0 &&
+                std::abs(d.normalized().dot(t0)) >= 0.85)
+                return true;
+            along += len;
+        }
+    }
+    return false;
+}
+
 // 将 Bezier 曲线写入 ConnectivityCurve，并按弧长重新生成输出折线几何。
 // 提供固定几何时保留该几何，否则清空旧 geometry 后从曲线采样填充。
 static void setConnectivityCurveGeometry(
@@ -1619,10 +1683,18 @@ static CurveRisk assessCurveRisk(
         // 使用特殊的U-turn边界检查，优先穿越弧形边界
         risk.boundary = curveIntersectsBoundariesUTurn(curve, input);
     } else {
-        risk.boundary = curveIntersectsBoundaries(curve, input) ||
-            curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15, 0.10);
+        const BoundarySafetyResult safety = curveBoundarySafetyForInput(curve, input, 128, 0.15);
+        risk.boundary = safety.intersects ||
+            curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15);
+        if (risk.boundary && safety.outside_road_edge &&
+            !curveRawIntersectsAnyBoundary(curve, input.boundaries, 0.15) &&
+            hasRoadEdgeEndpointDeparture(curve, input))
+            risk.boundary = false;
     }
 
+    // 外部普通候选必须和最终 validate() 使用同一条 RoadEdge 清距门禁。
+    // hasRoadEdgeEndpointDeparture() 只用于 BoundarySafety 的首端离开楔形
+    // 判定，不能把 mode=2 的非端点 1m 清距亏欠从候选审计中抹掉。
     if (roadEdgeClearanceViolation(curve, input.boundaries, input.mode) > 0.0)
         risk.boundary = true;
     risk.fence = include_fence && (!input.area.is_rough && curveLeavesFence(curve, input.area.geometry));
@@ -1697,6 +1769,44 @@ static bool tryPhysicalSafeSingleCubic(
         }
     }
 
+    // 斜向直行贴近入口 RoadEdge 时，安全解通常是“沿入口切线长开口，
+    // 尾端短收口”的非对称单段 cubic。对称 alpha 会同时把尾把手拉长，
+    // 重新切回边缘；这里在弦向预算内补充有限的长首/短尾组合，仍经过
+    // 单调控制多边形、物理边界和同簇门禁。
+    if (current.boundary) {
+        const double chord_len = (p1 - p0).norm();
+        for (double start_frac : {0.40, 0.50, 0.60, 0.70, 0.80, 1.00, 1.20, 1.40}) {
+            for (double end_frac : {0.05, 0.08, 0.12, 0.16, 0.20, 0.26}) {
+                BezierCurve candidate;
+                BezierSegment seg;
+                seg.ctrl[0] = p0;
+                seg.ctrl[1] = p0 + T0 * (start_frac * chord_len);
+                seg.ctrl[2] = p1 - T1 * (end_frac * chord_len);
+                seg.ctrl[3] = p1;
+                candidate.segs.push_back(seg);
+                if (!cubicControlPolygonMonotone(seg) ||
+                    curveSelfIntersectsBusiness(candidate, 1.0))
+                    continue;
+                CurveRisk candidate_risk = assessCurveRisk(
+                    candidate, input, sdf, sampled_siblings);
+                if (candidate_risk.physical() ||
+                    (require_topology_clear && candidate_risk.sibling_crosses > 0))
+                    continue;
+                double shape_score = std::abs(start_frac - 0.50) +
+                                     std::abs(end_frac - 0.12);
+                if (!have_best ||
+                    candidate_risk.sibling_crosses < best_cross ||
+                    (candidate_risk.sibling_crosses == best_cross &&
+                     shape_score < best_shape)) {
+                    best = candidate;
+                    have_best = true;
+                    best_cross = candidate_risk.sibling_crosses;
+                    best_shape = shape_score;
+                }
+            }
+        }
+    }
+
     if (!have_best)
         return false;
     curve = best;
@@ -1713,7 +1823,6 @@ static bool tryShapeSafeSingleCubic(
     double chord_len = (p1 - p0).norm();
     if (chord_len < 1e-6)
         return false;
-    bool debug = isgDebugUTurn();
     Vec2d T0 = t0.norm() > 1e-8 ? t0.normalized() : (p1 - p0).normalized();
     Vec2d chord_dir = (p1 - p0).normalized();
     double turn_strength = std::abs(cross2d(T0, chord_dir));
@@ -2055,7 +2164,7 @@ static bool tryBoundarySafeCandidate(
             continue;
         std::vector<Boundary> one_boundary{bnd};
         bool raw_through = curveRawIntersectsAnyBoundary(
-            curve, one_boundary, 0.15, 0.10);
+            curve, one_boundary, 0.15);
         BoundarySafetyResult bs = curveBoundarySafety(
             curve, one_boundary, center, 128);
         if (raw_through || bs.intersects || bs.outside_road_edge ||
@@ -2072,13 +2181,20 @@ static bool tryBoundarySafeCandidate(
         return false;
     auto boundaryViolationScore = [&](const BezierCurve& c,
                                       const std::vector<Boundary>& bnds) {
+        // 候选是否真正越界必须以完整 Boundary 集合的主风险审计为准。
+        // 逐条拆成单边界后会丢失共享端点/离开楔形的上下文，造成
+        // “主审计安全、二次评分仍记穿越”的矛盾，尤其出现在 43109989/90
+        // 这种相邻斜向 RoadEdge 链上。
+        const CurveRisk full_risk = assessCurveRisk(
+            c, input, sdf, sampled_siblings, include_fence);
+        if (!full_risk.boundary)
+            return 0.0;
         double score = 0.0;
         for (const auto& b : bnds) {
             const std::vector<Boundary> one_boundary{b};
             BoundarySafetyResult bs = curveBoundarySafety(
                 c, one_boundary, center, 128, 0.15);
-            if (curveRawIntersectsAnyBoundary(
-                    c, one_boundary, 0.15, 0.10))
+            if (curveRawIntersectsAnyBoundary(c, one_boundary, 0.15))
                 score += 10000.0;
             if (bs.intersects)
                 score += 10000.0;
@@ -2166,7 +2282,7 @@ static bool tryBoundarySafeCandidate(
     };
 
     auto add_endpoint_opening_candidates = [&]() {
-        constexpr double endpoint_match_tol = 0.35;
+        constexpr double endpoint_match_tol = 2.0;
         std::vector<Vec2d> entry_open_knots;
         std::vector<Vec2d> exit_open_knots;
         for (const auto& bnd : violated_boundaries) {
@@ -2258,6 +2374,34 @@ static bool tryBoundarySafeCandidate(
                         }
                     }
                 }
+                // 斜向直行从 RoadEdge 首端外侧进入时，短开口不足以越过
+                // 首端与入口连接点之间的间隙。补充一组有界的长开口，沿
+                // 入口切向前进并在法向上小幅偏置，避免把曲线直接压进
+                // 边缘折线；候选仍经过统一物理/形态/同簇门禁。
+                for (double lead : {6.0, 7.5, 9.0, 10.5}) {
+                    for (double side : {-4.0, -2.5, 0.0, 2.5, 4.0}) {
+                        Vec2d knot = p0 + T0 * lead + normal * side;
+                        entry_open_knots.push_back(knot);
+                        Vec2d to_knot = knot - p0;
+                        Vec2d to_exit = p1 - knot;
+                        if (to_knot.norm() < 1e-8 || to_exit.norm() < 1e-8)
+                            continue;
+                        std::vector<Vec2d> mid_tans = {
+                            to_exit.normalized(),
+                            (to_knot.normalized() + to_exit.normalized()).norm() > 1e-8
+                                ? (to_knot.normalized() + to_exit.normalized()).normalized()
+                                : chord_dir,
+                            chord_dir};
+                        for (const auto& mt : mid_tans) {
+                            for (double alpha : {0.12, 0.18, 0.24, 0.30, 0.36, 0.42}) {
+                                BezierCurve candidate;
+                                candidate.segs.push_back(makeCubicG1(p0, T0, knot, mt, alpha));
+                                candidate.segs.push_back(makeCubicG1(knot, mt, p1, T1, alpha));
+                                consider(candidate, 3.0 + lead + std::abs(side), true);
+                            }
+                        }
+                    }
+                }
             };
 
             if ((p1 - first).norm() <= endpoint_match_tol)
@@ -2323,7 +2467,7 @@ static bool tryBoundarySafeCandidate(
                     if (mt.norm() < 1e-8)
                         mt = chord_dir;
                     mt.normalize();
-                    for (double alpha : {0.12, 0.18, 0.24, 0.30}) {
+                    for (double alpha : {0.12, 0.18, 0.24, 0.30, 0.34, 0.38, 0.42}) {
                         BezierCurve candidate;
                         candidate.segs.push_back(makeCubicG1(p0, T0, knot, mt, alpha));
                         candidate.segs.push_back(makeCubicG1(knot, mt, p1, T1, alpha));
@@ -5875,10 +6019,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                          turn_a, turn_b, p.exempt));
                 if (!participates)
                     continue;
-                bool same_side_turn_pair =
-                    turn_a >= 0.25 && turn_b >= 0.25 &&
-                    signed_a * signed_b > 0.0;
-                (void)same_side_turn_pair;
                 // pair_safe_pairs 全部由共享连接点构造，统一走审计口径，
                 // 避免近端点数值穿插被记成真实交叉后污染 cand_cross 排序。
                 const double pair_tol = kSharedEndpointPairCrossTol;
@@ -7827,10 +7967,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     return a->id < b->id;
                 });
 
-            std::unordered_set<ConnId> family_ids;
             std::unordered_map<ConnId, std::size_t> family_index;
             for (std::size_t i = 0; i < family.size(); ++i) {
-                family_ids.insert(family[i]->id);
                 family_index[family[i]->id] = i;
             }
             const auto baseline_index = resultIndexById(results);
@@ -8024,29 +8162,25 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 external_pools;
             std::unordered_map<ConnId, std::size_t> external_index;
             bool external_pool_empty = false;
-            for (std::size_t ei = 0; ei < external_ids.size(); ++ei) {
-                const ConnId& external_id = external_ids[ei];
-                external_index[external_id] = ei;
+            const auto build_external_pool =
+                [&](const ConnId& external_id, bool require_ordinary) {
                 const Connectivity* external_conn =
                     scene.view.connectivity(external_id);
                 const auto baseline_external = baseline_index.find(external_id);
                 if (!external_conn || baseline_external == baseline_index.end() ||
                     !results[baseline_external->second].curve ||
-                    external_conn->fixed_shape ||
-                    isGeometricUTurnConn(*external_conn, input)) {
-                    external_pool_empty = true;
-                    break;
-                }
+                    (require_ordinary &&
+                     (external_conn->fixed_shape ||
+                      isGeometricUTurnConn(*external_conn, input))))
+                    return false;
                 const auto entry = scene.view.entryFrame(
                     external_conn->entry_lane_id);
                 const auto exit_ = scene.view.exitFrame(
                     external_conn->exit_lane_id);
                 const Vec2d chord = exit_.first - entry.first;
                 if (chord.norm() < 1e-8 || entry.second.norm() < 1e-8 ||
-                    exit_.second.norm() < 1e-8) {
-                    external_pool_empty = true;
-                    break;
-                }
+                    exit_.second.norm() < 1e-8)
+                    return false;
                 const double turn_strength = std::abs(cross2d(
                     entry.second.normalized(), chord.normalized()));
                 const OrdinaryCurveInitializer ordinary_initializer;
@@ -8060,22 +8194,99 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     trials.push_back(ordinary_initializer.buildSingleCubic(
                         entry.first, entry.second, exit_.first, exit_.second,
                         alpha));
+                // U-turn 家族的外部普通曲线不能只试少数对称 alpha：复杂
+                // Boundary 下，近直行 65 的合法 RoadEdge 走廊落在中等首把手、
+                // 短尾把手的非对称区域。该候选仍保持单段 G1 轴向控制点，随后
+                // 经过与其它外部候选完全相同的形态、物理和同簇联合验收。
+                const OrdinarySingleCubicHandleBounds external_bounds =
+                    ordinarySingleCubicHandleBounds(
+                        entry.first, entry.second, exit_.first, exit_.second,
+                        false);
+                const std::vector<double> external_fractions = {
+                    0.02, 0.06, 0.12, 0.18, 0.20, 0.30, 0.34, 0.38,
+                    0.42, 0.48, 0.68, 0.85, 1.0};
+                for (double f0 : external_fractions) {
+                    for (double f1 : external_fractions) {
+                        BezierSegment segment;
+                        segment.ctrl[0] = entry.first;
+                        segment.ctrl[1] = entry.first +
+                            external_bounds.start_dir * std::max(
+                                external_bounds.start_min,
+                                std::min(external_bounds.start_max,
+                                         f0 * external_bounds.start_max));
+                        segment.ctrl[2] = exit_.first -
+                            external_bounds.end_dir * std::max(
+                                external_bounds.end_min,
+                                std::min(external_bounds.end_max,
+                                         f1 * external_bounds.end_max));
+                        segment.ctrl[3] = exit_.first;
+                        BezierCurve candidate;
+                        candidate.segs.push_back(segment);
+                        trials.push_back(std::move(candidate));
+                    }
+                }
+                const bool allow_waypoint = turn_strength < 0.25 &&
+                    chord.norm() > 15.0;
+                if (allow_waypoint) {
+                    const Vec2d chord_dir = chord.normalized();
+                    const Vec2d perpendicular(-chord_dir.y(), chord_dir.x());
+                    for (double fraction : {0.18, 0.26, 0.34, 0.42, 0.50,
+                                            0.58, 0.66, 0.74, 0.82}) {
+                        const Vec2d base = entry.first + fraction * chord;
+                        for (double offset : {-12.0, -9.0, -6.0, -3.0,
+                                              3.0, 6.0, 9.0, 12.0}) {
+                            const Vec2d waypoint = base + offset * perpendicular;
+                            const Vec2d from_entry = waypoint - entry.first;
+                            const Vec2d to_exit = exit_.first - waypoint;
+                            if (from_entry.norm() < 0.30 || to_exit.norm() < 0.30)
+                                continue;
+                            std::vector<Vec2d> middle_tangents;
+                            if (to_exit.norm() > 1e-8)
+                                middle_tangents.push_back(to_exit.normalized());
+                            if (from_entry.norm() > 1e-8 && to_exit.norm() > 1e-8) {
+                                const Vec2d bisector = from_entry.normalized() +
+                                    to_exit.normalized();
+                                if (bisector.norm() > 1e-8)
+                                    middle_tangents.push_back(bisector.normalized());
+                            }
+                            for (const Vec2d& middle_tangent : middle_tangents)
+                                for (double alpha : {0.12, 0.18, 0.24, 0.30})
+                                    trials.push_back(makeCurveFromKnots(
+                                        {entry.first, waypoint, exit_.first},
+                                        {entry.second, middle_tangent, exit_.second},
+                                        alpha));
+                        }
+                    }
+                }
+                // 同一把手档位经 min/max 钳制后可能产生重复曲线；候选池只保留
+                // 有界前缀，避免多个 U-turn 家族在复杂 Boundary 路口放大回溯。
+                if (trials.size() > (allow_waypoint ? 384u : 192u))
+                    trials.resize(allow_waypoint ? 384u : 192u);
                 std::vector<ExternalCandidate>& pool =
                     external_pools[external_id];
                 for (std::size_t ti = 0; ti < trials.size(); ++ti) {
                     const BezierCurve& trial = trials[ti];
-                    if (trial.empty() || trial.numSegments() != 1 ||
-                        !ordinarySingleCubicControlsValid(
+                    const bool single_cubic = trial.numSegments() == 1;
+                    const bool waypoint_shape = !single_cubic &&
+                        trial.numSegments() == 2 &&
+                        isTwoSegmentOrdinaryWaypointShapeAcceptable(
                             trial, entry.first, entry.second, exit_.first,
-                            exit_.second, 1e-5, true) ||
+                            exit_.second, chord.norm(), turn_strength);
+                    if (trial.empty() ||
+                        (single_cubic && !ordinarySingleCubicControlsValid(
+                            trial, entry.first, entry.second, exit_.first,
+                            exit_.second, 1e-5, true)) ||
+                        (!single_cubic && !waypoint_shape) ||
                         curveSelfIntersectsBusiness(trial, 1.0)) {
                         ++external_shape_rejected;
                         continue;
                     }
-                    const bool shape_valid = turn_strength < 0.25
-                        ? isStraightLikeShapeAcceptable(trial, chord.norm())
-                        : isNonUTurnTurnShapeAcceptable(
-                              trial, chord.norm(), turn_strength);
+                    const bool shape_valid = single_cubic
+                        ? (turn_strength < 0.25
+                            ? isStraightLikeShapeAcceptable(trial, chord.norm())
+                            : isNonUTurnTurnShapeAcceptable(
+                                  trial, chord.norm(), turn_strength))
+                        : waypoint_shape;
                     if (!shape_valid) {
                         ++external_shape_rejected;
                         continue;
@@ -8089,7 +8300,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     candidate.curve = trial;
                     candidate.score = candidate.curve.maxCurvature(30) +
                         0.02 * candidate.curve.arcLength() +
-                        0.01 * static_cast<double>(ti);
+                        0.01 * static_cast<double>(ti) +
+                        (single_cubic ? 0.0 :
+                            kChordBudgetOvershootPenalty *
+                                curveChordBudgetOvershoot(candidate.curve));
                     pool.push_back(std::move(candidate));
                 }
                 std::stable_sort(
@@ -8097,13 +8311,99 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     [](const ExternalCandidate& a, const ExternalCandidate& b) {
                         return a.score < b.score;
                     });
-                if (isgProfile())
-                    fprintf(stderr,
-                            "[ISG_PROFILE] U-turn family %s external %s pool=%zu trials=%zu shape_rejected=%zu physical_rejected=%zu\n",
-                            family.front()->id.c_str(), external_id.c_str(),
-                            pool.size(), trials.size(), external_shape_rejected,
-                            external_physical_rejected);
-                if (pool.empty())
+                if (isgProfile()) {
+                    if (require_ordinary)
+                        fprintf(stderr,
+                                "[ISG_PROFILE] U-turn family %s external %s pool=%zu trials=%zu shape_rejected=%zu physical_rejected=%zu\n",
+                                family.front()->id.c_str(), external_id.c_str(),
+                                pool.size(), trials.size(), external_shape_rejected,
+                                external_physical_rejected);
+                    else
+                        fprintf(stderr,
+                                "[ISG_PROFILE] U-turn secondary external %s pool=%zu trials=%zu shape_rejected=%zu physical_rejected=%zu\n",
+                                external_id.c_str(), pool.size(), trials.size(),
+                                external_shape_rejected, external_physical_rejected);
+                }
+                return !pool.empty();
+            };
+            for (std::size_t ei = 0; ei < external_ids.size(); ++ei) {
+                const ConnId& external_id = external_ids[ei];
+                external_index[external_id] = ei;
+                if (!build_external_pool(external_id, true))
+                    external_pool_empty = true;
+            }
+
+            // 外部候选只要有一部分被某个同端点普通连接挡住，就把该连接
+            // 加入同一个原子闭包。候选的可行域可能被不同邻居分割：110003285
+            // 的 65 正是单段候选被 19 挡住、两段候选又被 64 挡住；要求“全部
+            // 候选都被同一邻居挡住”会漏掉这类约束网络。这里只扩张有限数量
+            // 的实际阻塞邻居，联合搜索仍有明确上限。
+            const std::size_t seed_external_count = external_ids.size();
+            std::vector<ConnId> secondary_external_ids;
+            constexpr std::size_t kMaxUTurnSecondaryExternal = 1;
+            for (std::size_t seed_index = 0;
+                 seed_index < seed_external_count &&
+                 secondary_external_ids.size() < kMaxUTurnSecondaryExternal;
+                 ++seed_index) {
+                const ConnId& seed_id = external_ids[seed_index];
+                const auto seed_pool = external_pools.find(seed_id);
+                const auto seed_result = baseline_index.find(seed_id);
+                if (seed_pool == external_pools.end() ||
+                    seed_pool->second.empty() ||
+                    seed_result == baseline_index.end() ||
+                    !results[seed_result->second].curve)
+                    continue;
+                for (const auto& pair : cluster_solver_.pairs()) {
+                    if (pair.exempt != CrossExemption::None ||
+                        !pair.shared_endpoint)
+                        continue;
+                    const bool seed_is_a = pair.id_a == seed_id;
+                    const bool seed_is_b = pair.id_b == seed_id;
+                    if (seed_is_a == seed_is_b)
+                        continue;
+                    const ConnId& neighbor_id = seed_is_a ? pair.id_b : pair.id_a;
+                    if (family_index.count(neighbor_id) ||
+                        external_index.count(neighbor_id) ||
+                        std::find(secondary_external_ids.begin(),
+                                  secondary_external_ids.end(), neighbor_id) !=
+                            secondary_external_ids.end())
+                        continue;
+                    const Connectivity* neighbor = scene.view.connectivity(neighbor_id);
+                    const auto baseline_neighbor = baseline_index.find(neighbor_id);
+                    if (!neighbor || baseline_neighbor == baseline_index.end() ||
+                        !results[baseline_neighbor->second].curve ||
+                        neighbor->fixed_shape ||
+                        isGeometricUTurnConn(*neighbor, input))
+                        continue;
+                    bool has_blocked_candidate = false;
+                    for (const ExternalCandidate& candidate : seed_pool->second) {
+                        if (!curvesHaveForbiddenSameClusterIntersection(
+                                candidate.curve,
+                                *results[baseline_neighbor->second].curve,
+                                kClusterEndpointTol)) {
+                            continue;
+                        }
+                        has_blocked_candidate = true;
+                        break;
+                    }
+                    if (has_blocked_candidate) {
+                        secondary_external_ids.push_back(neighbor_id);
+                        if (secondary_external_ids.size() >=
+                            kMaxUTurnSecondaryExternal)
+                            break;
+                    }
+                }
+            }
+            std::sort(secondary_external_ids.begin(),
+                      secondary_external_ids.end());
+            external_ids.insert(external_ids.end(), secondary_external_ids.begin(),
+                                secondary_external_ids.end());
+            external_index.clear();
+            for (std::size_t ei = 0; ei < external_ids.size(); ++ei)
+                external_index[external_ids[ei]] = ei;
+
+            for (const ConnId& external_id : secondary_external_ids) {
+                if (!build_external_pool(external_id, false))
                     external_pool_empty = true;
             }
             if (external_pool_empty)
@@ -8120,7 +8420,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     return curvesHaveForbiddenSameClusterIntersection(
                         original_a, original_b, kConnectionPointTolerance);
                 };
-
             // 存指针而不是拷贝：候选自带 BezierCurve，回溯每次迭代都整体
             // 赋值会带来数千万次向量堆分配。候选池在搜索期间不再变动，
             // 指针始终有效。
@@ -8214,6 +8513,230 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             family.front()->id.c_str());
                 continue;
             }
+
+            // 先做有界的弧一致性过滤，再进入家族回溯。外部普通候选和 U-turn
+            // 候选的可行域经常被不同邻居分别切开；如果把这些候选全部交给
+            // 深度优先搜索，会重复走过大量没有支撑的组合，甚至触发节点上限。
+            // 这里仅删除“对某个受约束变量完全没有兼容候选”的值，不改变任何
+            // 约束口径；最终提交前仍由完整的家族/外部联合验收再次复核。
+            const auto nonstructuralPair = [&](const ConnId& a,
+                                               const ConnId& b) {
+                return cluster_solver_.pairExists(a, b) &&
+                    cluster_solver_.exemptionOf(a, b) !=
+                        CrossExemption::StructuralCross;
+            };
+            const std::vector<std::vector<FamilyCandidate>> family_domains =
+                pools;
+            std::vector<std::vector<ExternalCandidate>> external_domains(
+                external_ids.size());
+            for (std::size_t ei = 0; ei < external_ids.size(); ++ei)
+                external_domains[ei] = external_pools[external_ids[ei]];
+            std::vector<std::vector<std::uint8_t>> family_active(family.size());
+            for (std::size_t fi = 0; fi < family.size(); ++fi)
+                family_active[fi].assign(family_domains[fi].size(), 1);
+            std::vector<std::vector<std::uint8_t>> external_active(
+                external_ids.size());
+            for (std::size_t ei = 0; ei < external_ids.size(); ++ei)
+                external_active[ei].assign(external_domains[ei].size(), 1);
+
+            std::vector<std::vector<std::uint8_t>> family_family_memo(
+                family.size() * family.size());
+            const auto familyFamilyForbidden =
+                [&](std::size_t fi, std::size_t fci, std::size_t fj,
+                    std::size_t fcj) {
+                    std::vector<std::uint8_t>& table =
+                        family_family_memo[fi * family.size() + fj];
+                    if (table.empty())
+                        table.assign(family_domains[fi].size() *
+                                         family_domains[fj].size(), 0);
+                    std::uint8_t& cell = table[
+                        fci * family_domains[fj].size() + fcj];
+                    if (cell == 0)
+                        cell = family_pair_forbidden(
+                                   family_domains[fi][fci].curve,
+                                   family_domains[fj][fcj].curve)
+                            ? 2 : 1;
+                    return cell == 2;
+                };
+            std::vector<std::vector<std::uint8_t>> family_external_memo(
+                family.size() * external_ids.size());
+            const auto familyExternalForbidden =
+                [&](std::size_t fi, std::size_t fci, std::size_t ei,
+                    std::size_t eci) {
+                    std::vector<std::uint8_t>& table =
+                        family_external_memo[fi * external_ids.size() + ei];
+                    if (table.empty())
+                        table.assign(family_domains[fi].size() *
+                                         external_domains[ei].size(), 0);
+                    std::uint8_t& cell = table[
+                        fci * external_domains[ei].size() + eci];
+                    if (cell == 0)
+                        cell = curvesHaveForbiddenSameClusterIntersection(
+                                   family_domains[fi][fci].curve,
+                                   external_domains[ei][eci].curve,
+                                   kClusterEndpointTol)
+                            ? 2 : 1;
+                    return cell == 2;
+                };
+            std::vector<std::vector<std::uint8_t>> external_external_memo(
+                external_ids.size() * external_ids.size());
+            const auto externalExternalForbidden =
+                [&](std::size_t ei, std::size_t eci, std::size_t ej,
+                    std::size_t ecj) {
+                    std::vector<std::uint8_t>& table =
+                        external_external_memo[ei * external_ids.size() + ej];
+                    if (table.empty())
+                        table.assign(external_domains[ei].size() *
+                                         external_domains[ej].size(), 0);
+                    std::uint8_t& cell = table[
+                        eci * external_domains[ej].size() + ecj];
+                    if (cell == 0)
+                        cell = curvesHaveForbiddenSameClusterIntersection(
+                                   external_domains[ei][eci].curve,
+                                   external_domains[ej][ecj].curve,
+                                   kClusterEndpointTol)
+                            ? 2 : 1;
+                    return cell == 2;
+                };
+            const auto familyHasSupport = [&](std::size_t fi,
+                                              std::size_t fci,
+                                              std::size_t fj,
+                                              const std::vector<std::vector<
+                                                  std::uint8_t>>& active) {
+                for (std::size_t fcj = 0; fcj < family_domains[fj].size(); ++fcj)
+                    if (active[fj][fcj] &&
+                        !familyFamilyForbidden(fi, fci, fj, fcj))
+                        return true;
+                return false;
+            };
+            const auto familyExternalHasSupport =
+                [&](std::size_t fi, std::size_t fci, std::size_t ei,
+                    const std::vector<std::vector<std::uint8_t>>& active) {
+                    for (std::size_t eci = 0; eci < external_domains[ei].size();
+                         ++eci)
+                        if (active[ei][eci] &&
+                            !familyExternalForbidden(fi, fci, ei, eci))
+                            return true;
+                    return false;
+                };
+            const auto externalFamilyHasSupport =
+                [&](std::size_t ei, std::size_t eci, std::size_t fi,
+                    const std::vector<std::vector<std::uint8_t>>& active) {
+                    for (std::size_t fci = 0; fci < family_domains[fi].size();
+                         ++fci)
+                        if (active[fi][fci] &&
+                            !familyExternalForbidden(fi, fci, ei, eci))
+                            return true;
+                    return false;
+                };
+            const auto externalExternalHasSupport =
+                [&](std::size_t ei, std::size_t eci, std::size_t ej,
+                    const std::vector<std::vector<std::uint8_t>>& active) {
+                    for (std::size_t ecj = 0; ecj < external_domains[ej].size();
+                         ++ecj)
+                        if (active[ej][ecj] &&
+                            !externalExternalForbidden(ei, eci, ej, ecj))
+                            return true;
+                    return false;
+                };
+            for (int ac3_round = 0; ac3_round < 4; ++ac3_round) {
+                bool changed = false;
+                std::vector<std::vector<std::uint8_t>> next_family =
+                    family_active;
+                std::vector<std::vector<std::uint8_t>> next_external =
+                    external_active;
+                for (std::size_t fi = 0; fi < family.size(); ++fi) {
+                    for (std::size_t fci = 0; fci < family_domains[fi].size();
+                         ++fci) {
+                        if (!family_active[fi][fci])
+                            continue;
+                        bool supported = true;
+                        for (std::size_t fj = 0; fj < family.size() && supported;
+                             ++fj) {
+                            if (fi != fj &&
+                                !familyHasSupport(fi, fci, fj, family_active))
+                                supported = false;
+                        }
+                        for (std::size_t ei = 0;
+                             ei < external_ids.size() && supported; ++ei) {
+                            if (nonstructuralPair(
+                                    family[fi]->id, external_ids[ei]) &&
+                                !familyExternalHasSupport(
+                                    fi, fci, ei, external_active))
+                                supported = false;
+                        }
+                        if (!supported) {
+                            next_family[fi][fci] = 0;
+                            changed = true;
+                        }
+                    }
+                }
+                for (std::size_t ei = 0; ei < external_ids.size(); ++ei) {
+                    for (std::size_t eci = 0; eci < external_domains[ei].size();
+                         ++eci) {
+                        if (!external_active[ei][eci])
+                            continue;
+                        bool supported = true;
+                        for (std::size_t fi = 0;
+                             fi < family.size() && supported; ++fi) {
+                            if (nonstructuralPair(
+                                    family[fi]->id, external_ids[ei]) &&
+                                !externalFamilyHasSupport(
+                                    ei, eci, fi, family_active))
+                                supported = false;
+                        }
+                        for (std::size_t ej = 0;
+                             ej < external_ids.size() && supported; ++ej) {
+                            if (ei != ej &&
+                                nonstructuralPair(external_ids[ei],
+                                                  external_ids[ej]) &&
+                                !externalExternalHasSupport(
+                                    ei, eci, ej, external_active))
+                                supported = false;
+                        }
+                        if (!supported) {
+                            next_external[ei][eci] = 0;
+                            changed = true;
+                        }
+                    }
+                }
+                family_active.swap(next_family);
+                external_active.swap(next_external);
+                if (!changed)
+                    break;
+            }
+            for (std::size_t fi = 0; fi < family.size(); ++fi) {
+                std::vector<FamilyCandidate> kept;
+                for (std::size_t fci = 0; fci < family_domains[fi].size(); ++fci)
+                    if (family_active[fi][fci])
+                        kept.push_back(family_domains[fi][fci]);
+                pools[fi].swap(kept);
+            }
+            for (std::size_t ei = 0; ei < external_ids.size(); ++ei) {
+                std::vector<ExternalCandidate> kept;
+                for (std::size_t eci = 0; eci < external_domains[ei].size(); ++eci)
+                    if (external_active[ei][eci])
+                        kept.push_back(external_domains[ei][eci]);
+                external_pools[external_ids[ei]].swap(kept);
+            }
+            bool ac3_empty = false;
+            for (const auto& pool : pools)
+                ac3_empty = ac3_empty || pool.empty();
+            for (const ConnId& external_id : external_ids)
+                ac3_empty = ac3_empty || external_pools[external_id].empty();
+            if (isgProfile()) {
+                fprintf(stderr, "[ISG_PROFILE] U-turn family %s AC3 pools",
+                        family.front()->id.c_str());
+                for (const auto& pool : pools)
+                    fprintf(stderr, " family=%zu", pool.size());
+                for (const ConnId& external_id : external_ids)
+                    fprintf(stderr, " %s=%zu", external_id.c_str(),
+                            external_pools[external_id].size());
+                fprintf(stderr, "\n");
+            }
+            if (ac3_empty)
+                continue;
+
             // 家族成员两两之间的判定同样只取决于两个候选的下标，回溯里会被
             // 反复重算（74|76 达 111 万次，而不同下标组合最多约 10 万种）。
             // 按需填充三态表：0 未计算 / 1 允许 / 2 禁止。
@@ -8567,7 +9090,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
     // 恢复整族首选单段；只有物理、形态、固定形态和所有外部同簇约束都不恶化
     // 时才整体提交，避免逐条恢复因中间态交叉而互相否决。
     {
-        std::unordered_map<std::string, std::vector<const Connectivity*>> families;
+        std::unordered_map<std::string, std::vector<const Connectivity*>> family_map;
         for (const auto& conn : input.connectivities) {
             if (preserved_fixed_ids.count(conn.id) || conn.fixed_shape ||
                 isGeometricUTurnConn(conn, input))
@@ -8577,8 +9100,23 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 continue;
             const std::string key = conn.entry_lane_id + "\x1f" + conn.exitGroupId +
                 (signed_turn > 0.0 ? "\x1fL" : "\x1fR");
-            families[key].push_back(&conn);
+            family_map[key].push_back(&conn);
         }
+
+        std::vector<std::pair<std::string, std::vector<const Connectivity*>>> families;
+        families.reserve(family_map.size());
+        for (auto& item : family_map) {
+            std::sort(item.second.begin(), item.second.end(),
+                      [](const Connectivity* a, const Connectivity* b) {
+                          return a->id < b->id;
+                      });
+            families.push_back(std::move(item));
+        }
+        std::sort(families.begin(), families.end(),
+                  [](const std::pair<std::string, std::vector<const Connectivity*>>& a,
+                     const std::pair<std::string, std::vector<const Connectivity*>>& b) {
+                      return a.first < b.first;
+                  });
 
         const OrdinaryCurveInitializer ordinary_initializer;
         for (const auto& family_item : families) {
@@ -8859,19 +9397,43 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
     // 交叉或控制多边形前兆的共享入口/出口族建立有限轴上候选池，并一次性回溯
     // 验收整族；候选仍须通过形态、Boundary/Fence、固定形态邻居和同簇外部关系。
     {
-        std::unordered_map<std::string, std::vector<ConnId>> endpoint_families;
+        std::unordered_map<std::string, std::vector<ConnId>> endpoint_family_map;
         auto final_idx = resultIndexById(results);
         for (const auto& conn : input.connectivities) {
             if (preserved_fixed_ids.count(conn.id) || conn.fixed_shape ||
                 isGeometricUTurnConn(conn, input))
                 continue;
             auto ri = final_idx.find(conn.id);
-            if (ri == final_idx.end() || !results[ri->second].curve ||
-                results[ri->second].curve->numSegments() != 1)
+            if (ri == final_idx.end() || !results[ri->second].curve)
                 continue;
-            endpoint_families["entry:" + conn.entry_lane_id].push_back(conn.id);
-            endpoint_families["exit:" + conn.exit_lane_id].push_back(conn.id);
+            // 物理避让可能暂时把近直行连接表达成多段，但这不能把它从
+            // 普通形态/共享端点闭包中永久摘除。只接纳与弦方向近似平行的
+            // 多段普通连接；已有单段转弯照常保留在原有族逻辑中。
+            const auto entry = scene.view.entryFrame(conn.entry_lane_id);
+            const auto exit_ = scene.view.exitFrame(conn.exit_lane_id);
+            const Vec2d chord = exit_.first - entry.first;
+            const Vec2d t0 = entry.second.norm() > 1e-8
+                ? entry.second.normalized() : chord.normalized();
+            const bool is_single = results[ri->second].curve->numSegments() == 1;
+            if (chord.norm() < 1e-8 ||
+                (!is_single &&
+                 std::abs(cross2d(t0, chord.normalized())) > 0.25))
+                continue;
+            endpoint_family_map["entry:" + conn.entry_lane_id].push_back(conn.id);
+            endpoint_family_map["exit:" + conn.exit_lane_id].push_back(conn.id);
         }
+
+        std::vector<std::pair<std::string, std::vector<ConnId>>> endpoint_families;
+        endpoint_families.reserve(endpoint_family_map.size());
+        for (auto& item : endpoint_family_map) {
+            std::sort(item.second.begin(), item.second.end());
+            endpoint_families.push_back(std::move(item));
+        }
+        std::sort(endpoint_families.begin(), endpoint_families.end(),
+                  [](const std::pair<std::string, std::vector<ConnId>>& a,
+                     const std::pair<std::string, std::vector<ConnId>>& b) {
+                      return a.first < b.first;
+                  });
 
         struct StrictOrdinaryCandidate {
             BezierCurve curve;
@@ -8901,7 +9463,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
         // 100000443 的连接 9 所需的约 0.42 比例；不扩大三元以上族的
         // 组合空间。
         const std::vector<double> long_pair_handle_fractions = {
-            0.36, 0.40, 0.418, 0.41812, 0.42, 0.44, 0.46};
+            0.14, 0.16, 0.17, 0.18, 0.19, 0.20,
+            0.30, 0.32, 0.33, 0.34, 0.35, 0.36,
+            0.38, 0.40, 0.418, 0.41812, 0.42, 0.44, 0.46};
         // 族级保序参照形态：普通转向的首选单段表达（转向按端点方向交点距离
         // 的 2/3 升阶，见 OrdinaryCurveInitializer::buildPreferredSingleCubic）
         // 只由本成员自身的端点位置与切向决定，与生成次序、兄弟形态和优化器
@@ -9038,8 +9602,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 if (ri == final_idx.end() || !results[ri->second].curve ||
                     !conn || conn->fixed_shape ||
                     preserved_fixed_ids.count(id) ||
-                    isGeometricUTurnConn(*conn, input) ||
-                    results[ri->second].curve->numSegments() != 1)
+                    isGeometricUTurnConn(*conn, input))
                     return false;
                 const auto entry = scene.view.entryFrame(conn->entry_lane_id);
                 const auto exit_ = scene.view.exitFrame(conn->exit_lane_id);
@@ -9069,7 +9632,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     (current.segs.front().ctrl[1] - entry.first).dot(
                         bounds.start_dir);
                 const double current_h1 =
-                    (exit_.first - current.segs.front().ctrl[2]).dot(
+                    (exit_.first - current.segs.back().ctrl[2]).dot(
                         bounds.end_dir);
                 if (bounds.start_max > 0.05 && std::isfinite(current_h0))
                     fractions.push_back(std::max(
@@ -9084,6 +9647,30 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 std::size_t control_rejects = 0;
                 std::size_t shape_rejects = 0;
                 std::size_t physical_rejects = 0;
+                // 闭包扩张可能把上一轮已经通过联合物理/形态审计的近直行
+                // 两段曲线纳入变量（110003285 的 64）。保留它作为基线候选，
+                // 让新闭包只改变确有必要的成员；该候选仍需再次通过完整物理
+                // 审计和闭包内外的精确相交验收。
+                bool current_baseline_admissible = false;
+                if (current.numSegments() == 2 && chord.norm() > 15.0 &&
+                    turn_strength <= 0.25) {
+                    const bool current_shape_ok =
+                        isTwoSegmentOrdinaryWaypointShapeAcceptable(
+                            current, entry.first, t0, exit_.first, t1,
+                            chord.norm(), turn_strength);
+                    const bool current_self_cross =
+                        curveSelfIntersectsBusiness(current, 1.0);
+                    const bool current_physical_risk =
+                        strictCandidateHasExactPhysicalRisk(current);
+                    current_baseline_admissible = current_shape_ok &&
+                        !current_self_cross && !current_physical_risk;
+                }
+                if (current_baseline_admissible) {
+                    StrictOrdinaryCandidate item;
+                    item.curve = current;
+                    item.score = -0.5;
+                    pending.push_back(std::move(item));
+                }
                 {
                     // 参照形态排在闭包池首位，理由见
                     // strict_natural_reference_candidate 的说明。
@@ -9171,20 +9758,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     out.push_back(std::move(item));
                     if (out.size() >= max_candidates)
                         break;
-                }
-                if (isgDebugPairRepair() && (id == "5" || id == "9" || id == "38")) {
-                    fprintf(stderr,
-                            "[STRICT-CLOSURE-POOL] id=%s limit=%zu controls=%zu shape=%zu physical=%zu pending=%zu out=%zu handles=",
-                            id.c_str(), max_candidates, control_rejects,
-                            shape_rejects, physical_rejects, pending.size(),
-                            out.size());
-                    for (const auto& item : out) {
-                        const auto& g = item.curve.segs.front().ctrl;
-                        fprintf(stderr, "%.3f/%.3f,",
-                                (g[1] - g[0]).norm(),
-                                (g[3] - g[2]).norm());
-                    }
-                    fprintf(stderr, "\n");
                 }
                 return !out.empty();
             };
@@ -9362,7 +9935,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
             for (std::size_t fi = 0; fi < family.size() && pools_valid; ++fi) {
                 int debug_shape_reject = 0;
                 int debug_physical_reject = 0;
-                int debug_external_reject = 0;
                 int debug_physical_boundary = 0;
                 int debug_physical_fence = 0;
                 int debug_physical_obstacle = 0;
@@ -9394,7 +9966,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 const double current_h0 =
                     (current.segs.front().ctrl[1] - entry.first).dot(bounds.start_dir);
                 const double current_h1 =
-                    (exit_.first - current.segs.front().ctrl[2]).dot(bounds.end_dir);
+                    (exit_.first - current.segs.back().ctrl[2]).dot(bounds.end_dir);
 
                 std::vector<double> member_fractions = handle_fractions;
                 if (chord.norm() <= 15.0)
@@ -9441,7 +10013,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         for (const auto& existing : pending) {
                             const auto& g = existing.curve.segs.front().ctrl;
                             const double existing_h0 = (g[1] - g[0]).norm();
-                            const double existing_h1 = (g[3] - g[2]).norm();
+                            const double existing_h1 =
+                                (existing.curve.segs.back().ctrl[3] -
+                                 existing.curve.segs.back().ctrl[2]).norm();
                             if (std::abs(existing_h0 - h0) <= 1e-7 &&
                                 std::abs(existing_h1 - h1) <= 1e-7) {
                                 duplicate_handle = true;
@@ -9533,7 +10107,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             "[STRICT-FAMILY] %s member=%s rejects shape=%d physical=%d external=%d pool=%zu\n",
                             family_item.first.c_str(), family[fi].c_str(),
                             debug_shape_reject, debug_physical_reject,
-                            debug_external_reject, pools[fi].size());
+                            0, pools[fi].size());
                     if (family[fi] == "5")
                         fprintf(stderr,
                                 "[STRICT-FAMILY-PHYSICAL] %s member=5 boundary=%d fence=%d obstacle=%d\n",
@@ -9611,9 +10185,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     queue.pop();
                     const auto& a = pools[0][item.first];
                     const auto& b = pools[1][item.second];
-                    if (!sharedEndpointControlPolylinesCross(
-                            a.curve, b.curve, kClusterEndpointTol) &&
-                        !sampledCurvesIntersectBusiness(
+                    // 控制折线互穿只是扇出曲线的保序前兆，不等价于真实
+                    // Bezier 曲线相交。长首换道弧 14|24 正是控制折线交叉、
+                    // 实际曲线已分离的合法组合；这里不能把它从兼容池硬删。
+                    if (!sampledCurvesIntersectBusiness(
                             a.sampled, b.sampled,
                             kOrdinaryFamilyCurveCrossTol)) {
                         CompatiblePair pair;
@@ -9828,12 +10403,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             const BezierCurve& a = pools[i][ci].curve;
                             const BezierCurve& b = pools[j][cj].curve;
                             matrix[ci * pools[j].size() + cj] =
-                                (sampledCurvesIntersectBusiness(
-                                     pools[i][ci].sampled,
-                                     pools[j][cj].sampled,
-                                     kOrdinaryFamilyCurveCrossTol) ||
-                                 sharedEndpointControlPolylinesCross(
-                                     a, b, kClusterEndpointTol)) ? 1 : 0;
+                                sampledCurvesIntersectBusiness(
+                                    pools[i][ci].sampled,
+                                    pools[j][cj].sampled,
+                                    kOrdinaryFamilyCurveCrossTol) ? 1 : 0;
                         }
                     }
                 }
@@ -9861,8 +10434,8 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
 
             auto exact_combination_is_clean = [&]() {
                 // 采样矩阵用于搜索剪枝，但不能成为最终准入依据。对已选
-                // 族内组合逐对执行与输出审计相同的精确业务判定，并检查
-                // 共享端点控制折线前兆。
+                // 族内组合逐对执行与输出审计相同的精确业务判定。控制折线
+                // 互穿只用于候选排序，不在这里冒充真实几何相交。
                 for (std::size_t i = 0; i < family.size(); ++i) {
                     for (std::size_t j = i + 1; j < family.size(); ++j) {
                         if (!strict_family_pair_required(family[i], family[j]))
@@ -9870,9 +10443,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         const BezierCurve& a = pools[i][selected_index[i]].curve;
                         const BezierCurve& b = pools[j][selected_index[j]].curve;
                         if (curvesIntersectBusiness(
-                                a, b, kOrdinaryFamilyCurveCrossTol) ||
-                            sharedEndpointControlPolylinesCross(
-                                a, b, kClusterEndpointTol))
+                                a, b, kOrdinaryFamilyCurveCrossTol))
                             return false;
                     }
                 }
@@ -9894,10 +10465,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         pools[fi][selected_index[fi]].curve;
                     const BezierCurve& other = *results[oi->second].curve;
                     if (curvesIntersectBusiness(
-                            candidate, other, kOrdinaryFamilyCurveCrossTol) ||
-                        (pair.shared_endpoint &&
-                         sharedEndpointControlPolylinesCross(
-                             candidate, other, kClusterEndpointTol)))
+                            candidate, other, kOrdinaryFamilyCurveCrossTol))
                         return false;
                 }
                 return true;
@@ -10029,11 +10597,31 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 auto is_movable_closure_member = [&](const ConnId& id) {
                     const Connectivity* conn = scene.view.connectivity(id);
                     auto ri = final_idx.find(id);
-                    return conn && ri != final_idx.end() &&
-                        results[ri->second].curve && !conn->fixed_shape &&
-                        !preserved_fixed_ids.count(id) &&
-                        !isGeometricUTurnConn(*conn, input) &&
-                        results[ri->second].curve->numSegments() == 1;
+                    if (!conn || ri == final_idx.end() ||
+                        !results[ri->second].curve || conn->fixed_shape ||
+                        preserved_fixed_ids.count(id) ||
+                        isGeometricUTurnConn(*conn, input))
+                        return false;
+                    const BezierCurve& current = *results[ri->second].curve;
+                    if (current.numSegments() == 1)
+                        return true;
+                    // 已经由物理/同簇联合搜索得到的近直行两段曲线也是
+                    // 可变闭包成员。只有这种长弦、近直行且当前形态本身合格
+                    // 的曲线允许再次进入闭包，转弯和掉头多段形态仍保持固定。
+                    if (current.numSegments() != 2)
+                        return false;
+                    const auto entry = scene.view.entryFrame(conn->entry_lane_id);
+                    const auto exit_ = scene.view.exitFrame(conn->exit_lane_id);
+                    const Vec2d chord = exit_.first - entry.first;
+                    if (chord.norm() <= 15.0 || entry.second.norm() < 1e-8 ||
+                        exit_.second.norm() < 1e-8)
+                        return false;
+                    const double turn_strength = std::abs(cross2d(
+                        entry.second.normalized(), chord.normalized()));
+                    return turn_strength <= 0.25 &&
+                        isTwoSegmentOrdinaryWaypointShapeAcceptable(
+                            current, entry.first, entry.second, exit_.first,
+                            exit_.second, chord.norm(), turn_strength);
                 };
                 std::unordered_map<ConnId, std::vector<const CurvePair*>>
                     strict_pair_neighbors;
@@ -10054,6 +10642,73 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         if (wide_it != strict_wide_pools.end()) {
                             closure_pools.emplace(
                                 closure_ids[ci], wide_it->second);
+                            // 宽池建立在上一阶段的单段轴向候选上；若该成员
+                            // 已被 Boundary 避让产生了合法两段曲线，不能因复用
+                            // 宽池而丢掉这条当前基线。否则闭包会被迫把 64/65
+                            // 重新压回单段，后续只是在错误形态上继续联调。
+                            auto& reused_pool =
+                                closure_pools.at(closure_ids[ci]);
+                            const Connectivity* baseline_conn =
+                                scene.view.connectivity(closure_ids[ci]);
+                            const auto baseline_ri =
+                                final_idx.find(closure_ids[ci]);
+                            if (baseline_conn && baseline_ri != final_idx.end() &&
+                                results[baseline_ri->second].curve &&
+                                results[baseline_ri->second].curve->numSegments() == 2) {
+                                const BezierCurve& baseline =
+                                    *results[baseline_ri->second].curve;
+                                const auto baseline_entry = scene.view.entryFrame(
+                                    baseline_conn->entry_lane_id);
+                                const auto baseline_exit = scene.view.exitFrame(
+                                    baseline_conn->exit_lane_id);
+                                const Vec2d baseline_chord =
+                                    baseline_exit.first - baseline_entry.first;
+                                const Vec2d baseline_t0 =
+                                    baseline_entry.second.norm() > 1e-8
+                                    ? baseline_entry.second.normalized()
+                                    : baseline_chord.normalized();
+                                const Vec2d baseline_t1 =
+                                    baseline_exit.second.norm() > 1e-8
+                                    ? baseline_exit.second.normalized()
+                                    : baseline_chord.normalized();
+                                const double baseline_turn =
+                                    baseline_chord.norm() > 1e-8
+                                    ? std::abs(cross2d(
+                                          baseline_t0,
+                                          baseline_chord.normalized()))
+                                    : 1.0;
+                                const bool baseline_admissible =
+                                    baseline_chord.norm() > 15.0 &&
+                                    baseline_turn <= 0.25 &&
+                                    isTwoSegmentOrdinaryWaypointShapeAcceptable(
+                                        baseline, baseline_entry.first,
+                                        baseline_t0, baseline_exit.first,
+                                        baseline_t1, baseline_chord.norm(),
+                                        baseline_turn) &&
+                                    !curveSelfIntersectsBusiness(baseline, 1.0) &&
+                                    !strictCandidateHasExactPhysicalRisk(baseline);
+                                if (baseline_admissible) {
+                                    const std::string baseline_key =
+                                        strict_curve_key(baseline);
+                                    bool duplicate = false;
+                                    for (const auto& existing : reused_pool) {
+                                        if (strict_curve_key(existing.curve) ==
+                                            baseline_key) {
+                                            duplicate = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!duplicate) {
+                                        StrictOrdinaryCandidate baseline_item;
+                                        baseline_item.curve = baseline;
+                                        baseline_item.sampled =
+                                            sampleStrictPairCurve(baseline_item.curve);
+                                        baseline_item.score = -0.5;
+                                        reused_pool.push_back(
+                                            std::move(baseline_item));
+                                    }
+                                }
+                            }
                             continue;
                         }
                         std::vector<StrictOrdinaryCandidate> pool;
@@ -10106,7 +10761,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     const Vec2d t1 = exit_.second.normalized();
                     const double turn_strength = std::abs(
                         cross2d(t0, chord.normalized()));
-                    if (turn_strength > 0.25)
+                    // 严格闭包的路点回退也可服务于中等浅转向（如 4），
+                    // 但不把急转向变成通用多段搜索。最终候选仍由转向分支
+                    // 的弧长、曲率、单向转角和横向偏差门禁控制。
+                    if (turn_strength > 0.60)
                         return false;
 
                     const Vec2d perpendicular(
@@ -10114,10 +10772,16 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     const std::vector<double> fractions = {
                         0.18, 0.22, 0.26, 0.30, 0.35, 0.40, 0.46,
                         0.54, 0.60, 0.65, 0.70, 0.76, 0.82};
-                    const std::vector<double> offsets = {
-                        -3.0, -2.0, -1.5, -1.0, -0.5,
-                        0.5, 1.0, 1.5, 2.0, 2.5, 3.0};
-                    const std::vector<double> alphas = {0.18, 0.24, 0.30};
+                    const std::vector<double> offsets = turn_strength <= 0.25
+                        ? std::vector<double>{
+                              -3.0, -2.0, -1.5, -1.0, -0.5,
+                              0.5, 1.0, 1.5, 2.0, 2.5, 3.0}
+                        : std::vector<double>{
+                              -9.0, -6.0, -4.0, -3.0, -2.0, -1.0, -0.5,
+                              0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0};
+                    const std::vector<double> alphas = turn_strength <= 0.25
+                        ? std::vector<double>{0.18, 0.24, 0.30}
+                        : std::vector<double>{0.12, 0.18, 0.24, 0.30, 0.36, 0.42};
                     std::vector<StrictOrdinaryCandidate> pending;
                     for (double fraction : fractions) {
                         const Vec2d base = entry.first + fraction * chord;
@@ -10133,10 +10797,12 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                 mid_tangents.push_back(to_exit.normalized());
                             if (from_entry.norm() > 1e-8 && to_exit.norm() > 1e-8) {
                                 const Vec2d bisector =
-                                    from_entry.normalized() + to_exit.normalized();
+                                        from_entry.normalized() + to_exit.normalized();
                                 if (bisector.norm() > 1e-8)
                                     mid_tangents.push_back(bisector.normalized());
                             }
+                            if (turn_strength > 0.25)
+                                mid_tangents.push_back(chord.normalized());
                             for (const Vec2d& mid_tangent : mid_tangents) {
                                 for (double alpha : alphas) {
                                     BezierCurve candidate = makeCurveFromKnots(
@@ -10170,8 +10836,16 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                               });
                     auto& pool = closure_pools[id];
                     constexpr std::size_t kMaxWaypointCandidates = 96;
+                    // 闭包池的单段候选上限并不固定：原始二元族可能只有几条
+                    // RoadEdge 安全单段（110003285 的 68 只有 3 条），大族扩展
+                    // 时也可能是 32/128 条。此前把 512 当成“路点候选起始点”
+                    // 会让小池永远无法加入两段候选，导致已确认存在的有界解根本
+                    // 没有进入闭包矩阵。只在当前池尾追加固定数量，仍保持总候选
+                    // 有界；宽池若已有 512 条也最多再增加 96 条。
+                    const std::size_t waypoint_pool_limit =
+                        pool.size() + kMaxWaypointCandidates;
                     for (auto& item : pending) {
-                        if (pool.size() >= 512 + kMaxWaypointCandidates)
+                        if (pool.size() >= waypoint_pool_limit)
                             break;
                         const std::string key = strict_curve_key(item.curve);
                         bool duplicate = false;
@@ -10188,35 +10862,47 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         fprintf(stderr,
                                 "[STRICT-WAYPOINT-POOL] id=%s added=%zu total=%zu\n",
                                 id.c_str(), pool.size() -
-                                    std::min<std::size_t>(pool.size(), 512),
+                                    std::min<std::size_t>(pool.size(),
+                                                          waypoint_pool_limit -
+                                                              kMaxWaypointCandidates),
                                 pool.size());
-                    return pool.size() > 512;
+                    return pool.size() > waypoint_pool_limit -
+                        kMaxWaypointCandidates;
                 };
 
                 std::unordered_set<ConnId> waypoint_targets;
+                std::unordered_set<ConnId> waypoint_expanded_ids;
                 const auto closure_contains = [&](const ConnId& id) {
                     return closure_id_set.count(id) != 0;
                 };
-                const auto choose_waypoint_target = [&](const ConnId& a,
-                                                        const ConnId& b) {
-                    const auto is_eligible = [&](const ConnId& id) {
-                        if (!is_movable_closure_member(id))
-                            return false;
-                        const Connectivity* conn = scene.view.connectivity(id);
-                        if (!conn)
-                            return false;
-                        const auto entry = scene.view.entryFrame(conn->entry_lane_id);
-                        const auto exit_ = scene.view.exitFrame(conn->exit_lane_id);
-                        const Vec2d chord = exit_.first - entry.first;
-                        return chord.norm() > 15.0 && entry.second.norm() > 1e-8 &&
-                            std::abs(cross2d(entry.second.normalized(),
-                                              chord.normalized())) <= 0.25;
-                    };
-                    if (is_eligible(a))
-                        return a;
-                    if (is_eligible(b))
-                        return b;
-                    return ConnId();
+                const auto is_waypoint_eligible = [&](const ConnId& id) {
+                    if (!is_movable_closure_member(id))
+                        return false;
+                    const Connectivity* conn = scene.view.connectivity(id);
+                    const auto ri = final_idx.find(id);
+                    if (!conn)
+                        return false;
+                    const auto entry = scene.view.entryFrame(conn->entry_lane_id);
+                    const auto exit_ = scene.view.exitFrame(conn->exit_lane_id);
+                    const Vec2d chord = exit_.first - entry.first;
+                    if (chord.norm() <= 15.0 || entry.second.norm() <= 1e-8 ||
+                        exit_.second.norm() <= 1e-8)
+                        return false;
+                    const double turn_strength = std::abs(
+                        cross2d(entry.second.normalized(), chord.normalized()));
+                    // 当前已是物理安全的近直行单段时，优先保留单段表达。
+                    // 只有已有两段状态，或当前单段本身确有物理风险，才允许
+                    // 通过闭包路点回退改变段数；否则会把 68 这类已经安全的
+                    // 单段曲线变形成多段来换取局部组合可行。
+                    if (turn_strength <= 0.25 && ri != final_idx.end() &&
+                        results[ri->second].curve &&
+                        results[ri->second].curve->numSegments() == 1 &&
+                        !strictCandidateHasExactPhysicalRisk(
+                            *results[ri->second].curve))
+                        return false;
+                    return chord.norm() > 15.0 && entry.second.norm() > 1e-8 &&
+                        exit_.second.norm() > 1e-8 &&
+                        turn_strength <= 0.60;
                 };
                 for (const auto& pair : cluster_solver_.pairs()) {
                     if (pair.exempt == CrossExemption::StructuralCross)
@@ -10225,7 +10911,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     const bool b_variable = closure_contains(pair.id_b);
                     if (!a_variable && !b_variable)
                         continue;
-                    ConnId target;
                     if (a_variable && b_variable) {
                         const auto& pool_a = closure_pools[pair.id_a];
                         const auto& pool_b = closure_pools[pair.id_b];
@@ -10242,8 +10927,17 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             if (supported)
                                 break;
                         }
-                        if (!supported)
-                            target = choose_waypoint_target(pair.id_a, pair.id_b);
+                        if (!supported) {
+                            // 双方都是可变普通近直行时，不能按 CurvePair 的
+                            // id 顺序只扩充一侧：43109857 的 68 对当前 4
+                            // 没有干净的两段候选，但 4 对当前 68 有。两侧
+                            // 一起进入有界池，矩阵会选择真正可行且形态代价
+                            // 更小的一侧，避免把候选方向误当成几何结论。
+                            if (is_waypoint_eligible(pair.id_a))
+                                waypoint_targets.insert(pair.id_a);
+                            if (is_waypoint_eligible(pair.id_b))
+                                waypoint_targets.insert(pair.id_b);
+                        }
                     } else {
                         const ConnId variable = a_variable ? pair.id_a : pair.id_b;
                         const ConnId fixed = a_variable ? pair.id_b : pair.id_a;
@@ -10259,64 +10953,106 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                 break;
                             }
                         }
-                        if (!supported)
-                            target = choose_waypoint_target(variable, variable);
+                        if (!supported && is_waypoint_eligible(variable))
+                            waypoint_targets.insert(variable);
                     }
-                    if (!target.empty())
-                        waypoint_targets.insert(target);
                 }
                 for (const ConnId& id : waypoint_targets)
-                    append_strict_waypoint_candidates(id);
-
-                if (isgDebugPairRepair() &&
-                    family_item.first == "entry:1015689") {
-                    fprintf(stderr, "[STRICT-CLOSURE-POOLS] ok=%d sizes=",
-                            closure_pool_ok ? 1 : 0);
-                    for (const ConnId& id : closure_ids) {
-                        auto it = closure_pools.find(id);
-                        fprintf(stderr, "%s:%zu,", id.c_str(),
-                                it == closure_pools.end() ? 0 : it->second.size());
-                    }
-                    fprintf(stderr, "\n");
-                    for (const ConnId& id : closure_ids) {
-                        if (id != "5" && id != "9")
-                            continue;
-                        const auto it = closure_pools.find(id);
-                        if (it == closure_pools.end())
-                            continue;
-                        fprintf(stderr, "[STRICT-CLOSURE-POOL-VIEW] id=%s handles=",
-                                id.c_str());
-                        for (const auto& candidate : it->second) {
-                            const auto& g = candidate.curve.segs.front().ctrl;
-                            fprintf(stderr, "%.3f/%.3f,",
-                                    (g[1] - g[0]).norm(),
-                                    (g[3] - g[2]).norm());
-                        }
-                        fprintf(stderr, "\n");
-                    }
-                }
+                    if (waypoint_expanded_ids.insert(id).second)
+                        append_strict_waypoint_candidates(id);
 
                 // 直接阻塞者自身可能在闭包外还有可变普通兄弟。只沿“某个
-                // 候选实际相交”的边扩展一轮，并限制变量总数；固定形态、
-                // U-turn 和不可变连接留在后续矩阵中作为硬约束。这样既能
-                // 覆盖 5/9 的分裂阻塞，又不会把全路口关系图展开成全局穷举。
+                // 候选实际相交”的边扩展，并限制变量总数；固定形态、U-turn
+                // 和不可变连接留在后续矩阵中作为硬约束。这样既能覆盖 5/9
+                // 的分裂阻塞，又不会把全路口关系图展开成全局穷举。
                 // 大族往往被多个跨端点阻塞者同时挡住（43106530 的候选分别
                 // 被 41 和 47 挡住），每轮只纳入一个新变量无法解锁。轮数与
-                // 每轮发现数只在升级重试轮放宽，仍受 kMaxStrictClosureMembers
-                // 与节点预算约束。
+                // 每轮发现数只在升级重试轮放宽，仍受成员、候选和节点预算约束。
                 const std::size_t closure_discovery_per_round =
                     (closure_escalate && family.size() >= 4) ? 2u : 1u;
+                // 二元族的前几轮可能先发现旁路阻塞者（本例先发现 3、64），
+                // 而新变量的唯一支撑又会被另一个外部连接（65）挡住。允许
+                // 有界传递发现即可形成实际闭包；每轮最多发现一个普通兄弟，
+                // 仍受成员上限、候选上限和节点上限约束。
                 const int closure_max_rounds =
-                    (closure_escalate && family.size() >= 4) ? 3 : 1;
+                    (closure_escalate && family.size() >= 4) ? 3
+                    : family.size() == 2 ? 4 : 1;
                 for (int closure_round = 0;
                      closure_pool_ok && closure_round < closure_max_rounds &&
                      closure_ids.size() < kMaxStrictClosureMembers;
                      ++closure_round) {
-                    std::vector<ConnId> discovered;
-                    std::unordered_set<ConnId> discovered_set;
+                    // 只按“被多少候选碰到”排序会遗漏少量但关键的阻塞者：
+                    // 4 的 176/190 两个核心候选都被 5 挡住，而 2/3 的总
+                    // 冲突数更大，旧排序会先把 2/3 塞进有限闭包。先计算
+                    // 当前闭包内部仍有支撑的核心候选，再优先发现能封死这
+                    // 个核心域的外部成员；它只影响变量发现顺序，不放宽任何
+                    // 相交、物理或形态约束。
+                    std::unordered_map<ConnId, std::vector<unsigned char>>
+                        core_supported;
                     for (const ConnId& variable_id : closure_ids) {
-                        if (discovered.size() >= closure_discovery_per_round)
-                            break;
+                        const auto pool_it = closure_pools.find(variable_id);
+                        if (pool_it == closure_pools.end())
+                            continue;
+                        std::vector<unsigned char> supported(
+                            pool_it->second.size(), 1);
+                        for (std::size_t candidate_index = 0;
+                             candidate_index < pool_it->second.size();
+                             ++candidate_index) {
+                            for (const auto& pair : cluster_solver_.pairs()) {
+                                if (pair.exempt == CrossExemption::StructuralCross)
+                                    continue;
+                                ConnId other_id;
+                                if (pair.id_a == variable_id)
+                                    other_id = pair.id_b;
+                                else if (pair.id_b == variable_id)
+                                    other_id = pair.id_a;
+                                else
+                                    continue;
+                                if (!closure_id_set.count(other_id))
+                                    continue;
+                                const auto other_pool_it =
+                                    closure_pools.find(other_id);
+                                if (other_pool_it == closure_pools.end()) {
+                                    supported[candidate_index] = 0;
+                                    break;
+                                }
+                                const auto& candidate =
+                                    pool_it->second[candidate_index];
+                                bool has_support = false;
+                                for (const auto& other_candidate :
+                                     other_pool_it->second) {
+                                    const double endpoint_tol =
+                                        (candidate.curve.numSegments() > 1 ||
+                                         other_candidate.curve.numSegments() > 1)
+                                        ? kStrictSameClusterEndpointTol
+                                        : kSharedEndpointPairCrossTol;
+                                    if (!sampledCurvesIntersectBusiness(
+                                            candidate.sampled,
+                                            other_candidate.sampled,
+                                            endpoint_tol)) {
+                                        has_support = true;
+                                        break;
+                                    }
+                                }
+                                if (!has_support) {
+                                    supported[candidate_index] = 0;
+                                    break;
+                                }
+                            }
+                        }
+                        core_supported.emplace(variable_id,
+                                               std::move(supported));
+                    }
+                    // 先完整统计本轮所有真实冲突的外部兄弟，再按优先级截断。
+                    // 直接遇到的第一个邻居受输入顺序影响，曾导致 3/2/18
+                    // 先占满闭包而遗漏 64 的传递阻塞者 65。
+                    std::unordered_map<ConnId, std::size_t>
+                        discovered_conflicts;
+                    std::unordered_map<ConnId, std::unordered_set<ConnId>>
+                        core_blocked_by_variable;
+                    std::unordered_map<ConnId, std::unordered_set<ConnId>>
+                        core_escape_by_variable;
+                    for (const ConnId& variable_id : closure_ids) {
                         const auto pool_it = closure_pools.find(variable_id);
                         if (pool_it == closure_pools.end())
                             continue;
@@ -10324,12 +11060,12 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                             strict_pair_neighbors.find(variable_id);
                         if (neighbor_it == strict_pair_neighbors.end())
                             continue;
-                        for (const auto& candidate : pool_it->second) {
-                            if (discovered.size() >= closure_discovery_per_round)
-                                break;
+                        for (std::size_t candidate_index = 0;
+                             candidate_index < pool_it->second.size();
+                             ++candidate_index) {
+                            const auto& candidate =
+                                pool_it->second[candidate_index];
                             for (const CurvePair* pair_ptr : neighbor_it->second) {
-                                if (discovered.size() >= closure_discovery_per_round)
-                                    break;
                                 const CurvePair& pair = *pair_ptr;
                                 ConnId other_id;
                                 if (pair.id_a == variable_id)
@@ -10339,8 +11075,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                 else
                                     continue;
                                 if (closure_id_set.count(other_id) ||
-                                    discovered_set.count(other_id) ||
-                                    pair.exempt == CrossExemption::StructuralCross ||
+                                    pair.exempt == CrossExemption::StructuralCross)
+                                    continue;
+                                if (!discovered_conflicts.count(other_id) &&
                                     !is_movable_closure_member(other_id))
                                     continue;
                                 auto oi = final_idx.find(other_id);
@@ -10358,12 +11095,112 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                 // 一条兄弟会独占挡住全部候选，但这些阻塞的并集
                                 // 仍会清空原始族的可行组合。只要存在实际冲突候选，
                                 // 就把可变普通兄弟纳入有限闭包，由矩阵统一求解。
-                                if (discovered_set.insert(other_id).second)
-                                    discovered.push_back(other_id);
-                                break;
+                                ++discovered_conflicts[other_id];
+                                const auto core_it = core_supported.find(variable_id);
+                                const bool candidate_core =
+                                    core_it != core_supported.end() &&
+                                    candidate_index < core_it->second.size() &&
+                                    core_it->second[candidate_index] != 0;
+                                if (candidate_core)
+                                    core_blocked_by_variable[other_id].insert(
+                                        variable_id);
                             }
                         }
                     }
+                    // 上面的冲突扫描只会命中“被挡住”的候选；补扫核心候选
+                    // 的安全逃逸，区分“完全封死”与“仅部分冲突”。
+                    for (const ConnId& variable_id : closure_ids) {
+                        const auto pool_it = closure_pools.find(variable_id);
+                        const auto core_it = core_supported.find(variable_id);
+                        if (pool_it == closure_pools.end() ||
+                            core_it == core_supported.end())
+                            continue;
+                        for (std::size_t candidate_index = 0;
+                             candidate_index < pool_it->second.size();
+                             ++candidate_index) {
+                            if (!core_it->second[candidate_index])
+                                continue;
+                            const auto neighbor_it =
+                                strict_pair_neighbors.find(variable_id);
+                            if (neighbor_it == strict_pair_neighbors.end())
+                                continue;
+                            for (const CurvePair* pair_ptr : neighbor_it->second) {
+                                const CurvePair& pair = *pair_ptr;
+                                ConnId other_id;
+                                if (pair.id_a == variable_id)
+                                    other_id = pair.id_b;
+                                else if (pair.id_b == variable_id)
+                                    other_id = pair.id_a;
+                                else
+                                    continue;
+                                if (closure_id_set.count(other_id) ||
+                                    pair.exempt == CrossExemption::StructuralCross ||
+                                    !is_movable_closure_member(other_id))
+                                    continue;
+                                auto oi = final_idx.find(other_id);
+                                if (oi == final_idx.end() ||
+                                    !results[oi->second].curve)
+                                    continue;
+                                const auto other_sample =
+                                    strict_result_samples.find(other_id);
+                                if (other_sample == strict_result_samples.end())
+                                    continue;
+                                const bool conflict = sampledCurvesIntersectBusiness(
+                                    pool_it->second[candidate_index].sampled,
+                                    other_sample->second,
+                                    kSharedEndpointPairCrossTol);
+                                if (!conflict)
+                                    core_escape_by_variable[other_id].insert(
+                                        variable_id);
+                            }
+                        }
+                    }
+                    std::vector<ConnId> discovered;
+                    discovered.reserve(discovered_conflicts.size());
+                    for (const auto& item : discovered_conflicts)
+                        discovered.push_back(item.first);
+                    std::sort(discovered.begin(), discovered.end(),
+                              [&](const ConnId& a, const ConnId& b) {
+                        const auto ia = final_idx.find(a);
+                        const auto ib = final_idx.find(b);
+                        const bool a_segmented = ia != final_idx.end() &&
+                            results[ia->second].curve &&
+                            results[ia->second].curve->numSegments() > 1;
+                        const bool b_segmented = ib != final_idx.end() &&
+                            results[ib->second].curve &&
+                            results[ib->second].curve->numSegments() > 1;
+                        if (a_segmented != b_segmented)
+                            return a_segmented > b_segmented;
+                        const std::size_t a_conflicts =
+                            discovered_conflicts.at(a);
+                        const std::size_t b_conflicts =
+                            discovered_conflicts.at(b);
+                        const auto is_full_core_blocker = [&](const ConnId& id) {
+                            const auto blocked_it =
+                                core_blocked_by_variable.find(id);
+                            if (blocked_it == core_blocked_by_variable.end())
+                                return false;
+                            const auto escape_it =
+                                core_escape_by_variable.find(id);
+                            for (const ConnId& variable_id : blocked_it->second) {
+                                if (escape_it == core_escape_by_variable.end() ||
+                                    escape_it->second.count(variable_id) == 0)
+                                    return true;
+                            }
+                            return false;
+                        };
+                        const bool a_full_core_blocker =
+                            is_full_core_blocker(a);
+                        const bool b_full_core_blocker =
+                            is_full_core_blocker(b);
+                        if (a_full_core_blocker != b_full_core_blocker)
+                            return a_full_core_blocker > b_full_core_blocker;
+                        if (a_conflicts != b_conflicts)
+                            return a_conflicts > b_conflicts;
+                        return a < b;
+                    });
+                    if (discovered.size() > closure_discovery_per_round)
+                        discovered.resize(closure_discovery_per_round);
                     for (const ConnId& id : discovered) {
                         if (closure_ids.size() >= kMaxStrictClosureMembers)
                             break;
@@ -10373,6 +11210,19 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     if (discovered.empty())
                         break;
                     build_missing_closure_pools();
+                    // 新增闭包成员可能已经是上一阶段通过避让得到的两段
+                    // 曲线。它们的当前基线虽被保留，但仅靠单段候选无法参与
+                    // 新的多变量组合；每个成员只扩充一次有限路点池。
+                    for (const ConnId& id : closure_ids) {
+                        if (!is_waypoint_eligible(id))
+                            continue;
+                        const auto ri = final_idx.find(id);
+                        if (ri == final_idx.end() || !results[ri->second].curve ||
+                            results[ri->second].curve->numSegments() != 2)
+                            continue;
+                        if (waypoint_expanded_ids.insert(id).second)
+                            append_strict_waypoint_candidates(id);
+                    }
                 }
 
                 struct ClosurePair {
@@ -10458,76 +11308,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         closure_pairs.push_back(std::move(item));
                     }
                 }
-                if (isgDebugPairRepair() &&
-                    family_item.first == "entry:1015689") {
-                    for (const auto& item : closure_pairs) {
-                        if (item.b == std::numeric_limits<std::size_t>::max())
-                            continue;
-                        const auto& pool_a = closure_pools[closure_ids[item.a]];
-                        const auto& pool_b = closure_pools[closure_ids[item.b]];
-                        std::size_t conflicts = 0;
-                        std::size_t rows_with_support = 0;
-                        std::size_t cols_with_support = 0;
-                        for (std::size_t ai = 0; ai < pool_a.size(); ++ai) {
-                            bool row_supported = false;
-                            for (std::size_t bi = 0; bi < pool_b.size(); ++bi) {
-                                if (!item.conflict[ai * pool_b.size() + bi])
-                                    row_supported = true;
-                                else
-                                    ++conflicts;
-                            }
-                            rows_with_support += row_supported ? 1 : 0;
-                        }
-                        for (std::size_t bi = 0; bi < pool_b.size(); ++bi) {
-                            for (std::size_t ai = 0; ai < pool_a.size(); ++ai)
-                                if (!item.conflict[ai * pool_b.size() + bi]) {
-                                    ++cols_with_support;
-                                    break;
-                                }
-                        }
-                        fprintf(stderr,
-                                "[STRICT-CLOSURE-VARIABLE] %s|%s conflicts=%zu/%zu rows=%zu/%zu cols=%zu/%zu\n",
-                                closure_ids[item.a].c_str(),
-                                closure_ids[item.b].c_str(), conflicts,
-                                pool_a.size() * pool_b.size(), rows_with_support,
-                                pool_a.size(), cols_with_support, pool_b.size());
-                        if ((closure_ids[item.a] == "5" &&
-                             closure_ids[item.b] == "9") ||
-                            (closure_ids[item.a] == "9" &&
-                             closure_ids[item.b] == "5")) {
-                            std::size_t exact_conflicts = 0;
-                            std::size_t exact_rows = 0;
-                            std::size_t exact_cols = 0;
-                            for (std::size_t ai = 0; ai < pool_a.size(); ++ai) {
-                                bool row_supported = false;
-                                for (std::size_t bi = 0; bi < pool_b.size(); ++bi) {
-                                    const bool conflict = curvesIntersectBusiness(
-                                        pool_a[ai].curve, pool_b[bi].curve,
-                                        kSharedEndpointPairCrossTol);
-                                    exact_conflicts += conflict ? 1 : 0;
-                                    row_supported = row_supported || !conflict;
-                                }
-                                exact_rows += row_supported ? 1 : 0;
-                            }
-                            for (std::size_t bi = 0; bi < pool_b.size(); ++bi) {
-                                for (std::size_t ai = 0; ai < pool_a.size(); ++ai)
-                                    if (!curvesIntersectBusiness(
-                                            pool_a[ai].curve, pool_b[bi].curve,
-                                            kSharedEndpointPairCrossTol)) {
-                                        ++exact_cols;
-                                        break;
-                                    }
-                            }
-                            fprintf(stderr,
-                                    "[STRICT-CLOSURE-EXACT] %s|%s conflicts=%zu/%zu rows=%zu/%zu cols=%zu/%zu\n",
-                                    closure_ids[item.a].c_str(),
-                                    closure_ids[item.b].c_str(), exact_conflicts,
-                                    pool_a.size() * pool_b.size(), exact_rows,
-                                    pool_a.size(), exact_cols, pool_b.size());
-                        }
-                    }
-                }
-
                 // 先做弧一致性约束传播：固定外部曲线直接删除冲突候选，
                 // 变量之间删除在另一侧没有任何兼容支撑的候选。该过程只删掉
                 // 不可能属于任意完整解的值，不改变闭包的可行解集合；之后的
@@ -10621,29 +11401,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                                 break;
                             }
                         }
-                    }
-                }
-                if (isgDebugPairRepair() &&
-                    family_item.first == "entry:1015689") {
-                    fprintf(stderr, "[STRICT-CLOSURE-DOMAINS] ok=%d ",
-                            closure_pool_ok ? 1 : 0);
-                    for (std::size_t ci = 0; ci < closure_ids.size(); ++ci)
-                        fprintf(stderr, "%s:%zu/%zu ", closure_ids[ci].c_str(),
-                                std::count(closure_domains[ci].begin(),
-                                           closure_domains[ci].end(),
-                                           static_cast<unsigned char>(1)),
-                                closure_domains[ci].size());
-                    fprintf(stderr, "\n");
-                    for (const auto& item : closure_pairs) {
-                        if (item.b != std::numeric_limits<std::size_t>::max())
-                            continue;
-                        std::size_t conflicts = 0;
-                        for (unsigned char value : item.conflict)
-                            conflicts += value != 0 ? 1 : 0;
-                        fprintf(stderr,
-                                "[STRICT-CLOSURE-FIXED] %s vs %s conflicts=%zu/%zu\n",
-                                closure_ids[item.a].c_str(), item.fixed_id.c_str(),
-                                conflicts, item.conflict.size());
                     }
                 }
                 std::vector<std::size_t> closure_order;
@@ -10751,85 +11508,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         return false;
                     };
                 bool closure_found = closure_pool_ok && search_closure(0);
-                if (!closure_found && closure_pool_ok &&
-                    isgDebugPairRepair() &&
-                    family_item.first == "entry:1015689") {
-                    // 失败时求一次矩阵上的最小冲突组合，区分候选域完全
-                    // 不可行与仅有少量外部冲突需要下一轮收口的情况。该诊断
-                    // 不参与提交，避免为定位问题改变严格搜索结果。
-                    int best_conflicts = std::numeric_limits<int>::max();
-                    std::vector<std::size_t> best_selection(
-                        closure_ids.size(), 0);
-                    std::function<void(std::size_t, int)> find_best =
-                        [&](std::size_t depth, int partial) {
-                            if (partial >= best_conflicts)
-                                return;
-                            if (depth == closure_order.size()) {
-                                best_conflicts = partial;
-                                best_selection = closure_selected;
-                                return;
-                            }
-                            const std::size_t variable = closure_order[depth];
-                            const auto& pool = closure_pools[
-                                closure_ids[variable]];
-                            for (std::size_t candidate = 0;
-                                 candidate < pool.size(); ++candidate) {
-                                int added = 0;
-                                for (const auto& item : closure_pairs) {
-                                    if (item.a != variable && item.b != variable)
-                                        continue;
-                                    const std::size_t other = item.a == variable
-                                        ? item.b : item.a;
-                                    if (other == std::numeric_limits<std::size_t>::max()) {
-                                        added += item.conflict[candidate] ? 1 : 0;
-                                    } else if (closure_selected_flags[other]) {
-                                        const std::size_t ai = item.a == variable
-                                            ? candidate : closure_selected[item.a];
-                                        const std::size_t bi = item.b == variable
-                                            ? candidate : closure_selected[item.b];
-                                        const auto& pool_b = closure_pools[
-                                            closure_ids[item.b]];
-                                        added += item.conflict[
-                                            ai * pool_b.size() + bi] ? 1 : 0;
-                                    }
-                                }
-                                closure_selected[variable] = candidate;
-                                closure_selected_flags[variable] = true;
-                                find_best(depth + 1, partial + added);
-                                closure_selected_flags[variable] = false;
-                            }
-                        };
-                    find_best(0, 0);
-                    fprintf(stderr,
-                            "[STRICT-CLOSURE-BEST] %s conflicts=%d handles=",
-                            family_item.first.c_str(), best_conflicts);
-                    for (std::size_t ci = 0; ci < closure_ids.size(); ++ci) {
-                        const auto& g = closure_pools[closure_ids[ci]][
-                            best_selection[ci]].curve.segs.front().ctrl;
-                        fprintf(stderr, "%s:%.3f/%.3f,", closure_ids[ci].c_str(),
-                                (g[1] - g[0]).norm(), (g[3] - g[2]).norm());
-                    }
-                    for (const auto& item : closure_pairs) {
-                        const std::size_t ai = item.a < best_selection.size()
-                            ? best_selection[item.a] : 0;
-                        const std::size_t bi = item.b < best_selection.size()
-                            ? best_selection[item.b] : 0;
-                        const auto& pool_b = item.b < closure_ids.size()
-                            ? closure_pools[closure_ids[item.b]]
-                            : closure_pools[closure_ids[item.a]];
-                        const bool conflict = item.b ==
-                            std::numeric_limits<std::size_t>::max()
-                            ? item.conflict[ai]
-                            : item.conflict[ai * pool_b.size() + bi];
-                        if (conflict)
-                            fprintf(stderr, " [conflict=%s|%s]",
-                                    closure_ids[item.a].c_str(),
-                                    item.b == std::numeric_limits<std::size_t>::max()
-                                        ? item.fixed_id.c_str()
-                                        : closure_ids[item.b].c_str());
-                    }
-                    fprintf(stderr, "\n");
-                }
                 if (closure_found) {
                     std::vector<CurvePatchEntry> closure_patch;
                     closure_patch.reserve(closure_ids.size());
@@ -10849,11 +11527,6 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     family_pass_changed = true;
                     for (const ConnId& id : closure_ids)
                         strict_changed_this_pass.insert(id);
-                    if (isgDebugPairRepair())
-                        fprintf(stderr,
-                                "[STRICT-CLOSURE] %s committed members=%zu nodes=%zu\n",
-                                family_item.first.c_str(), closure_ids.size(),
-                                closure_nodes);
                     continue;
                 }
                 if (isgDebugPairRepair())

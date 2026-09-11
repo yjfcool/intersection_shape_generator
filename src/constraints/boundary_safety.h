@@ -44,6 +44,10 @@ struct BoundarySafetySegment {
     bool center_side_reliable = true;
     bool a_is_boundary_endpoint = false;
     bool b_is_boundary_endpoint = false;
+    Vec2d boundary_front{0, 0};
+    Vec2d boundary_back{0, 0};
+    double distance_from_front = 0.0;
+    double distance_to_back = 0.0;
 };
 
 struct BoundarySafetyResult {
@@ -273,7 +277,7 @@ inline Vec2d boundarySafetyCenter(const IntersectionInput& input) {
 
 inline std::vector<BoundarySafetySegment> buildBoundarySafetySegments(
         const std::vector<Boundary>& boundaries, const Vec2d& center,
-        const std::vector<std::vector<bool>>* exempt_masks = nullptr,
+        const std::vector<std::vector<bool>>* /*exempt_masks*/ = nullptr,
         const Polygon2d* fence_outline = nullptr) {
     auto endpointTouchesOtherBoundary = [&](size_t boundary_index,
                                              const Vec2d& point) {
@@ -297,10 +301,12 @@ inline std::vector<BoundarySafetySegment> buildBoundarySafetySegments(
         const auto& pts = bnd.geometry.points;
         const bool duplicate_fence_outline =
             roadEdgeDuplicatesFenceOutline(bnd, fence_outline);
-        (void)exempt_masks;
         std::vector<BoundarySafetySegment> boundary_segments;
         bool has_pos_center_side = false;
         bool has_neg_center_side = false;
+        std::vector<double> stations(pts.size(), 0.0);
+        for (std::size_t i = 1; i < pts.size(); ++i)
+            stations[i] = stations[i - 1] + (pts[i] - pts[i - 1]).norm();
         for (int i = 0; i + 1 < (int)pts.size(); ++i) {
             Vec2d d = pts[i + 1] - pts[i];
             double len = d.norm();
@@ -329,6 +335,10 @@ inline std::vector<BoundarySafetySegment> buildBoundarySafetySegments(
                 has_neg_center_side = true;
             seg.a_is_boundary_endpoint = (i == 0);
             seg.b_is_boundary_endpoint = (i + 1 == (int)pts.size() - 1);
+            seg.boundary_front = pts.front();
+            seg.boundary_back = pts.back();
+            seg.distance_from_front = stations[i];
+            seg.distance_to_back = stations.back() - stations[i + 1];
             boundary_segments.push_back(seg);
         }
         bool reliable = !(bnd.type == Boundary::Type::RoadEdge &&
@@ -386,14 +396,15 @@ inline void markBoundaryTipAlignedRun(
     }
 }
 
-inline double roadEdgeOutsidePenalty(
+template <typename SkipFn>
+inline double roadEdgeOutsidePenaltyWithSkip(
         const Vec2d& pt, const std::vector<BoundarySafetySegment>& segments,
-        double tol = 0.05, double max_influence_dist = 3.0) {
+        double tol, double max_influence_dist, SkipFn&& skip) {
     const BoundarySafetySegment* best = nullptr;
     double best_dist = std::numeric_limits<double>::infinity();
     double best_signed = 0.0;
     for (const auto& seg : segments) {
-        if (!seg.road_edge || !seg.center_side_reliable ||
+        if (skip(seg) || !seg.road_edge || !seg.center_side_reliable ||
             std::abs(seg.center_signed) < 1e-6)
             continue;
         // 很短的 RoadEdge 通常是车道端点/鼻端的连接片段，有限线段附近
@@ -432,12 +443,19 @@ inline double roadEdgeOutsidePenalty(
     return std::max(0.0, -center_sign * best_signed - tol);
 }
 
+inline double roadEdgeOutsidePenalty(
+        const Vec2d& pt, const std::vector<BoundarySafetySegment>& segments,
+        double tol = 0.05, double max_influence_dist = 3.0) {
+    return roadEdgeOutsidePenaltyWithSkip(
+        pt, segments, tol, max_influence_dist,
+        [](const BoundarySafetySegment&) { return false; });
+}
+
 inline BoundarySafetyResult curveBoundarySafety(
         const BezierCurve& curve, const std::vector<BoundarySafetySegment>& segments,
         int min_samples = 64, double curve_endpoint_tol = kConnectionPointTolerance,
-        double boundary_endpoint_tol = 0.10, double outside_tol = 0.05,
+        double /*boundary_endpoint_tol*/ = 0.10, double outside_tol = 0.05,
         double sample_spacing = 0.18) {
-    (void)boundary_endpoint_tol;
     const double endpoint_tol = std::min(
         std::max(0.0, curve_endpoint_tol), kConnectionPointTolerance);
     BoundarySafetyResult result;
@@ -486,6 +504,7 @@ inline BoundarySafetyResult curveBoundarySafety(
                y.max_pt[1] < x.min_pt[1] - box_slack;
     };
 
+    bool boundary_contact = false;
     for (const auto& seg : segments) {
         if (!curve_box.intersects(seg.bbox))
             continue;
@@ -496,6 +515,7 @@ inline BoundarySafetyResult curveBoundarySafety(
                     pts[i], pts[i + 1], seg.a, seg.b,
                     pts.front(), pts.back(), endpoint_tol)) {
                 result.intersects = true;
+                boundary_contact = true;
                 break;
             }
         }
@@ -503,15 +523,96 @@ inline BoundarySafetyResult curveBoundarySafety(
             break;
     }
 
+    // RoadEdge 端点在连接点前方约一个车道宽度内时，端点外侧并不代表
+    // 曲线已经驶出道路：斜向入口常见“边缘先到、车道中心后到”的数据。
+    // 豁免只作用于中心侧半平面罚分，真实线段相交仍由上面的严格检查负责。
+    const Vec2d curve_start = curve.startPt();
+    const Vec2d curve_end = curve.endPt();
+    const Vec2d start_tan = curve.startTan().norm() > 1e-8
+        ? curve.startTan().normalized() : Vec2d(1, 0);
+    const Vec2d end_tan = curve.endTan().norm() > 1e-8
+        ? curve.endTan().normalized() : Vec2d(1, 0);
+    const auto skip_center_side = [&](const BoundarySafetySegment& seg) {
+        if (!seg.road_edge || seg.len < 2.0)
+            return false;
+        const Vec2d dir = (seg.b - seg.a).normalized();
+        const Vec2d mid = 0.5 * (seg.a + seg.b);
+        const auto start_edge_ends_before_curve = [&]() {
+            const double edge_span =
+                (seg.boundary_back - seg.boundary_front).dot(start_tan);
+            const double curve_span = (curve_end - curve_start).dot(start_tan);
+            // 仅当有限 RoadEdge 在曲线到达另一端前结束，才可能是“边缘
+            // 先到、车道中心后到”的入口开口；一条仍延伸到曲线末端之后
+            // 的长边不能仅凭平行切向获得豁免（outside_only）。
+            return edge_span >= -1.0 && edge_span <= curve_span + 1.0;
+        };
+        const auto aligned_departure = [](const Vec2d& origin,
+                                          const Vec2d& tangent,
+                                          const Vec2d& point,
+                                          const Vec2d& edge_dir) {
+            const Vec2d delta = point - origin;
+            const double longitudinal = delta.dot(tangent);
+            const double lateral = std::abs(cross2d(tangent, delta));
+            return longitudinal >= -1.0 && longitudinal <= 16.0 &&
+                   lateral <= 3.0 && std::abs(edge_dir.dot(tangent)) >= 0.85;
+        };
+        const bool start_departure =
+            (seg.boundary_front - curve_start).norm() <= 4.0 &&
+            seg.distance_from_front <= 30.0 &&
+            start_edge_ends_before_curve() &&
+            aligned_departure(curve_start, start_tan, mid, dir);
+        const bool end_departure =
+            (seg.boundary_back - curve_end).norm() <= 4.0 &&
+            seg.distance_to_back <= 30.0 &&
+            aligned_departure(curve_end, end_tan, mid, dir);
+        return start_departure || end_departure;
+    };
+
     for (int i = 1; i + 1 < (int)pts.size(); ++i) {
         if ((pts[i] - pts.front()).norm() <= endpoint_tol ||
             (pts[i] - pts.back()).norm() <= endpoint_tol)
             continue;
-        double p = roadEdgeOutsidePenalty(pts[i], segments, outside_tol);
+        double p = roadEdgeOutsidePenaltyWithSkip(
+            pts[i], segments, outside_tol, 3.0, skip_center_side);
         if (p > 1e-3) {
             result.outside_road_edge = true;
             result.intersects = true;
             result.outside_penalty += p * p;
+        }
+    }
+    if (result.outside_road_edge && !boundary_contact) {
+        bool departure = false;
+        for (const auto& seg : segments) {
+            if (!seg.road_edge || seg.len < 2.0)
+                continue;
+            const Vec2d dir = (seg.b - seg.a).normalized();
+            const Vec2d mid = 0.5 * (seg.a + seg.b);
+            const Vec2d ds = mid - curve_start;
+            const Vec2d de = mid - curve_end;
+            const auto start_edge_ends_before_curve = [&]() {
+                const double edge_span =
+                    (seg.boundary_back - seg.boundary_front).dot(start_tan);
+                const double curve_span =
+                    (curve_end - curve_start).dot(start_tan);
+                return edge_span >= -1.0 && edge_span <= curve_span + 1.0;
+            };
+            if (((seg.boundary_front - curve_start).norm() <= 4.0 &&
+                 seg.distance_from_front <= 30.0 && ds.dot(start_tan) >= -1.0 &&
+                 ds.dot(start_tan) <= 30.0 && std::abs(cross2d(start_tan, ds)) <= 5.0 &&
+                 std::abs(dir.dot(start_tan)) >= 0.85 &&
+                 start_edge_ends_before_curve()) ||
+                ((seg.boundary_back - curve_end).norm() <= 4.0 &&
+                 seg.distance_to_back <= 30.0 && de.dot(end_tan) >= -1.0 &&
+                 de.dot(end_tan) <= 30.0 && std::abs(cross2d(end_tan, de)) <= 5.0 &&
+                 std::abs(dir.dot(end_tan)) >= 0.85)) {
+                departure = true;
+                break;
+            }
+        }
+        if (departure) {
+            result.outside_road_edge = false;
+            result.intersects = false;
+            result.outside_penalty = 0.0;
         }
     }
     return result;
@@ -732,15 +833,13 @@ inline bool boundaryExemptMasksEmpty(const std::vector<std::vector<bool>>& masks
 inline BoundarySafetyResult curveBoundarySafetyIgnoringEndpointGraze(
         const BezierCurve& curve, const std::vector<Boundary>& boundaries,
         const Vec2d& center, int min_samples = 64,
-        double curve_endpoint_tol = kConnectionPointTolerance, double boundary_endpoint_tol = 0.10,
-        double outside_tol = 0.05, double pos_tol = 0.60,
-        double dir_min_dot = 0.70, double graze_tol = 0.25,
+        double curve_endpoint_tol = kConnectionPointTolerance,
+        double boundary_endpoint_tol = 0.10, double outside_tol = 0.05,
+        double /*pos_tol*/ = 0.60, double /*dir_min_dot*/ = 0.70,
+        double /*graze_tol*/ = 0.25,
         const Polygon2d* fence_outline = nullptr) {
     // 保留旧函数名以兼容已有调用方，但“忽略端点擦碰”已不再是产品规则：
     // 只有曲线真实首/尾连接点允许浮点误差，端点后的贴合、重叠和穿越一律保留。
-    (void)pos_tol;
-    (void)dir_min_dot;
-    (void)graze_tol;
     return curveBoundarySafety(
         curve, boundaries, center, min_samples, curve_endpoint_tol,
         boundary_endpoint_tol, outside_tol, fence_outline);

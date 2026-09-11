@@ -13,22 +13,6 @@ namespace isg {
 
 namespace {
 
-bool crosswalkNearTurnChord(const Crosswalk& crosswalk,
-                            const Vec2d& p0, const Vec2d& p1,
-                            double max_distance) {
-    const std::vector<Vec2d> points = toVec2dArray(crosswalk.geometry.outer);
-    for (size_t i = 1; i < points.size(); ++i) {
-        const Vec2d& a = points[i - 1];
-        const Vec2d& b = points[i];
-        if (pointToSegment(a, p0, p1).first <= max_distance ||
-            pointToSegment(b, p0, p1).first <= max_distance ||
-            pointToSegment(p0, a, b).first <= max_distance ||
-            pointToSegment(p1, a, b).first <= max_distance)
-            return true;
-    }
-    return false;
-}
-
 LaneGroupId laneGroupIdForRole(
         const Connectivity& connectivity, const IntersectionInput& input, bool entry_side);
 
@@ -523,31 +507,31 @@ UTurnLeadFloors UTurnFamilyBuilder::leadFloors(
     const CrosswalkClearanceResult exit =
         calculator.behind(exit_point, exit_tangent, input);
     // 射线命中并不等于该人行横道属于当前掉头走廊：100000547-1 的两条
-    // 射线都命中东侧横道，但横道整体离进出端点弦超过 4m，首尾若按其
-    // 远边强行拉长，中弧必穿另一组 RoadEdge。只有横道多边形落在端点
-    // 弦 4m 走廊内才参与当前掉头的净空约束。
+    // 射线命中不同站位的相邻横道，按远边强行拉长会使中弧穿入另一组
+    // RoadEdge。通常要求横道落在端点弦 4m 走廊内；长掉头若两侧射线命中
+    // 同一横道且近端站位对齐，则保留该横道，避免 110003285 被误杀。
     const double turn_corridor_width = 4.0;
     CrosswalkClearanceResult effective_entry = entry;
     CrosswalkClearanceResult effective_exit = exit;
-    const bool apply_short_turn_correction = input.mode == 2;
-    auto retainIfNearChord = [&](CrosswalkClearanceResult& result) {
-        if (!apply_short_turn_correction)
-            return;
-        if (!result.found)
-            return;
-        auto it = std::find_if(
-            input.crosswalks.begin(), input.crosswalks.end(),
-            [&](const Crosswalk& crosswalk) {
-                return crosswalk.id == result.crosswalk_id &&
-                       crosswalkNearTurnChord(
-                           crosswalk, entry_point, exit_point,
-                           turn_corridor_width);
-            });
-        if (it == input.crosswalks.end())
-            result = CrosswalkClearanceResult();
-    };
-    retainIfNearChord(effective_entry);
-    retainIfNearChord(effective_exit);
+    if (input.mode == 2) {
+        auto retainIfRelevant = [&](CrosswalkClearanceResult& result,
+                                    const CrosswalkClearanceResult& paired) {
+            if (!result.found)
+                return;
+            auto it = std::find_if(
+                input.crosswalks.begin(), input.crosswalks.end(),
+                [&](const Crosswalk& crosswalk) {
+                    return crosswalk.id == result.crosswalk_id &&
+                           crosswalkRelevantToUTurn(
+                               crosswalk, entry_point, exit_point, result,
+                               &paired, turn_corridor_width);
+                });
+            if (it == input.crosswalks.end())
+                result = CrosswalkClearanceResult();
+        };
+        retainIfRelevant(effective_entry, exit);
+        retainIfRelevant(effective_exit, entry);
+    }
     UTurnLeadFloors floors;
     floors.crosswalk0 = effective_entry.found;
     floors.crosswalk1 = effective_exit.found;
