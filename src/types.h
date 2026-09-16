@@ -225,7 +225,8 @@ using AttrMap      = std::map<std::string, std::string>;  ///< 属性映射
 /// 车道组角色：进入组或退出组
 enum class GroupRole { Entry, Exit };
 
-/// 转向类型（按几何方位计算优先，输入数据的turn_type不一定可信）
+/// 转向类型。显式左/右转和掉头声明用于消除端点切向近反向时的歧义；
+/// Unknown/Straight 才以端点几何方位作为 U-turn 兜底判断。
 enum class ConnTurnType { Unknown = 0, TurnLeft = 1, UTurnLeft = 2, Straight = 3, TurnRight = 4, UTurnRight = 5 };
 
 enum class ConnLaneType { Motorway = 0, NonMotorway = 1 };

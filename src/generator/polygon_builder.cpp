@@ -446,6 +446,64 @@ private:
         return std::find(group.lanes.begin(), group.lanes.end(), lane_id) != group.lanes.end();
     }
 
+    std::vector<const LaneEdge*> laneEdgesTouchingEndpoint(
+        const IntersectionInput& inp, const Vec3d& point) const {
+        std::vector<const LaneEdge*> result;
+        for (const auto& edge : inp.lane_edges) {
+            if (edge.geometry.points.size() < 2)
+                continue;
+            if (dist(point, edge.geometry.points.front()) <= 0.05 ||
+                dist(point, edge.geometry.points.back()) <= 0.05) {
+                bool duplicate = false;
+                for (const auto* existing : result) {
+                    if (existing->id == edge.id)
+                        duplicate = true;
+                }
+                if (!duplicate)
+                    result.push_back(&edge);
+            }
+        }
+        return result;
+    }
+
+    bool isLaneEdgeBackedBoundary(
+        const IntersectionInput& inp, const Boundary& boundary) const {
+        if (boundary.type != Boundary::Type::Other ||
+            boundary.geometry.points.size() < 2)
+            return false;
+
+        // 有些输入把同一条外轮廓同时作为 Boundary 和 LaneEdge 输出；这类
+        // Boundary 本身已经是车道边线串的一段，不需要再依赖另一条边缘端点。
+        for (const auto& edge : inp.lane_edges) {
+            if (edge.id == boundary.id)
+                return true;
+        }
+
+        const auto first_edges = laneEdgesTouchingEndpoint(
+            inp, boundary.geometry.points.front());
+        const auto last_edges = laneEdgesTouchingEndpoint(
+            inp, boundary.geometry.points.back());
+        if (first_edges.empty() || last_edges.empty())
+            return false;
+
+        auto hasRole = [&](const std::vector<const LaneEdge*>& edges,
+                           GroupRole role) {
+            for (const auto* edge : edges) {
+                const LaneGroup* group = inp.findGroup(edge->groupId);
+                if (group && group->role == role)
+                    return true;
+            }
+            return false;
+        };
+
+        // 外轮廓边缘应连接一个进入臂和一个退出臂。同侧短连接片即使
+        // 首尾都碰到 LaneEdge，也不能因此升级为路口外轮廓。
+        return (hasRole(first_edges, GroupRole::Entry) &&
+                hasRole(last_edges, GroupRole::Exit)) ||
+               (hasRole(first_edges, GroupRole::Exit) &&
+                hasRole(last_edges, GroupRole::Entry));
+    }
+
     bool isRoadEdgeBridgeBoundary(const IntersectionInput& inp, const Boundary& boundary) const {
         if (boundary.type != Boundary::Type::Other || boundary.geometry.points.size() < 2)
             return false;
@@ -462,7 +520,8 @@ private:
             return false;
         };
         return endpointTouchesRoadEdge(boundary.geometry.points.front()) ||
-               endpointTouchesRoadEdge(boundary.geometry.points.back());
+               endpointTouchesRoadEdge(boundary.geometry.points.back()) ||
+               isLaneEdgeBackedBoundary(inp, boundary);
     }
 
     bool isUsableRoadEdgeBoundary(const IntersectionInput& inp, const Boundary& boundary) const {
@@ -1362,6 +1421,7 @@ private:
     // 退出组内未生成连通曲线的退出线还用首端缩扩探测线补充对应RoadEdge的station，
     // 避免单命中时把整条边缘纳入路口面。
     AlignedAreaParts alignCutLinesAndBoundaries(
+        const IntersectionInput& inp,
         const std::vector<BoundaryLine>& boundary_lines,
         std::vector<std::vector<Vec3d>> cut_lines,
         const std::vector<GroupRole>& cut_roles,
@@ -1562,7 +1622,6 @@ private:
 
         AlignedAreaParts result;
         std::vector<std::vector<BoundaryHitStation>> hit_stations(boundary_lines.size());
-
         auto uniqueHitStationCount = [](const std::vector<BoundaryHitStation>& stations) -> int {
             std::vector<double> unique;
             for (const auto& hit : stations) {
@@ -1845,6 +1904,38 @@ private:
                     if (best_distance >= 1e17)
                         return empty;
                     const double sample_distance = 0.10;
+                    // 1m 是现有“道路边缘端点命中”判定使用的同一物理邻近范围；
+                    // 超出该范围仍按整条合并链的既有方向规则处理。
+                    const double branch_threshold = groupCutOffset + 0.5;
+                    if (best_distance > branch_threshold)
+                        return empty;
+
+                    // 命中点可能因缩扩线数值误差偏离共享节点几厘米，不能只
+                    // 对精确命中使用拓扑选支，否则会把完整的远端 RoadEdge
+                    // 退化成共享节点前的一小段。
+                    if (!hit.cut_roles.empty()) {
+                        const GroupRole wanted_role =
+                            hit.cut_roles.front() == GroupRole::Entry
+                                ? GroupRole::Exit : GroupRole::Entry;
+                        auto endpointHasRole = [&](const Vec3d& endpoint) {
+                            for (const auto* edge : laneEdgesTouchingEndpoint(inp, endpoint)) {
+                                const LaneGroup* group = inp.findGroup(edge->groupId);
+                                if (group && group->role == wanted_role)
+                                    return true;
+                            }
+                            return false;
+                        };
+                        const bool prefix_has_role = endpointHasRole(
+                            boundary_lines[i].pts.front());
+                        const bool suffix_has_role = endpointHasRole(
+                            boundary_lines[i].pts.back());
+                        if (prefix_has_role != suffix_has_role) {
+                            return prefix_has_role
+                                ? subPolylineByStation(boundary_lines[i].pts, 0.0, hit_station)
+                                : subPolylineByStation(boundary_lines[i].pts, hit_station, total);
+                        }
+                    }
+
                     const Vec2d shared_point = xyOf(pointAtStation(
                         boundary_lines[i].pts, best_station));
                     const Vec2d before = xyOf(pointAtStation(
@@ -1853,18 +1944,28 @@ private:
                     const Vec2d after = xyOf(pointAtStation(
                         boundary_lines[i].pts,
                         std::min(total, best_station + sample_distance))) - shared_point;
-                    // 近共享点的局部弧只有在共享点确实是一个道路边缘转角时
-                    // 才能代表内凹返回段。近 180 度的连续/掉头形链虽然也有
-                    // 共享端点，但应继续保留其原有切点方向（100000610）。
+                    if (best_distance <= 0.05) {
+                        // 命中点正好落在共享节点时，命中与共享点之间没有可
+                        // 返回的局部弧。若链端没有可用角色信息，仍按
+                        // 中心距离选择近侧分支，兼容旧输入。
+                        bool keep_prefix = false;
+                        const double prefix_end_distance = dist(
+                            boundary_lines[i].pts.front(),
+                            Vec3d(center.x(), center.y(), 0.0));
+                        const double suffix_end_distance = dist(
+                            boundary_lines[i].pts.back(),
+                            Vec3d(center.x(), center.y(), 0.0));
+                        keep_prefix = prefix_end_distance < suffix_end_distance;
+                        return keep_prefix
+                            ? subPolylineByStation(boundary_lines[i].pts, 0.0, hit_station)
+                            : subPolylineByStation(boundary_lines[i].pts, hit_station, total);
+                    }
+                    // 非精确命中仍要求共享点两侧确实形成道路边缘转角。
+                    // 近 180 度的连续/掉头形链不能据此判定局部内凹弧，
+                    // 应继续保留其原有切点方向（100000610）。
                     if (before.norm() <= 1e-8 || after.norm() <= 1e-8 ||
                         before.normalized().dot(after.normalized()) <
                             std::cos(5.0 * M_PI / 6.0))
-                        return empty;
-
-                    // 1m 是现有“道路边缘端点命中”判定使用的同一物理邻近范围；
-                    // 超出该范围仍按整条合并链的既有方向规则处理。
-                    const double branch_threshold = groupCutOffset + 0.5;
-                    if (best_distance <= 0.05 || best_distance > branch_threshold)
                         return empty;
                     return subPolylineByStation(
                         boundary_lines[i].pts, hit_station, best_station);
@@ -1883,8 +1984,47 @@ private:
                 // 会把另一条边的远端突尖段带入路口面。
                 bool keep_prefix = false;
                 bool direction_resolved = false;
+                // 合并链可能包含已经越过粗糙路口面 Fence 的远端延伸段。
+                // 此时 Fence 内外关系比交通方向启发式更可靠：只保留命中点
+                // 一侧仍在粗糙路口面内的分支，避免把远端 RoadEdge 接入精细面。
+                if (!inp.area.geometry.outer.empty()) {
+                    const bool prefix_in_fence = pointInPolygon(
+                        xyOf(boundary_lines[i].pts.front()), inp.area.geometry.outer);
+                    const bool suffix_in_fence = pointInPolygon(
+                        xyOf(boundary_lines[i].pts.back()), inp.area.geometry.outer);
+                    if (prefix_in_fence != suffix_in_fence) {
+                        keep_prefix = prefix_in_fence;
+                        direction_resolved = true;
+                    }
+                }
+                const double station = std::max(0.0, std::min(total, hit.station));
+                // 两端都在 Fence 内时，Entry 交通方向无法区分“远端外侧”和
+                // “趋向中心侧”。对靠近合并链端点的单命中，优先保留端点距
+                // 中心更近的一侧；只有中心距离也无法稳定区分时才回退到角色方向。
+                if (!direction_resolved &&
+                    boundary_lines[i].source_ids.size() > 1 &&
+                    !inp.area.geometry.outer.empty() &&
+                    std::min(station, total - station) <= groupCutOffset + 0.5) {
+                    const bool prefix_in_fence = pointInPolygon(
+                        xyOf(boundary_lines[i].pts.front()), inp.area.geometry.outer);
+                    const bool suffix_in_fence = pointInPolygon(
+                        xyOf(boundary_lines[i].pts.back()), inp.area.geometry.outer);
+                    const double prefix_center_distance = dist(
+                        boundary_lines[i].pts.front(),
+                        Vec3d(center.x(), center.y(), 0.0));
+                    const double suffix_center_distance = dist(
+                        boundary_lines[i].pts.back(),
+                        Vec3d(center.x(), center.y(), 0.0));
+                    if (prefix_in_fence && suffix_in_fence &&
+                        std::abs(prefix_center_distance - suffix_center_distance) > 0.5) {
+                        keep_prefix = prefix_center_distance < suffix_center_distance;
+                        direction_resolved = true;
+                    }
+                }
                 for (size_t k = 0; k < hit.cut_indices.size() &&
                                    k < hit.cut_roles.size(); ++k) {
+                    if (direction_resolved)
+                        break;
                     const int cut_index = hit.cut_indices[k];
                     if (cut_index < 0 || cut_index >= (int)cut_group_dirs.size())
                         continue;
@@ -1915,7 +2055,6 @@ private:
                     if (hit.boundary_dir.dot(hit.chain_dir) < 0.0)
                         keep_prefix = !keep_prefix;
                 }
-                double station = std::max(0.0, std::min(total, hit.station));
                 if (keep_prefix && station > 0.05) {
                     result.boundary_lines.push_back(
                         subPolylineByStation(boundary_lines[i].pts, 0.0, station));
@@ -2147,7 +2286,11 @@ private:
                     break;
                 }
             }
-            if (current_node == start_node && out.used_count > 1 && !has_real_candidate)
+            // 只有回到起点且当前节点没有可继续使用的真实分支时才闭环。
+            // 三叉节点仍需继续尝试其它分支，以保持旧的候选环筛选语义。
+            if (current_node == start_node &&
+                out.used_count > 1 &&
+                !has_real_candidate)
                 break;
 
             for (const auto& incident : nodes[current_node].incident) {
@@ -2436,7 +2579,8 @@ private:
             }
         }
 
-        // 获取构成路口外轮廓的道路边缘线
+        // 无 centerline 的兼容调用只需要原始 RoadEdge 凸连结果；保持该
+        // fallback 的旧口径，拓扑串扩展仅作用于精细路口面主路径。
         if (centerlines.empty()) {
             std::vector<std::vector<Vec3d>> raw_boundary_lines;
             for (const auto& bnd : inp.boundaries) {
@@ -2454,6 +2598,10 @@ private:
                 boundary_lines.push_back(std::move(line));
             }
         } else {
+            // 获取构成路口外轮廓的道路边缘线。Boundary 可能被输入数据拆成
+            // “车道边线 -> Other 边界 -> 车道边线”的首尾拓扑串；先把这些
+            // 车道边线桥段加入同一 BoundaryLine，再统一做端点合并，保证后续
+            // cut 命中和 station 截取看到的是完整外轮廓，而不是孤立的 RoadEdge。
             for (const auto& bnd : inp.boundaries) {
                 if (!isUsableRoadEdgeBoundary(inp, bnd))
                     continue;
@@ -2461,16 +2609,64 @@ private:
                 line.pts = bnd.geometry.points;
                 line.source_ids.push_back(bnd.id);
                 line.source_kind = AreaSourceKind::Boundary;
-                line.source_endpoints.push_back({bnd.geometry.points.front(), bnd.geometry.points.back()});
+                line.source_endpoints.push_back({
+                    bnd.geometry.points.front(), bnd.geometry.points.back()});
                 fillBoundarySegmentDirs(line);
                 boundary_lines.push_back(std::move(line));
+            }
+
+            auto sourceIdExists = [&](const std::string& id) {
+                for (const auto& line : boundary_lines) {
+                    if (std::find(line.source_ids.begin(), line.source_ids.end(), id) !=
+                        line.source_ids.end())
+                        return true;
+                }
+                return false;
+            };
+            std::vector<LaneEdgeId> added_bridge_edges;
+            for (const auto& bnd : inp.boundaries) {
+                if (!isLaneEdgeBackedBoundary(inp, bnd))
+                    continue;
+
+                // Boundary 与 LaneEdge 同 ID 时，Boundary 几何已经包含该段，
+                // 再加一份会制造重叠边和伪环。
+                bool has_same_id_lane_edge = false;
+                for (const auto& edge : inp.lane_edges) {
+                    if (edge.id == bnd.id) {
+                        has_same_id_lane_edge = true;
+                        break;
+                    }
+                }
+                if (has_same_id_lane_edge)
+                    continue;
+
+                const Vec3d endpoints[2] = {
+                    bnd.geometry.points.front(), bnd.geometry.points.back()};
+                for (const auto& endpoint : endpoints) {
+                    for (const auto* edge : laneEdgesTouchingEndpoint(inp, endpoint)) {
+                        if (sourceIdExists(edge->id) ||
+                            std::find(added_bridge_edges.begin(), added_bridge_edges.end(), edge->id) !=
+                                added_bridge_edges.end() ||
+                            edge->geometry.points.size() < 2)
+                            continue;
+                        BoundaryLine bridge;
+                        bridge.pts = edge->geometry.points;
+                        bridge.source_ids.push_back(edge->id);
+                        bridge.source_kind = AreaSourceKind::Boundary;
+                        bridge.source_endpoints.push_back({
+                            edge->geometry.points.front(), edge->geometry.points.back()});
+                        fillBoundarySegmentDirs(bridge);
+                        boundary_lines.push_back(std::move(bridge));
+                        added_bridge_edges.push_back(edge->id);
+                    }
+                }
             }
             boundary_lines = MergeBoundaryLines(std::move(boundary_lines));
         }
 
         // 打断处理后集合段：组端边缘线+道路边缘
         AlignedAreaParts parts = alignCutLinesAndBoundaries(
-            boundary_lines, cut_lines, cut_roles, cut_meta, cut_group_dirs,
+            inp, boundary_lines, cut_lines, cut_roles, cut_meta, cut_group_dirs,
             cut_group_edge_ids, center, group_ids);
 
         bool prefer_center_containment = parts.boundary_lines.size() >= 3;

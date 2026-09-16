@@ -241,10 +241,11 @@ double maxDeviationToPolyline(const BezierCurve& curve, const LineString2d& line
 }
 
 /// 几何掉头判定：与 shape_constraint 内的 isGeometricUTurn 同口径。
-bool isGeometricUTurn(const std::pair<Vec2d, Vec2d>& entry,
+bool isGeometricUTurn(const Connectivity& connectivity,
+                      const std::pair<Vec2d, Vec2d>& entry,
                       const std::pair<Vec2d, Vec2d>& exit) {
-    return entry.second.norm() > 1e-8 && exit.second.norm() > 1e-8 &&
-           entry.second.normalized().dot(exit.second.normalized()) < -0.5;
+    return isGeometricUTurnByTurnType(
+        connectivity.turn_type, entry.second, exit.second);
 }
 
 std::string formatPoint(const Vec2d& pt) {
@@ -434,7 +435,7 @@ void auditCurves(const std::string& name, const IntersectionInput& raw_input,
         }
 
         // 端点 G1（业务口径）：几何掉头豁免，家族错开站位会有意打破端点 G1。
-        if (!isGeometricUTurn(context.entry, context.exit)) {
+        if (!isGeometricUTurn(conn, context.entry, context.exit)) {
             const double g1 = endpointG1Min(curve, input, cc);
             if (g1 < 0.999) {
                 const bool hard = g1 < 0.99;
@@ -449,7 +450,7 @@ void auditCurves(const std::string& name, const IntersectionInput& raw_input,
         // 固定形态保持：几何掉头按最新掉头形态约束统一重生成，不参与此项；固有形态
         // 穿障时生成侧允许重生成，只记 info。
         if (conn.geometry.points.size() >= 2 &&
-            !isGeometricUTurn(context.entry, context.exit)) {
+            !isGeometricUTurn(conn, context.entry, context.exit)) {
             const double deviation = maxDeviationToPolyline(curve, conn.geometry);
             const double tolerance = 0.10;
             if (deviation > tolerance) {

@@ -620,9 +620,8 @@ std::vector<CurveCandidate> CurveInitializerRegistry::build(
     const Vec2d& t0 = context.entry.second;
     const Vec2d& p1 = context.exit.first;
     const Vec2d& t1 = context.exit.second;
-    const bool geometric_uturn =
-        t0.norm() > 1e-8 && t1.norm() > 1e-8 &&
-        t0.normalized().dot(t1.normalized()) < -0.5;
+    const bool geometric_uturn = isGeometricUTurnByTurnType(
+        context.connectivity->turn_type, t0, t1);
 
     if (geometric_uturn) {
         CurveCandidate candidate;

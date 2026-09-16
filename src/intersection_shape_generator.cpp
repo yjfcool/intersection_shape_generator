@@ -86,8 +86,9 @@ bool IntersectionShapeGenerator::generate(const IntersectionInput& input, Inters
         ElevationInterpolator(output.connectivity_curves, norm_input); //高程插值
         output.perf.optimize_ms = opt_ms;
 
-        /// 车道边线生成：按兼容基线保持车道边线生成关闭，lane_edges 继续为空。
+        // 顶层暂不启用 EdgeLineGenerator；清空复用的输出对象，避免残留旧边线。
         auto te = std::chrono::steady_clock::now();
+        output.lane_edges.clear();
         // EdgeLineGenerator elgen;
         // output.lane_edges = elgen.generate(norm_input, output.connectivity_curves);
         output.perf.edge_gen_ms =

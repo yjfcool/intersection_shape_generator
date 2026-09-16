@@ -11,6 +11,23 @@
 
 namespace isg {
 
+bool isDeclaredOrdinaryTurn(ConnTurnType declared_turn) {
+    return declared_turn == ConnTurnType::TurnLeft ||
+           declared_turn == ConnTurnType::TurnRight;
+}
+
+bool isGeometricUTurnByTurnType(
+    ConnTurnType declared_turn, const Vec2d& entry_tangent,
+    const Vec2d& exit_tangent) {
+    if (isDeclaredOrdinaryTurn(declared_turn))
+        return false;
+    if (declared_turn == ConnTurnType::UTurnLeft ||
+        declared_turn == ConnTurnType::UTurnRight)
+        return true;
+    return entry_tangent.norm() > 1e-8 && exit_tangent.norm() > 1e-8 &&
+           entry_tangent.normalized().dot(exit_tangent.normalized()) < -0.5;
+}
+
 namespace {
 
 LaneGroupId laneGroupIdForRole(
@@ -216,8 +233,8 @@ bool UTurnFamilyBuilder::isGeometricUTurn(
         input.entryPtDir(connectivity.entry_lane_id);
     const std::pair<Vec2d, Vec2d> exit =
         input.exitPtDir(connectivity.exit_lane_id);
-    return entry.second.norm() > 1e-8 && exit.second.norm() > 1e-8 &&
-           entry.second.normalized().dot(exit.second.normalized()) < -0.5;
+    return isGeometricUTurnByTurnType(
+        connectivity.turn_type, entry.second, exit.second);
 }
 
 Vec2d UTurnFamilyBuilder::alignmentAxis(

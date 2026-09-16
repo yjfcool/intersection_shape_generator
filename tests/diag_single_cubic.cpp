@@ -37,10 +37,11 @@ using namespace isg;
 
 namespace {
 
-bool isGeometricUTurnLocal(const std::pair<Vec2d, Vec2d>& entry,
-                           const std::pair<Vec2d, Vec2d>& exit) {
-    return entry.second.norm() > 1e-8 && exit.second.norm() > 1e-8 &&
-           entry.second.normalized().dot(exit.second.normalized()) < -0.5;
+bool isGeometricUTurnLocal(
+    const Connectivity& connectivity, const std::pair<Vec2d, Vec2d>& entry,
+    const std::pair<Vec2d, Vec2d>& exit) {
+    return isGeometricUTurnByTurnType(
+        connectivity.turn_type, entry.second, exit.second);
 }
 
 /// 与 diag_all_violations 的 auditProfile 同口径，另外打开同簇检查，因为这里要
@@ -312,7 +313,7 @@ int main(int argc, char** argv) {
         CurveGenerationContext context = CurveGenerationContextBuilder().build(
             scene, conn, dir_cfg.uturn_alignment_scope, &solver, &family);
         context.profile = profile;
-        if (isGeometricUTurnLocal(context.entry, context.exit))
+        if (isGeometricUTurnLocal(conn, context.entry, context.exit))
             continue;
         if (!show_all && final_curve.numSegments() == 1)
             continue;

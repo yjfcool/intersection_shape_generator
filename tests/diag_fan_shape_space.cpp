@@ -12,8 +12,10 @@
 //
 // Usage: diag_fan_shape_space <data.json> <target_id> <sibling_id> [...]
 #include "constraints/shape_constraint.h"
+#include "constraints/road_edge_clearance.h"
 #include "constraints/constraint_evaluator.h"
 #include "curve/curve_utils.h"
+#include "geometry/predicates.h"
 #include "domain/scene_context.h"
 #include "generation/connectivity_generation_context.h"
 #include "intersection_shape_generator.h"
@@ -170,6 +172,23 @@ int main(int argc, char** argv) {
                 continue;
             }
             ++feasible;
+            if (std::getenv("ISG_DIAG_ROAD_EDGE") &&
+                target_id == "33") {
+                const RoadEdgeClearanceMeasure measure =
+                    measureCurveRoadEdgeClearanceForAudit(
+                        candidate, input.boundaries, Boundary::Type::RoadEdge,
+                        1.0, 128, 1e-4);
+                if (roadEdgeClearanceDeficit(measure, 1.0) > 0.0 ||
+                    std::getenv("ISG_DIAG_SHOW_ROAD_EDGE")) {
+                    printf("  roadedge h0=%.3f h1=%.3f min=%.4f deficit=%.4f "
+                           "loc=(%.3f,%.3f) deficit_loc=(%.3f,%.3f) start=%.4f end=%.4f\n",
+                           h0, h1, measure.minimum,
+                           roadEdgeClearanceDeficit(measure, 1.0),
+                           measure.location.x(), measure.location.y(),
+                           measure.deficit_location.x(), measure.deficit_location.y(),
+                           measure.start_distance, measure.end_distance);
+                }
+            }
             // 同时按两套口径统计：1.5m 是最终审计口径（diag_all_violations），
             // 0.15m 是配对修复内部的候选硬门口径。两者不一致时，审计已经
             // 干净的候选仍可能在修复阶段被 0.15m 判为穿越而剔除，因此把
@@ -199,6 +218,74 @@ int main(int argc, char** argv) {
         }
     }
     printf("  shape-feasible cells=%d, of which clean=%d\n", feasible, clean);
+
+    // 可选的双曲线联合扫描：单条曲线对当前兄弟都无解时，不能据此
+    // 断言单段族本身无解；两条曲线可能需要同时改变把手长度。该诊断
+    // 只用于定位候选空间问题，不参与生成器决策。
+    if (std::getenv("ISG_DIAG_JOINT") && sibling_ids.size() == 1) {
+        const Connectivity* sibling = nullptr;
+        for (const auto& conn : input.connectivities)
+            if (conn.id == sibling_ids.front())
+                sibling = &conn;
+        if (sibling) {
+            const CurveGenerationContext sibling_context =
+                builder.build(scene, *sibling);
+            const auto build_candidates = [&](const Connectivity& conn,
+                                               const CurveGenerationContext& ctx) {
+                const auto e = input.entryPtDir(conn.entry_lane_id);
+                const auto x = input.exitPtDir(conn.exit_lane_id);
+                const auto b = ordinarySingleCubicHandleBounds(
+                    e.first, e.second, x.first, x.second);
+                std::vector<BezierCurve> candidates;
+                for (int i = 0; i <= 32; ++i) {
+                    const double h0 = b.start_min +
+                        (b.start_max - b.start_min) * i / 32.0;
+                    for (int j = 0; j <= 32; ++j) {
+                        const double h1 = b.end_min +
+                            (b.end_max - b.end_min) * j / 32.0;
+                        BezierCurve candidate = makeCubic(
+                            e.first, e.second, x.first, x.second, h0, h1);
+                        if (!ordinarySingleCubicControlsValid(
+                                candidate, e.first, e.second, x.first,
+                                x.second, 1e-5, true) ||
+                            curveSelfIntersectsBusiness(candidate, 1.0) ||
+                            evaluateOrdinaryShape(
+                                candidate, ctx, empty_state).state ==
+                                ConstraintState::Violated ||
+                            hasPhysicalViolation(candidate, scene, conn))
+                            continue;
+                        candidates.push_back(std::move(candidate));
+                    }
+                }
+                return candidates;
+            };
+            const std::vector<BezierCurve> target_candidates =
+                build_candidates(*target, context);
+            const std::vector<BezierCurve> sibling_candidates =
+                build_candidates(*sibling, sibling_context);
+            std::size_t joint_clean = 0;
+            printf("  joint candidates %s=%zu %s=%zu\n",
+                   target_id.c_str(), target_candidates.size(),
+                   sibling_ids.front().c_str(), sibling_candidates.size());
+            for (const auto& a : target_candidates) {
+                for (const auto& b : sibling_candidates) {
+                    if (curvesIntersectBusiness(a, b, 1.5))
+                        continue;
+                    ++joint_clean;
+                    if (joint_clean <= 10) {
+                        const auto& ag = a.segs.front().ctrl;
+                        const auto& bg = b.segs.front().ctrl;
+                        printf("    joint CLEAN %.3f/%.3f %.3f/%.3f\n",
+                               (ag[1] - ag[0]).norm(),
+                               (ag[3] - ag[2]).norm(),
+                               (bg[1] - bg[0]).norm(),
+                               (bg[3] - bg[2]).norm());
+                    }
+                }
+            }
+            printf("  joint clean combinations=%zu\n", joint_clean);
+        }
+    }
 
     if (std::getenv("ISG_DIAG_PHYSICAL") && sibling_ids.size() >= 1) {
         std::vector<const Connectivity*> members;

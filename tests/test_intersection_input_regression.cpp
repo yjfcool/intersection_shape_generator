@@ -2708,6 +2708,121 @@ TEST_CASE("110002137 exit group road edge uses only the cut-line valid span",
         output.area.geometry.outer, edge1006810->geometry.points[2], 0.08));
 }
 
+TEST_CASE("100000915 shared RoadEdge node keeps the local branch",
+          "[regression][area][100000915]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000915.json";
+    IntersectionInput input = loadInputOrSkip(path);
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+    REQUIRE_FALSE(output.area.geometry.outer.empty());
+    REQUIRE(isSimplePolygon(output.area.geometry));
+    INFO("100000915 area generation elapsed_ms=" << output.perf.area_gen_ms);
+    CHECK(output.perf.area_gen_ms < 1000.0);
+
+    const Boundary* remote_edge = findBoundary(input, "43123713");
+    const Boundary* local_edge = findBoundary(input, "43123542");
+    REQUIRE(remote_edge);
+    REQUIRE(local_edge);
+    INFO("A cut-line hit at the 43123713|43123542 shared node must keep the "
+         "local branch and reject the remote 43123713 extension.");
+    CHECK_FALSE(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *remote_edge, 0.08, 0.20));
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, remote_edge->geometry.points.front(), 0.08));
+    CHECK(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *local_edge, 0.08, 0.20));
+
+    INFO("Road-edge participation must follow complete entry/exit topology "
+         "chains, including Other boundaries bridged by LaneEdges.");
+    for (const auto& boundary_id : std::vector<LaneEdgeId>{
+             "43123432", "43123438", "43123504",
+             "43125037", "43123661", "43123542"}) {
+        const Boundary* boundary = findBoundary(input, boundary_id);
+        REQUIRE(boundary);
+        INFO("Expected boundary " << boundary_id
+             << " to contribute a segment to the fine intersection area");
+        CHECK(polygonUsesBoundarySegment(
+            output.area.geometry.outer, *boundary, 0.08, 0.20));
+    }
+
+    const Boundary* outside_fence_lane_edge = findBoundary(input, "43123434");
+    REQUIRE(outside_fence_lane_edge);
+    INFO("43123434 is a lane-edge-backed Other boundary, but its remote span "
+         "is outside the rough-area fence and must not be forced into a simple "
+         "fine-area ring.");
+    CHECK_FALSE(pointInPolygon(
+        xyOf(outside_fence_lane_edge->geometry.points.back()),
+        input.area.geometry.outer));
+    CHECK_FALSE(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *outside_fence_lane_edge, 0.08, 0.20));
+
+    const Boundary* same_side_connector = findBoundary(input, "43123428");
+    REQUIRE(same_side_connector);
+    INFO("Same-role short LaneEdge connectors must not be promoted to the "
+         "outer road-edge chain.");
+    CHECK_FALSE(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *same_side_connector, 0.08, 0.20));
+}
+
+TEST_CASE("100000412 keeps the in-fence concave RoadEdge branch",
+          "[regression][area][100000412]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000412.json";
+    IntersectionInput input = loadInputOrSkip(path);
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+    REQUIRE_FALSE(output.area.geometry.outer.empty());
+    REQUIRE(isSimplePolygon(output.area.geometry));
+    INFO("100000412 area generation elapsed_ms=" << output.perf.area_gen_ms);
+    CHECK(output.perf.area_gen_ms < 1000.0);
+
+    const Boundary* edge3001230 = findBoundary(input, "3001230");
+    REQUIRE(edge3001230);
+    REQUIRE(edge3001230->geometry.points.size() > 2);
+
+    INFO("The merged 3001267|3001230 chain must not keep its remote, out-of-fence "
+         "prefix; the fine area must retain the concave in-fence span of 3001230.");
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, edge3001230->geometry.points.front(), 0.08));
+    CHECK(hasPolygonPointNear(
+        output.area.geometry.outer, edge3001230->geometry.points[2], 0.08));
+    CHECK(polygonUsesBoundarySegmentInStationRange(
+        output.area.geometry.outer, *edge3001230,
+        boundaryPointStationForTest(*edge3001230, 2),
+        boundaryLengthForTest(*edge3001230), 0.08, 0.20));
+}
+
+TEST_CASE("110000703-u keeps the centerward RoadEdge chain branch",
+          "[regression][area][110000703]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110000703-u.json";
+    IntersectionInput input = loadInputOrSkip(path);
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(input, output));
+    REQUIRE_FALSE(output.area.geometry.outer.empty());
+    REQUIRE(isSimplePolygon(output.area.geometry));
+    INFO("110000703-u area generation elapsed_ms=" << output.perf.area_gen_ms);
+    CHECK(output.perf.area_gen_ms < 1000.0);
+
+    const Boundary* edge43110007 = findBoundary(input, "43110007");
+    const Boundary* edge43110008 = findBoundary(input, "43110008");
+    REQUIRE(edge43110007);
+    REQUIRE(edge43110008);
+
+    INFO("The merged 43110008|43110007 chain must keep the centerward suffix, "
+         "not only the 0.5m remote prefix before its Entry cut hit.");
+    CHECK_FALSE(hasPolygonPointNear(
+        output.area.geometry.outer, edge43110008->geometry.points.front(), 0.08));
+    CHECK(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *edge43110008, 0.08, 0.20));
+    CHECK(polygonUsesBoundarySegment(
+        output.area.geometry.outer, *edge43110007, 0.08, 0.20));
+}
+
 TEST_CASE("100000443 road edge clipping ignores opposite-direction group hits",
           "[regression][area][100000443]") {
     const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/100000443.json";

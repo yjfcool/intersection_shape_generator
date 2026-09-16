@@ -25,7 +25,9 @@ struct RepairBudget {
           final_straight_uturn_repairs(6), pure_topology_passes(3),
           pure_topology_repairs_per_pass(6), shape_restores(8),
           base_expression_passes(1), pair_safe_passes(3),
-          pair_safe_phases(4), regeneration_passes(1),
+          // 0~3 为共享端点转向阶段，4 为非共享普通转弯，5 为共享近直行
+          // 曲线的有界修复。
+          pair_safe_phases(6), regeneration_passes(1),
           regenerations_per_pass(8) {}
 };
 

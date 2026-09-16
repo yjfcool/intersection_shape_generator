@@ -179,4 +179,15 @@ public:
                                  double& min_lead1) const;
 };
 
+/// 按声明转向和端点几何方向统一解析 U-turn。
+/// 显式左/右转优先于“切向近似反向”的几何启发式；显式 U-turn 仍保留
+/// U-turn 语义，Unknown/Straight 才使用几何阈值作为兜底。
+bool isGeometricUTurnByTurnType(ConnTurnType declared_turn,
+                                const Vec2d& entry_tangent,
+                                const Vec2d& exit_tangent);
+
+/// 判断输入是否明确声明为普通左/右转。该语义优先于端点几何阈值，供
+/// 普通曲线形态、候选搜索和最终审计保持同一转弯/直行分支。
+bool isDeclaredOrdinaryTurn(ConnTurnType declared_turn);
+
 }  // 命名空间 isg

@@ -1,9 +1,12 @@
 #include "cluster_order.h"
 #include "optimizer/sdf_field.h"
 #include "curve/curve_utils.h"
+#include "preprocessing/uturn_family_builder.h"
 #include "utils.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 
 namespace isg {
@@ -345,8 +348,7 @@ void ClusterOrderSolver::detectTopologicalInversions(
         Vec2d path = p1 - p0;
         if (path.norm() < 1e-6) return '?';
         path.normalize();
-        double dot = t0.dot(t1);
-        if (dot < -0.5) return 'U';
+        if (isGeometricUTurnByTurnType(c->turn_type, t0, t1)) return 'U';
         double cross = cross2d(t0, path);
         if (cross > 0.5) return 'L';
         if (cross < -0.5) return 'R';
@@ -486,6 +488,22 @@ void ClusterOrderSolver::detectTopologicalInversions(
                 if (iea != entry_lat_in_entry_ref_.end() &&
                     ieb != entry_lat_in_entry_ref_.end()) {
                     double entry_diff = iea->second - ieb->second;
+                    if (std::getenv("ISG_DEBUG_CLUSTER_ORDER") != nullptr &&
+                        ((pair.id_a == "1" && pair.id_b == "16") ||
+                         (pair.id_a == "31" && pair.id_b == "15") ||
+                         (pair.id_a == "31" && pair.id_b == "16") ||
+                         (pair.id_a == "32" && pair.id_b == "16"))) {
+                        fprintf(stderr,
+                                "[CLUSTER-ORDER] pair=%s|%s same_entry=%d rank=%d/%d entry_lat=%.6f/%.6f exit_lat=%.6f/%.6f entry_diff=%.6f exit_diff_pending\n",
+                                pair.id_a.c_str(), pair.id_b.c_str(),
+                                same_entry ? 1 : 0,
+                                entry_cluster_rank_.at(pair.id_a),
+                                entry_cluster_rank_.at(pair.id_b),
+                                iea->second, ieb->second,
+                                exit_lat_in_entry_ref_.at(pair.id_a),
+                                exit_lat_in_entry_ref_.at(pair.id_b),
+                                entry_diff);
+                    }
                     if (std::abs(entry_diff) > LAT_EPS) {
                         double exit_diff = 0.0;
                         bool got_exit = false;
@@ -507,6 +525,17 @@ void ClusterOrderSolver::detectTopologicalInversions(
                                 exit_diff = ixa->second - ixb->second;
                                 got_exit = true;
                             }
+                        }
+                        if (std::getenv("ISG_DEBUG_CLUSTER_ORDER") != nullptr &&
+                            ((pair.id_a == "1" && pair.id_b == "16") ||
+                             (pair.id_a == "31" && pair.id_b == "15") ||
+                             (pair.id_a == "31" && pair.id_b == "16") ||
+                             (pair.id_a == "32" && pair.id_b == "16"))) {
+                            fprintf(stderr,
+                                    "[CLUSTER-ORDER] pair=%s|%s share_exit=%d got_exit=%d exit_diff=%.6f\n",
+                                    pair.id_a.c_str(), pair.id_b.c_str(),
+                                    share_exit ? 1 : 0, got_exit ? 1 : 0,
+                                    exit_diff);
                         }
                         if (got_exit && std::abs(exit_diff) > LAT_EPS) {
                             if (entry_diff * exit_diff < 0.0) {
@@ -697,7 +726,8 @@ void ClusterOrderSolver::build(
             // 用实际车道切向点积判断U型调头
             Vec2d t0 = connectionDirection(*c, lanes, true);
             Vec2d t1 = connectionDirection(*c, lanes, false);
-            is_uturn_[cids[i]] = (t0.dot(t1) < -0.5);
+            is_uturn_[cids[i]] = isGeometricUTurnByTurnType(
+                c->turn_type, t0, t1);
         }
     }
 
@@ -724,7 +754,8 @@ void ClusterOrderSolver::build(
             if (!is_uturn_.count(cids[i])) {
                 Vec2d t0 = connectionDirection(*c, lanes, true);
                 Vec2d t1 = connectionDirection(*c, lanes, false);
-                is_uturn_[cids[i]] = (t0.dot(t1) < -0.5);
+                is_uturn_[cids[i]] = isGeometricUTurnByTurnType(
+                    c->turn_type, t0, t1);
             }
         }
     }

@@ -8,6 +8,7 @@
 #include "geometry/predicates.h"
 #include "optimizer/sdf_field.h"
 #include "preprocessing/crosswalk_clearance_calculator.h"
+#include "preprocessing/uturn_family_builder.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -35,8 +36,9 @@ ConstraintResult violated(const char* id, const char* reason, double amount = 1.
 }
 
 bool isGeometricUTurn(const CurveGenerationContext& context) {
-    return context.entry.second.norm() > 1e-8 && context.exit.second.norm() > 1e-8 &&
-           context.entry.second.normalized().dot(context.exit.second.normalized()) < -0.5;
+    return context.connectivity && isGeometricUTurnByTurnType(
+        context.connectivity->turn_type, context.entry.second,
+        context.exit.second);
 }
 
 bool signFlip(const BezierCurve& curve, double eps = 0.10) {
@@ -380,6 +382,13 @@ ConstraintResult evaluateOrdinaryShape(const BezierCurve& curve,
         if (ratio > 1.08 || lateral > 0.08 || curve.maxCurvature(40) > 3.0)
             return violated("shape.ordinary.straight", "straight curve is not sufficiently straight");
     } else {
+        // 与生成侧 isNonUTurnTurnShapeAcceptable() 的短急弯例外保持一致。
+        // 短连接的合法单段可以有较高局部曲率，但仍须是单侧、无 S 形的可行驶弧；
+        // 不能因为端点转角很大而被普通弧长地板重复拒绝。
+        if (chord.norm() <= 10.0 && curve.arcLength() <= 10.5 &&
+            ratio >= 1.005 && ratio <= 1.08 &&
+            curve.maxCurvature(40) <= 6.0 && !signFlip(curve))
+            return satisfied("shape.ordinary");
         // arc/chord 下限按端点转角折算（见 ordinaryTurnArcChordFloor）：
         // 需求写的常数是按 90° 折算出来的，浅转时常数超过同转角圆弧的
         // 理论比例，任何合规单拱都不可能达到。

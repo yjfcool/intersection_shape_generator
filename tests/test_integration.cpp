@@ -817,6 +817,20 @@ TEST_CASE("Integration: perf stats are populated", "[integration]") {
     REQUIRE(out.perf.area_gen_ms  >= 0.0);
 }
 
+TEST_CASE("Integration: disabled edge generation clears reused output",
+          "[integration][output-state]") {
+    auto inp = makeTwoDirectionInput(false);
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput out;
+    out.lane_edges.push_back(ConnectivityLaneEdge());
+    out.perf.edge_gen_ms = 123.0;
+
+    REQUIRE(gen.generate(inp, out));
+    CHECK(out.lane_edges.empty());
+    CHECK(out.perf.edge_gen_ms == 0.0);
+}
+
 // ──────────────────────────────────────────────────────────────
 //  4-way intersection: 4 entry + 4 exit groups, 8 connectivities
 // ──────────────────────────────────────────────────────────────

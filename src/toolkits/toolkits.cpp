@@ -3,6 +3,7 @@
 //
 
 #include "toolkits.h"
+#include "preprocessing/uturn_family_builder.h"
 #include "utils.h"
 #include <unordered_set>
 
@@ -37,9 +38,17 @@ namespace isg {
             return connectivity.turn_type;
         const Vec2d entry_tangent = entry.second.normalized();
         const Vec2d exit_tangent = exit.second.normalized();
-        if (entry_tangent.dot(exit_tangent) < -0.5)
+        if (isGeometricUTurnByTurnType(
+                connectivity.turn_type, entry_tangent, exit_tangent))
+            {
             return cross2d(entry_tangent, exit.first - entry.first) >= 0.0 ?
                    ConnTurnType::UTurnLeft : ConnTurnType::UTurnRight;
+            }
+        if (connectivity.turn_type == ConnTurnType::TurnLeft ||
+            connectivity.turn_type == ConnTurnType::TurnRight ||
+            connectivity.turn_type == ConnTurnType::UTurnLeft ||
+            connectivity.turn_type == ConnTurnType::UTurnRight)
+            return connectivity.turn_type;
         Vec2d chord = exit.first - entry.first;
         if (chord.norm() < 1e-9) return ConnTurnType::Straight;
         chord.normalize();
