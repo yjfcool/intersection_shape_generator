@@ -187,12 +187,19 @@ struct RawBoundarySegment {
     bool road_edge = false;
 };
 
-static const std::vector<RawBoundarySegment>& cachedRawBoundarySegments(
+struct RawBoundarySegmentCache {
+    std::vector<RawBoundarySegment> segments;
+    // 按 bbox.min.x 排序的索引。查询仍对每个候选执行完整包围盒判断，
+    // 这里只跳过 x 轴上必然不相交的边界段。
+    std::vector<std::size_t> x_order;
+};
+
+static const RawBoundarySegmentCache& cachedRawBoundarySegments(
         const std::vector<Boundary>& boundaries) {
     struct Entry {
         std::uint64_t key = 0;
         bool valid = false;
-        std::vector<RawBoundarySegment> segments;
+        RawBoundarySegmentCache cache;
     };
     static thread_local std::vector<Entry> cache(8);
     static thread_local std::size_t next_slot = 0;
@@ -200,11 +207,12 @@ static const std::vector<RawBoundarySegment>& cachedRawBoundarySegments(
         boundaries, Vec2d(0, 0), nullptr);
     for (const Entry& entry : cache)
         if (entry.valid && entry.key == key)
-            return entry.segments;
+            return entry.cache;
 
     Entry& slot = cache[next_slot];
     next_slot = (next_slot + 1) % cache.size();
-    slot.segments.clear();
+    slot.cache.segments.clear();
+    slot.cache.x_order.clear();
     for (const auto& boundary : boundaries) {
         const auto& points = boundary.geometry.points;
         for (std::size_t i = 0; i + 1 < points.size(); ++i) {
@@ -216,12 +224,23 @@ static const std::vector<RawBoundarySegment>& cachedRawBoundarySegments(
             segment.bbox.expand(segment.a);
             segment.bbox.expand(segment.b);
             segment.road_edge = boundary.type == Boundary::Type::RoadEdge;
-            slot.segments.push_back(std::move(segment));
+            slot.cache.segments.push_back(std::move(segment));
         }
     }
+    slot.cache.x_order.resize(slot.cache.segments.size());
+    for (std::size_t i = 0; i < slot.cache.x_order.size(); ++i)
+        slot.cache.x_order[i] = i;
+    std::sort(slot.cache.x_order.begin(), slot.cache.x_order.end(),
+              [&](std::size_t a, std::size_t b) {
+                  const double ax = slot.cache.segments[a].bbox.min_pt.x();
+                  const double bx = slot.cache.segments[b].bbox.min_pt.x();
+                  if (std::abs(ax - bx) > 1e-12)
+                      return ax < bx;
+                  return a < b;
+              });
     slot.key = key;
     slot.valid = true;
-    return slot.segments;
+    return slot.cache;
 }
 
 // 对曲线进行采样后的线段级边界相交检查。
@@ -263,9 +282,17 @@ static bool curveRawIntersectsBoundariesImpl(
                x.max_pt[1] < y.min_pt[1] - kBoxSlack ||
                y.max_pt[1] < x.min_pt[1] - kBoxSlack;
     };
-    const auto& boundary_segments = cachedRawBoundarySegments(boundaries);
-    for (const auto& boundary_segment : boundary_segments) {
+    const RawBoundarySegmentCache& boundary_cache =
+        cachedRawBoundarySegments(boundaries);
+    for (const std::size_t segment_index : boundary_cache.x_order) {
+        const RawBoundarySegment& boundary_segment =
+            boundary_cache.segments[segment_index];
+        // x_order 已按 min.x 排序，后续段的 bbox 不可能再进入查询框。
+        if (boundary_segment.bbox.min_pt.x() > curve_box.max_pt.x())
+            break;
         if (road_edges_only && !boundary_segment.road_edge)
+            continue;
+        if (boundary_segment.bbox.max_pt.x() < curve_box.min_pt.x())
             continue;
         if (!curve_box.intersects(boundary_segment.bbox))
             continue;
@@ -1714,8 +1741,13 @@ static CurveRisk assessCurveRisk(
     const std::vector<SampledSiblingCurve>& sampled_siblings, bool include_fence = true,
     bool is_uturn = false, bool allow_merge_funnel = false) {
     CurveRisk risk;
-    double ms = minSDFAlongCurveAdaptive(curve, sdf);
-    risk.obstacle = curveIntersectsObstacles(curve, input.obstacles) || (ms < 0.0);
+    // SDF 只描述障碍物；无障碍物时跳过逐候选采样。该分支在 U-turn
+    // 家族候选池中会被调用数百次，跳过不会改变物理判定结果。
+    if (!input.obstacles.empty()) {
+        const double ms = minSDFAlongCurveAdaptive(curve, sdf);
+        risk.obstacle = curveIntersectsObstacles(curve, input.obstacles) ||
+            (ms < 0.0);
+    }
 
     // 对于U-turn，使用特殊的边界检查逻辑，优先考虑弧形边界穿越
     if (is_uturn) {
@@ -8815,8 +8847,10 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 std::size_t external_shape_rejected = 0;
                 std::size_t external_physical_rejected = 0;
                 trials.push_back(*results[baseline_external->second].curve);
-                trials.push_back(ordinary_initializer.buildPreferredSingleCubic(
-                    entry.first, entry.second, exit_.first, exit_.second));
+                const BezierCurve preferred_single =
+                    ordinary_initializer.buildPreferredSingleCubic(
+                        entry.first, entry.second, exit_.first, exit_.second);
+                trials.push_back(preferred_single);
                 for (double alpha : {0.25, 0.35, 0.45, 0.55, 0.65, 0.80})
                     trials.push_back(ordinary_initializer.buildSingleCubic(
                         entry.first, entry.second, exit_.first, exit_.second,
@@ -8854,7 +8888,20 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 }
                 const bool allow_waypoint = turn_strength < 0.25 &&
                     chord.norm() > 15.0;
-                if (allow_waypoint) {
+                // 基线曲线可能已经通过宽松的 Boundary 判定，但它的首选单段
+                // 仍可能被 RoadEdge 阻塞；secondary 则需要和 primary 一起换到
+                // 同一组 late-waypoint 走廊。两项都由闭包状态/候选风险决定，
+                // 与路口或连接的外部 ID 无关。
+                const CurveRisk preferred_risk = assessCurveRisk(
+                    preferred_single, input, sdf, {}, true, false);
+                const bool preferred_single_boundary_blocked =
+                    preferred_risk.boundary && !preferred_risk.obstacle &&
+                    !preferred_risk.fence;
+                const bool prefer_late_waypoint_for_road_edge =
+                    allow_waypoint && input.mode == 2 &&
+                    (preferred_single_boundary_blocked || !require_ordinary) &&
+                    input.obstacles.empty();
+                if (allow_waypoint && !prefer_late_waypoint_for_road_edge) {
                     const Vec2d chord_dir = chord.normalized();
                     const Vec2d perpendicular(-chord_dir.y(), chord_dir.x());
                     for (double fraction : {0.18, 0.26, 0.34, 0.42, 0.50,
@@ -8885,10 +8932,43 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         }
                     }
                 }
-                // 同一把手档位经 min/max 钳制后可能产生重复曲线；候选池只保留
-                // 有界前缀，避免多个 U-turn 家族在复杂 Boundary 路口放大回溯。
-                if (trials.size() > (allow_waypoint ? 384u : 192u))
-                    trials.resize(allow_waypoint ? 384u : 192u);
+                // 先保留原有 trial 前缀，确保已验证的 U-turn/普通连接联合解
+                // 不因新增网格改变。RoadEdge 场景使用固定规模的后置路点小网格，
+                // 不再与 broad-waypoint 网格叠加，保证单路口搜索预算可预测。
+                if (prefer_late_waypoint_for_road_edge) {
+                    const Vec2d chord_dir = chord.normalized();
+                    const Vec2d perpendicular(-chord_dir.y(), chord_dir.x());
+                    const std::vector<double> late_fractions = {
+                        0.30, 0.34, 0.42, 0.50};
+                    const std::vector<double> late_offsets = {
+                        1.5, -1.5, 2.0, -2.0};
+                    for (double fraction : late_fractions) {
+                        const Vec2d base = entry.first + fraction * chord;
+                        for (double offset : late_offsets) {
+                            const Vec2d waypoint = base + offset * perpendicular;
+                            const Vec2d from_entry = waypoint - entry.first;
+                            const Vec2d to_exit = exit_.first - waypoint;
+                            if (from_entry.norm() < 0.30 || to_exit.norm() < 0.30)
+                                continue;
+                            std::vector<Vec2d> middle_tangents;
+                            middle_tangents.push_back(to_exit.normalized());
+                            const Vec2d bisector = from_entry.normalized() +
+                                to_exit.normalized();
+                            if (bisector.norm() > 1e-8)
+                                middle_tangents.push_back(bisector.normalized());
+                            middle_tangents.push_back(chord_dir);
+                            for (const Vec2d& middle_tangent : middle_tangents)
+                                for (double alpha : {0.18, 0.24, 0.30})
+                                    trials.push_back(makeCurveFromKnots(
+                                        {entry.first, waypoint, exit_.first},
+                                        {entry.second, middle_tangent, exit_.second},
+                                        alpha));
+                        }
+                    }
+                }
+                const std::size_t trial_limit = allow_waypoint ? 384u : 192u;
+                if (trials.size() > trial_limit)
+                    trials.resize(trial_limit);
                 std::vector<ExternalCandidate>& pool =
                     external_pools[external_id];
                 for (std::size_t ti = 0; ti < trials.size(); ++ti) {
@@ -8918,8 +8998,9 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         ++external_shape_rejected;
                         continue;
                     }
-                    if (assessCurveRisk(
-                            trial, input, sdf, {}, true, false).physical()) {
+                    const CurveRisk trial_risk =
+                        assessCurveRisk(trial, input, sdf, {}, true, false);
+                    if (trial_risk.physical()) {
                         ++external_physical_rejected;
                         continue;
                     }
@@ -8927,10 +9008,38 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                     candidate.curve = trial;
                     candidate.score = candidate.curve.maxCurvature(30) +
                         0.02 * candidate.curve.arcLength() +
-                        0.01 * static_cast<double>(ti) +
+                        (prefer_late_waypoint_for_road_edge ? 1e-5 : 0.01) *
+                            static_cast<double>(ti) +
                         (single_cubic ? 0.0 :
                             kChordBudgetOvershootPenalty *
                                 curveChordBudgetOvershoot(candidate.curve));
+                    if (prefer_late_waypoint_for_road_edge && !single_cubic &&
+                        turn_strength < 0.25) {
+                        const Vec2d waypoint =
+                            candidate.curve.segs.front().ctrl[3];
+                        const double waypoint_fraction =
+                            (waypoint - entry.first).dot(chord) /
+                            std::max(1e-8, chord.squaredNorm());
+                        double first_segment_lateral = 0.0;
+                        BezierCurve first_segment;
+                        first_segment.segs.push_back(
+                            candidate.curve.segs.front());
+                        for (const Vec2d& point :
+                             first_segment.sampleByArcLength(24)) {
+                            first_segment_lateral = std::max(
+                                first_segment_lateral,
+                                std::abs(cross2d(
+                                    chord.normalized(), point - entry.first)) /
+                                    chord.norm());
+                        }
+                        const double junction_curvature_jump = std::abs(
+                            candidate.curve.segs.front().curvature(1.0) -
+                            candidate.curve.segs.back().curvature(0.0));
+                        candidate.score +=
+                            4.0 * std::max(0.0, 0.42 - waypoint_fraction) +
+                            6.0 * first_segment_lateral +
+                            0.25 * junction_curvature_jump;
+                    }
                     pool.push_back(std::move(candidate));
                 }
                 std::stable_sort(
@@ -10519,10 +10628,35 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
             bool family_has_current_curve_cross = false;
             bool family_has_current_physical_risk = false;
             bool family_has_current_road_edge_risk = false;
+            bool family_has_current_multisegment_turn = false;
             for (std::size_t i = 0; i < family.size(); ++i) {
                 auto ia = final_idx.find(family[i]);
                 if (ia == final_idx.end() || !results[ia->second].curve)
                     continue;
+                const Connectivity* member_conn =
+                    scene.view.connectivity(family[i]);
+                // Boundary 重搜可能先用 waypoint 消除当前兄弟交叉，但普通
+                // 转向仍应回到共享族的单段联合求解。近直行的两段 waypoint
+                // 是有意保留的 RoadEdge 方案（如 110003285 的 64/65），
+                // 因此只有明确偏转的普通连接触发该恢复门禁。
+                if (member_conn &&
+                    results[ia->second].curve->numSegments() != 1) {
+                    const auto member_entry = scene.view.entryFrame(
+                        member_conn->entry_lane_id);
+                    const auto member_exit = scene.view.exitFrame(
+                        member_conn->exit_lane_id);
+                    const Vec2d member_chord =
+                        member_exit.first - member_entry.first;
+                    if (member_chord.norm() > 1e-8 &&
+                        member_entry.second.norm() > 1e-8 &&
+                        std::abs(cross2d(
+                            member_entry.second.normalized(),
+                            member_chord.normalized())) >
+                            kOrdinaryTurnStrengthThreshold) {
+                        needs_restore = true;
+                        family_has_current_multisegment_turn = true;
+                    }
+                }
                 if (strictCandidateHasExactPhysicalRisk(
                         *results[ia->second].curve)) {
                     family_has_current_physical_risk = true;
@@ -10792,8 +10926,12 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 // 后续族内回溯最多只使用 24 个成员候选；物理门禁也只对
                 // 这个有界前缀求值。跨族闭包需要的更宽候选由下方独立的
                 // build_strict_closure_pool 按 32/64 的闭包预算构造。
+                constexpr std::size_t kMaxStrictPairMultisegmentPoolCandidates =
+                    128;
                 const std::size_t physical_budget = family.size() == 2
-                    ? kMaxStrictPairPoolCandidates
+                    ? (family_has_current_multisegment_turn
+                        ? kMaxStrictPairMultisegmentPoolCandidates
+                        : kMaxStrictPairPoolCandidates)
                     : kMaxStrictPoolCandidates;
                 for (auto& pending_item : pending) {
                     const std::string risk_key = strict_curve_key(

@@ -1027,6 +1027,30 @@ static double maxLateralChordDeviationRatioForTest(const BezierCurve& curve) {
     return max_dev / chord_len;
 }
 
+static double waypointChordFractionForTest(const BezierCurve& curve) {
+    REQUIRE(curve.numSegments() == 2);
+    const Vec2d chord = curve.endPt() - curve.startPt();
+    REQUIRE(chord.squaredNorm() > 1e-12);
+    const Vec2d waypoint = curve.segs.front().ctrl[3];
+    return (waypoint - curve.startPt()).dot(chord) / chord.squaredNorm();
+}
+
+static double firstSegmentLateralChordDeviationRatioForTest(
+    const BezierCurve& curve) {
+    REQUIRE(curve.numSegments() == 2);
+    const Vec2d chord = curve.endPt() - curve.startPt();
+    const double chord_len = chord.norm();
+    REQUIRE(chord_len > 1e-6);
+    const Vec2d chord_dir = chord / chord_len;
+    BezierCurve first_segment;
+    first_segment.segs.push_back(curve.segs.front());
+    double max_dev = 0.0;
+    for (const Vec2d& point : first_segment.sampleByArcLength(48))
+        max_dev = std::max(
+            max_dev, std::abs(cross2d(chord_dir, point - curve.startPt())));
+    return max_dev / chord_len;
+}
+
 static bool hasCurvatureSignFlipForTest(const BezierCurve& curve, double eps = 0.10) {
     int sign = 0;
     for (const auto& seg : curve.segs) {
@@ -1229,6 +1253,8 @@ TEST_CASE("110003285 straight 65 uses the constrained two-segment solution",
     const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110003285.json";
     IntersectionInput input = loadInputOrSkip(path);
     REQUIRE(input.mode == 2);
+    // 生成策略必须由几何/约束状态决定，不能依赖数据源分配的路口 ID。
+    input.id = "renamed-road-edge-regression";
 
     const auto start = std::chrono::steady_clock::now();
     IntersectionShapeGenerator gen;
@@ -1277,11 +1303,19 @@ TEST_CASE("110003285 straight 65 uses the constrained two-segment solution",
              << arcChordRatioForTest(straight)
              << " lateral/chord="
              << maxLateralChordDeviationRatioForTest(straight)
+             << " waypoint_fraction="
+             << waypointChordFractionForTest(straight)
+             << " first_lateral/chord="
+             << firstSegmentLateralChordDeviationRatioForTest(straight)
              << " max_kappa=" << straight.maxCurvature(40));
         // 这些阈值与生成器的两段近直行形态门禁一致，防止只满足段数而
         // 通过过度绕行、横向折偏或异常曲率掩盖同簇冲突。
         CHECK(arcChordRatioForTest(straight) <= 1.12);
         CHECK(maxLateralChordDeviationRatioForTest(straight) <= 0.12);
+        // 近直行必须先沿总弦线前进，再用尾段完成 RoadEdge 避让；禁止
+        // 首段先向侧方拱出、尾段再拉回的视觉不平滑表达。
+        CHECK(waypointChordFractionForTest(straight) >= 0.30);
+        CHECK(firstSegmentLateralChordDeviationRatioForTest(straight) <= 0.05);
         CHECK(straight.maxCurvature(40) <= 0.25);
         CHECK_FALSE(hasCurvatureSignFlipForTest(straight));
     }
@@ -1319,6 +1353,49 @@ TEST_CASE("110003285 straight 65 uses the constrained two-segment solution",
     CHECK(segmentLooksStraightForTest(uturn51.segs.front()));
     CHECK(segmentLooksStraightForTest(uturn51.segs.back()));
     CHECK(uturn51.segs[1].maxCurvature(30) > 0.03);
+}
+
+TEST_CASE("110003285 left turns 2 and 3 stay single cubic",
+          "[regression][cluster][shape][single-cubic][110003285]") {
+    const std::string path = std::string(PROJECT_ROOT_DIR) + "/datas/110003285.json";
+    const IntersectionInput raw_input = loadInputOrSkip(path);
+    // generate() 在内部使用方向归一化后的副本；验收必须使用同一套车道
+    // 端点/切向，否则会把生成坐标系与原始输入坐标系混用。
+    IntersectionInput input = InputNormalizer(raw_input);
+    ConnectivityDirectionNormalizer(input, ConnectivityDirectionConfig());
+
+    IntersectionShapeGenerator gen;
+    IntersectionOutput output;
+    REQUIRE(gen.generate(raw_input, output));
+
+    auto curves = curveMap(output);
+    REQUIRE(curves.count("2") == 1);
+    REQUIRE(curves.count("3") == 1);
+    REQUIRE(curves["2"]->curve);
+    REQUIRE(curves["3"]->curve);
+
+    for (const ConnId& id : {ConnId("2"), ConnId("3")}) {
+        const Connectivity* conn = findConnectivity(input, id);
+        REQUIRE(conn != nullptr);
+        const BezierCurve& curve = *curves[id]->curve;
+        const auto entry = input.entryPtDir(conn->entry_lane_id);
+        const auto exit = input.exitPtDir(conn->exit_lane_id);
+        INFO("left turn " << id << " must use a single smooth cubic");
+        CHECK(curve.numSegments() == 1);
+        CHECK(ordinarySingleCubicControlsValid(
+            curve, entry.first, entry.second, exit.first, exit.second,
+            1e-5, true));
+        CHECK(endpointG1Min(*curves[id], input) > 0.99);
+        CHECK(arcChordRatioForTest(curve) >= 1.03);
+        CHECK(arcChordRatioForTest(curve) <= 1.35);
+        CHECK(curve.maxCurvature(40) <= 2.5);
+        CHECK_FALSE(curveSelfIntersectsBusiness(curve, 1.0));
+        CHECK_FALSE(hasCurvatureSignFlipForTest(curve));
+    }
+
+    INFO("same-entry left turns 2|3 must not cross away from the shared endpoint");
+    CHECK_FALSE(curvesIntersectBusiness(
+        *curves["2"]->curve, *curves["3"]->curve, 1.5));
 }
 
 TEST_CASE("RoadEdge boundary safety rejects adherent contact and outside crossing",
