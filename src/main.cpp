@@ -24,7 +24,6 @@ int main(int argc, char* argv[]) {
             std::string(PROJECT_ROOT_DIR) + "/datas/100001036.json",
                 std::string(PROJECT_ROOT_DIR) + "/datas/100000536.json",
                 std::string(PROJECT_ROOT_DIR) + "/datas/100000547.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/100000012.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100000610.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/110003285.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/intersection_ds.json",
