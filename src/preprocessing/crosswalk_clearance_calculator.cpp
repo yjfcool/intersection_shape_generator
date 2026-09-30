@@ -6,7 +6,6 @@
 #include <cmath>
 
 namespace isg {
-namespace {
 
 void considerPolyline(
         const std::vector<Vec2d>& points, const Vec2d& origin,
@@ -40,8 +39,6 @@ void considerPolygon(
     for (const auto& hole : polygon.holes)
         considerPolyline(toVec2dArray(hole), origin, forward, lateral, candidate);
 }
-
-}  // namespace
 
 bool crosswalkRelevantToUTurn(
         const Crosswalk& crosswalk,

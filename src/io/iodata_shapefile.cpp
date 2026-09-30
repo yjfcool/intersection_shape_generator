@@ -25,6 +25,15 @@ const std::vector<IsgDbfField> kConnectivityFields = {
         {"LANE_TYPE", 'C', 64, 0},
         {"FIXED_SHAPE", 'C', 64, 0},
 };
+const std::vector<IsgDbfField> kConnectivityCurveFields = {
+        {"ID", 'C', 64, 0},
+        {"TURN_TYPE", 'C', 64, 0},
+        {"FLANE", 'C', 64, 0},
+        {"TLANE", 'C', 64, 0},
+        {"LANE_TYPE", 'C', 64, 0},
+        {"FIXED_SHAPE", 'C', 64, 0},
+        {"UPDATE_SHAPE", 'C', 64, 0},
+};
 const std::vector<IsgDbfField> kLaneEdgeFields = {
         {"ID", 'C', 64, 0},
         {"GROUP_ID", 'C', 64, 0},
@@ -35,6 +44,11 @@ const std::vector<IsgDbfField> kLaneEdgeFields = {
 const std::vector<IsgDbfField> kIdTypeFields = {
         {"ID", 'C', 64, 0},
         {"TYPE", 'C', 64, 0},
+};
+const std::vector<IsgDbfField> kAreaFields = {
+        {"ID", 'C', 64, 0},
+        {"TYPE", 'C', 64, 0},
+        {"TASKID", 'C', 64, 0},
 };
 const std::vector<IsgDbfField> kStopLineFields = {
         {"ID", 'C', 64, 0},
@@ -99,13 +113,14 @@ bool polygonGeometry(const T& value, std::vector<ShapePoint>& points) {
 }
 
 void writeArea(const std::string& dir, const std::string& name, const IntersectionArea& area) {
-    const std::vector<Polygon2d> areas{area.geometry};
-    writeShapes(dir, name, SHP_POLYGONZ, kIdTypeFields, areas,
-        [](const Polygon2d&, std::size_t i) {
-            return std::vector<std::string>{std::to_string(i), "-1"};
+    std::string id = area.id, taskid = area.taskid;
+    const std::vector<IntersectionArea> areas{area};
+    writeShapes(dir, name, SHP_POLYGONZ, kAreaFields, areas,
+        [](const IntersectionArea& a, std::size_t i) {
+            return std::vector<std::string>{a.id, a.is_rough?"1":"0", a.taskid};
         },
-        [](const Polygon2d& polygon, std::vector<ShapePoint>& points) {
-            points = toShapePoints(polygon.outer);
+        [](const IntersectionArea& a, std::vector<ShapePoint>& points) {
+            points = toShapePoints(a.geometry.outer);
             return true;
         });
 }
@@ -128,7 +143,7 @@ bool save(IntersectionInput& input, std::string out_dir, std::string prefix) {
                 connectivity.fixed_shape ? "1" : "0"};
         },
         [](const Connectivity& connectivity, std::vector<ShapePoint>& points) {
-            if (connectivity.fixed_shape && !connectivity.geometry.points.empty())
+            if (!connectivity.geometry.points.empty())
                 points = toShapePoints(connectivity.geometry.points);
             return true;
         });
@@ -158,6 +173,11 @@ bool save(IntersectionInput& input, std::string out_dir, std::string prefix) {
         [](const Crosswalk& crosswalk, std::size_t) {
             return std::vector<std::string>{crosswalk.id, "-1"};
         }, polygonGeometry<Crosswalk>);
+
+    writeShapes(out_dir, prefix + "_safetyislands", SHP_POLYGONZ, kIdTypeFields, input.safety_islands,
+        [](const SafetyIsland& safetyisland, std::size_t) {
+            return std::vector<std::string>{safetyisland.id, "-1"};
+        }, polygonGeometry<SafetyIsland>);
 
     writeArea(out_dir, prefix + "_areas", input.area);
     return true;
@@ -201,13 +221,13 @@ bool save(IntersectionOutput& output, std::string out_dir, std::string prefix) {
             return true;
         });
 
-    writeShapes(out_dir, prefix + "_lanes", SHP_POLYLINEZ, kConnectivityFields,
+    writeShapes(out_dir, prefix + "_lanes", SHP_POLYLINEZ, kConnectivityCurveFields,
         output.connectivity_curves,
         [](const ConnectivityCurve& curve, std::size_t) {
             return std::vector<std::string>{curve.id,
                 std::to_string(static_cast<int>(curve.turn_type)), curve.entry_lane_id,
                 curve.exit_lane_id, std::to_string(static_cast<int>(curve.lane_type)),
-                curve.fixed_shape ? "1" : "0"};
+                curve.fixed_shape ? "1" : "0", curve.update_shape ? "1" : "0"};
         },
         [](const ConnectivityCurve& curve, std::vector<ShapePoint>& points) {
             if (!curve.geometry.points.empty()) {

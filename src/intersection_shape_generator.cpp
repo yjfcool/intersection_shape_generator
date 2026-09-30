@@ -61,43 +61,54 @@ static BoundingBox2d getOuterBoundingBox(const IntersectionInput& norm_input) {
 
 bool IntersectionShapeGenerator::generate(const IntersectionInput& input, IntersectionOutput& output) {
     try {
-        /// 初始化原数据缺失信息
-        const IntersectionInput norm_input = InputNormalizer(input);
-        report_ = validateTopology(norm_input);
-        if (!report_.is_valid())
-            return false;
+        /// 处理 机动逻辑 数据
+        if (true) {
+            /// 获取机动逻辑数据
+            const IntersectionInput motor_input = ConnectivityMotorLogicFilter(input, true);
+            /// 初始化原数据缺失信息
+            const IntersectionInput norm_input = InputNormalizer(motor_input);
+            report_ = validateTopology(norm_input);
+            if (!report_.is_valid())
+                return false;
 
-        /// 构建避让空间距离查询器
-        auto t0 = std::chrono::steady_clock::now();
-        SDFField sdf;
-        if (!norm_input.obstacles.empty()) {
-            double obstacle_clearance = obstacleAvoidanceClearanceForMode(norm_input.mode);
-            if (norm_input.mode == 2)
-                obstacle_clearance = std::max(obstacle_clearance, config_.obstacle_buffer);
-            sdf.build(getOuterBoundingBox(norm_input), norm_input.obstacles, config_.sdf_cell_size, obstacle_clearance);
+            /// 构建避让空间距离查询器
+            auto t0 = std::chrono::steady_clock::now();
+            SDFField sdf;
+            if (!norm_input.obstacles.empty()) {
+                double obstacle_clearance = obstacleAvoidanceClearanceForMode(norm_input.mode);
+                if (norm_input.mode == 2)
+                    obstacle_clearance = std::max(obstacle_clearance, config_.obstacle_buffer);
+                sdf.build(getOuterBoundingBox(norm_input), norm_input.obstacles, config_.sdf_cell_size, obstacle_clearance);
+            }
+            output.perf.sdf_build_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+            /// 曲线生成
+            double opt_ms = 0;
+            ConnectivityGenerator cgen(config_.lbfgs, config_.connectivity_direction);
+            output.connectivity_curves = cgen.generate(norm_input, sdf, &opt_ms);
+            ElevationInterpolator(output.connectivity_curves, norm_input); //高程插值
+            output.perf.optimize_ms = opt_ms;
+
+            // 顶层暂不启用 EdgeLineGenerator；清空复用的输出对象，避免残留旧边线。
+            auto te = std::chrono::steady_clock::now();
+            output.lane_edges.clear();
+            // EdgeLineGenerator elgen;
+            // output.lane_edges = elgen.generate(norm_input, output.connectivity_curves);
+            output.perf.edge_gen_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
         }
-        output.perf.sdf_build_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-        /// 曲线生成
-        double opt_ms = 0;
-        ConnectivityGenerator cgen(config_.lbfgs, config_.connectivity_direction);
-        output.connectivity_curves = cgen.generate(norm_input, sdf, &opt_ms);
-        ElevationInterpolator(output.connectivity_curves, norm_input); //高程插值
-        output.perf.optimize_ms = opt_ms;
-
-        // 顶层暂不启用 EdgeLineGenerator；清空复用的输出对象，避免残留旧边线。
-        auto te = std::chrono::steady_clock::now();
-        output.lane_edges.clear();
-        // EdgeLineGenerator elgen;
-        // output.lane_edges = elgen.generate(norm_input, output.connectivity_curves);
-        output.perf.edge_gen_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
+        /// 处理 非机动逻辑 数据
+        if (false) {
+            /// 获取非机动车道处理数据
+            const IntersectionInput nonmotor_input = ConnectivityMotorLogicFilter(input, false);
+        }
 
         /// 路口面生成
         auto ta = std::chrono::steady_clock::now();
-        IntersectionAreaBuilder areabuilder(intersectionAreaExtendDistance(norm_input.mode), 4.0);
-        output.area = areabuilder.build(norm_input, output.connectivity_curves, output.lane_edges);
+        IntersectionAreaBuilder areabuilder(intersectionAreaExtendDistance(input.mode), 4.0);
+        output.area = areabuilder.build(input, output.connectivity_curves, output.lane_edges);
         output.perf.area_gen_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
 

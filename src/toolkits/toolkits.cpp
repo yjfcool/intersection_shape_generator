@@ -375,5 +375,44 @@ namespace isg {
                     setExitDirection(*lane, direction->second);
             }
         }
-    }
+    };
+    IntersectionInput ConnectivityMotorLogicFilter(const IntersectionInput& raw_input, bool is_motorlogic) {
+        IntersectionInput input = raw_input;
+        // 是否按机动车道处理逻辑
+        auto isMotorProcess = [&](const Connectivity& conn) -> bool {
+            if (conn.lane_type == ConnLaneType::Motorway //机动车道
+                || (conn.lane_type == ConnLaneType::NonMotorway //直行和右转的非机动车道
+                    && (conn.turn_type == ConnTurnType::Straight
+                        || conn.turn_type == ConnTurnType::TurnRight))) {
+                return true;
+            }
+            return false;
+        };
+        auto conns = input.connectivities;
+        for (auto conn : conns) {
+            bool is_motorprocess = isMotorProcess(conn);
+            if (is_motorlogic) { //获取机动逻辑数据
+                if (!is_motorprocess) { //删除非机动逻辑数据
+                    auto it_conn = std::find_if(
+                        input.connectivities.begin(), input.connectivities.end(), [conn](Connectivity& c) {
+                        return conn.id == c.id;
+                    });
+                    if (it_conn != input.connectivities.end()) {
+                        input.connectivities.erase(it_conn);
+                    }
+                }
+            } else {  //获取非机动逻辑数据
+                if (is_motorprocess) { //删除机动逻辑数据
+                    auto it_conn = std::find_if(
+                        input.connectivities.begin(), input.connectivities.end(), [conn](Connectivity& c) {
+                        return conn.id == c.id;
+                    });
+                    if (it_conn != input.connectivities.end()) {
+                        input.connectivities.erase(it_conn);
+                    }
+                }
+            }
+        }
+        return input;
+    };
 };

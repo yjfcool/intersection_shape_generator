@@ -190,6 +190,7 @@ public:
         if (finePoly.size() >= 4) {
             junctArea.geometry.outer = finePoly;
             junctArea.is_rough = false;
+            junctArea.taskid = inp.area.taskid;
             return junctArea;
         }
 
@@ -240,6 +241,7 @@ public:
             // 终极回退：用所有连接点的凸包
             junctArea.geometry.outer = buildConvexHullFallback(inp, centerlines);
             junctArea.is_rough = false;
+            junctArea.taskid = inp.area.taskid;
             return junctArea;
         }
 
@@ -280,8 +282,8 @@ public:
 
         // 6. 多边形修复（移除共线点，确保逆/顺时针）
         junctArea.geometry.outer = repairPolygon(rawPoly, center);
-
         junctArea.is_rough = false;
+        junctArea.taskid = inp.area.taskid;
         return junctArea;
     }
 

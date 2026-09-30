@@ -536,6 +536,7 @@ static ConnectivityCurve makeFixedGeometryCurve(
     cc.entry_lane_id = conn.entry_lane_id;
     cc.exit_lane_id = conn.exit_lane_id;
     cc.turn_type = conn.turn_type;
+    cc.lane_type = conn.lane_type;
     cc.geometry = conn.geometry;
     cc.fixed_shape = conn.fixed_shape;
     BezierCurve curve = FixedShapeInitializer().build(conn);
@@ -3968,6 +3969,7 @@ ConnectivityCurve SingleCurveGenerationPipeline::run(
     cc.entry_lane_id = conn.entry_lane_id;
     cc.exit_lane_id = conn.exit_lane_id;
     cc.turn_type = context.turn;
+    cc.lane_type = conn.lane_type;
     cc.fixed_shape = conn.fixed_shape;
 
     const std::pair<Vec2d, Vec2d>& _entry = context.entry;
@@ -5128,9 +5130,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                         for (double arc_alpha : alpha_options) {
                             for (double extra_stagger : stagger_options) {
                             // 即使只共享一侧端点，q0/q1 也必须使用相同总错开量。
-                            // 继续传旧的 entry/exit 值会覆盖
-                            // buildSegmented 的通用错开量，使
-                            // extra_stagger 实际失效。
+                            // 继续传旧的 entry/exit 值会覆盖 buildSegmented 的通用错开量，使 extra_stagger 实际失效。
                             double total_stagger = std::max(
                                 0.0, shared_endpoint_stagger + extra_stagger);
                             BezierCurve c = UTurnCurveInitializer().buildSegmented(

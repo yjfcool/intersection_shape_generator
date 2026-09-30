@@ -28,8 +28,6 @@ bool isGeometricUTurnByTurnType(
            entry_tangent.normalized().dot(exit_tangent.normalized()) < -0.5;
 }
 
-namespace {
-
 LaneGroupId laneGroupIdForRole(
         const Connectivity& connectivity, const IntersectionInput& input, bool entry_side);
 
@@ -116,8 +114,6 @@ bool boundaryAlignmentForUTurnComponent(
         station = best;
     return found;
 }
-
-}  // namespace
 
 UTurnFamilyInfo UTurnFamilyBuilder::build(
     const Connectivity& connectivity, const IntersectionInput& input,
@@ -292,8 +288,6 @@ double UTurnFamilyBuilder::requiredAlignedStationOnAxis(
     return std::max(s0 + lead0 * c0, s1 + lead1 * c1);
 }
 
-namespace {
-
 LaneGroupId laneGroupIdForRole(const Connectivity& connectivity,
                                const IntersectionInput& input,
                                bool entry_side) {
@@ -337,8 +331,6 @@ bool sameAlignmentFamily(const Connectivity& a, const Connectivity& b,
            pa.second.normalized().dot(pb.second.normalized()) > 0.99;
 }
 
-}  // namespace
-
 std::vector<const Connectivity*> UTurnFamilyBuilder::alignmentComponent(
     const Connectivity& connectivity, const IntersectionInput& input,
     UTurnAlignmentScope scope, const ClusterOrderSolver* topology,
@@ -364,8 +356,6 @@ std::vector<const Connectivity*> UTurnFamilyBuilder::alignmentComponent(
     }
     return component;
 }
-
-namespace {
 
 // 家族成员按半径升序（半径相同按 id）排列的稳定次序。
 // radiusRank 与 familyStaggerStep 必须共用同一次序，否则分档量与分档上限
@@ -394,8 +384,6 @@ Vec2d endpointOnSide(const Connectivity& connectivity,
     return entry_side ? input.entryPtDir(connectivity.entry_lane_id).first
                       : input.exitPtDir(connectivity.exit_lane_id).first;
 }
-
-}  // namespace
 
 UTurnFamilyRank UTurnFamilyBuilder::radiusRank(
     const Connectivity& connectivity, const IntersectionInput& input,

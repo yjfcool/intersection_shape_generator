@@ -308,9 +308,16 @@ struct Crosswalk {
     Vec2d crossing_direction{0, 1};  ///< 行人通行方向
 };
 
+/// 安全岛（面）：行人通行区域
+struct SafetyIsland {
+    std::string id;
+    Polygon2d geometry;
+};
+
 /// 路口面
 struct IntersectionArea {
     InterId id;
+    std::string taskid;
     Polygon2d geometry;
     bool is_rough = false;  ///< true:粗糙路口面；false:精细路口面
 };
@@ -343,6 +350,7 @@ struct ConnectivityCurve {
     LaneEdgeId right_edge_id = "";
     ConnLaneType lane_type = ConnLaneType::Motorway;
     bool fixed_shape = false;
+    bool update_shape = true; //形态更新标识
 };
 
 /// 连通车道边线：可被相邻连通曲线共享
@@ -381,10 +389,12 @@ struct IntersectionInput {
     std::vector<Boundary> boundaries;
     std::vector<StopLine> stop_lines;
     std::vector<Crosswalk> crosswalks;
+    std::vector<SafetyIsland> safety_islands;
     IntersectionArea area;
 
     std::string id;  ///< 路口ID
     int mode = 1;    ///< 路口模式: 1:bxn, 2:jd, 3:ds
+    std::string taskid; ///< 任务ID
 
     const bool IsEntryLaneEdge(const LaneEdgeId& id) const;  ///< 是否为进入车道边线
     const bool IsEntryLane(const LaneId& id) const;          ///< 是否为进入车道

@@ -446,6 +446,15 @@ inline nlohmann::json crosswalkToJson(const Crosswalk& cw) {
     return j;
 }
 
+// 序列化和反序列化 SafetyIsland
+inline nlohmann::json safetyIslandToJson(const SafetyIsland& si) {
+    nlohmann::json j = nlohmann::json::object();
+    j["id"] = si.id;
+    j["geometry"] = polygon2dToJson(si.geometry);
+
+    return j;
+}
+
 inline Crosswalk crosswalkFromJson(const nlohmann::json& j) {
     Crosswalk cw;
     if (j.contains("id")) {
@@ -461,11 +470,24 @@ inline Crosswalk crosswalkFromJson(const nlohmann::json& j) {
     return cw;
 }
 
+inline SafetyIsland safetyislandFromJson(const nlohmann::json& j) {
+    SafetyIsland si;
+    if (j.contains("id")) {
+        si.id = j["id"].get<std::string>();
+    }
+    if (j.contains("geometry")) {
+        si.geometry = polygon2dFromJson(j["geometry"]);
+    }
+
+    return si;
+}
+
 // 序列化和反序列化 IntersectionArea
 inline nlohmann::json intersectionAreaToJson(const IntersectionArea& ia) {
     nlohmann::json j = nlohmann::json::object();
     j["id"] = ia.id;
     j["geometry"] = polygon2dToJson(ia.geometry);
+    j["taskid"] = ia.taskid;
     j["is_rough"] = ia.is_rough;
 
     return j;
@@ -481,6 +503,9 @@ inline IntersectionArea intersectionAreaFromJson(const nlohmann::json& j) {
     }
     if (j.contains("is_rough")) {
         ia.is_rough = j["is_rough"].get<bool>();
+    }
+    if (j.contains("taskid")) {
+        ia.taskid = j["taskid"].get<std::string>();
     }
 
     return ia;
@@ -519,18 +544,15 @@ inline ViolationInfo violationInfoFromJson(const nlohmann::json& j) {
     if (j.contains("fence_expansion_applied")) {
         vi.fence_expansion_applied = j["fence_expansion_applied"].get<double>();
     }
-
     if (j.contains("exempt_crosses")) {
         const nlohmann::json& crosses = j["exempt_crosses"];
         for (size_t i = 0; i < crosses.size(); ++i) {
             vi.exempt_crosses.push_back(vec2dFromJson(crosses[i]));
         }
     }
-
     if (j.contains("reason")) {
         vi.reason = j["reason"].get<std::string>();
     }
-
     return vi;
 }
 
@@ -543,6 +565,7 @@ inline nlohmann::json connectivityCurveToJson(const ConnectivityCurve& cc) {
     j["turn_type"] = static_cast<int>(cc.turn_type);
     j["lane_type"] = static_cast<int>(cc.lane_type);
     j["fixed_shape"] = (cc.fixed_shape ? 1 : 0);
+    j["update_shape"] = (cc.update_shape ? 1 : 0);
     LineString2d geometry = cc.geometry;
     if (geometry.points.empty() && cc.curve) {
         int n = std::max(2, std::min(240, (int)std::ceil(cc.curve->arcLength() / 0.3) + 1));
@@ -797,11 +820,21 @@ inline nlohmann::json intersectionInputToJson(const IntersectionInput& input) {
     }
     j["crosswalks"] = crosswalks;
 
+    // 序列化safetyisland
+    nlohmann::json safetyislands = nlohmann::json::array();
+    for (const auto& si : input.safety_islands) {
+        safetyislands.push_back(safetyIslandToJson(si));
+    }
+    j["safety_islands"] = safetyislands;
+
     // 序列化area
     j["area"] = intersectionAreaToJson(input.area);
 
     // 序列化id
     j["id"] = input.id;
+
+    // 序列化taskid
+    j["taskid"] = input.area.taskid;
 
     // 序列化mode
     j["mode"] = input.mode;
@@ -925,16 +958,32 @@ inline IntersectionInput intersectionInputFromJson(const nlohmann::json& j) {
         }
     }
 
+    // 反序列化safetyislands
+    if (j.contains("safety_islands")) {
+        const nlohmann::json& safetyislands = j["safety_islands"];
+        for (size_t i = 0; i < safetyislands.size(); ++i) {
+            auto safetyisland = safetyislandFromJson(safetyislands[i]);
+            auto it_safetyisland = std::find_if(input.safety_islands.begin(), input.safety_islands.end(), [safetyisland](isg::SafetyIsland& l){
+                return l.id == safetyisland.id;
+            });
+            if (it_safetyisland == input.safety_islands.end()) {
+                input.safety_islands.push_back(safetyisland);
+            }
+        }
+    }
+
     // 反序列化area
     if (j.contains("area")) {
         input.area = intersectionAreaFromJson(j["area"]);
     }
-
     // 反序列化id
     if (j.contains("id")) {
         input.id = j["id"].get<std::string>();
     }
-
+    // 反序列化taskid
+    if (j.contains("taskid")) {
+        input.taskid = j["taskid"].get<std::string>();
+    }
     // 反序列化mode
     if (j.contains("mode")) {
         input.mode = j["mode"].get<int>();
