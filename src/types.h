@@ -247,9 +247,10 @@ struct Lane {
     LaneId id;
     LaneEdgeId left_edge_id;
     LaneEdgeId right_edge_id;
+    bool motoway = true;      ///< 是否为机动车道
     double width = 3.5;       ///< 车道宽度（米）
     LineString2d geometry;    ///< 车道中心线，进入车道末点为路口端点，退出车道首点为路口端点
-    AttrMap attrs;
+    AttrMap attrs;  ///< CON_NUM:提右车道
     std::string groupId;
     int laneOrder = 0; ///< 组内横向排序（0=最内侧）
 };

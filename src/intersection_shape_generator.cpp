@@ -66,10 +66,17 @@ bool IntersectionShapeGenerator::generate(const IntersectionInput& input, Inters
             /// 获取机动逻辑数据
             const IntersectionInput motor_input = ConnectivityMotorLogicFilter(input, true);
             /// 初始化原数据缺失信息
-            const IntersectionInput norm_input = InputNormalizer(motor_input);
+            IntersectionInput norm_input = InputNormalizer(motor_input);
             report_ = validateTopology(norm_input);
             if (!report_.is_valid())
                 return false;
+            /// 机动车道不能穿行安全岛，将安全岛视做障碍物处理
+            if (!motor_input.safety_islands.empty()) {
+                for (auto si : motor_input.safety_islands) {
+                    Obstacle obstacle = {si.id, si.geometry};
+                    norm_input.obstacles.emplace_back(obstacle);
+                }
+            }
 
             /// 构建避让空间距离查询器
             auto t0 = std::chrono::steady_clock::now();

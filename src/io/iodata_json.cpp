@@ -234,6 +234,7 @@ inline nlohmann::json laneToJson(const Lane& l) {
     j["id"] = l.id;
     j["left_edge_id"] = l.left_edge_id;
     j["right_edge_id"] = l.right_edge_id;
+    j["motoway"] = l.motoway;
     j["width"] = l.width;
     j["geometry"] = lineString2dToJson(l.geometry);
     j["attrs"] = detail::mapToAttrMapJson(l.attrs);
@@ -253,6 +254,9 @@ inline Lane laneFromJson(const nlohmann::json& j) {
     }
     if (j.contains("right_edge_id")) {
         l.right_edge_id = j["right_edge_id"].get<std::string>();
+    }
+    if (j.contains("motoway")) {
+        l.motoway = j["motoway"].get<bool>();
     }
     if (j.contains("width")) {
         l.width = j["width"].get<double>();

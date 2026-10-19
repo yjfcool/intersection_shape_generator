@@ -16,6 +16,7 @@ const std::vector<IsgDbfField> kLaneFields = {
         {"REDGE", 'C', 64, 0},
         {"GROUP_ID", 'C', 64, 0},
         {"GROUP_TYPE", 'C', 64, 0},
+        {"MOTOWAY", 'C', 64, 0},
 };
 const std::vector<IsgDbfField> kConnectivityFields = {
         {"ID", 'C', 64, 0},
@@ -58,6 +59,7 @@ const std::vector<IsgDbfField> kControlPointFields = {
         {"ID", 'C', 64, 0},
         {"NUM_SEGS", 'C', 64, 0},
         {"TURN_TYPE", 'C', 64, 0},
+        {"FLANE", 'C', 64, 0},
         {"TLANE", 'C', 64, 0},
         {"LANE_TYPE", 'C', 64, 0},
         {"FIXED_SHAPE", 'C', 64, 0},
@@ -131,7 +133,7 @@ bool save(IntersectionInput& input, std::string out_dir, std::string prefix) {
     writeShapes(out_dir, prefix + "_lanes", SHP_POLYLINEZ, kLaneFields, input.lanes,
         [](const Lane& lane, std::size_t) {
             return std::vector<std::string>{lane.id, std::to_string(lane.laneOrder),
-                lane.left_edge_id, lane.right_edge_id, lane.groupId, ""};
+                lane.left_edge_id, lane.right_edge_id, lane.groupId, "", std::to_string(lane.motoway)};
         }, lineGeometry<Lane>);
 
     writeShapes(out_dir, prefix + "_connectivities", SHP_POLYLINEZ, kConnectivityFields,
