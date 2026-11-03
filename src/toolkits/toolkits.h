@@ -28,7 +28,7 @@ namespace isg {
     /// 按配置统一同组车道的路口端切向，不修改车道端点位置。
     void ConnectivityDirectionNormalizer(IntersectionInput& input, const ConnectivityDirectionConfig& config);
 
-    /// 按机动车道处理逻辑过滤所需数据，机动逻辑：机动车道+左右转的非机动车道
+    /// 机动挂接和非机动挂接数据过滤器：机动挂接包含机动车道+按机动挂接逻辑处理的非机动车道。
     IntersectionInput ConnectivityMotorLogicFilter(const IntersectionInput& raw_input, bool is_motorlogic = true);
 
 };

@@ -2,6 +2,9 @@
 #include "utils/filesystem.hpp"
 #include "utils/shapefile.hpp"
 #include <algorithm>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <vector>
 
 namespace isg {
@@ -82,7 +85,7 @@ std::vector<ShapePoint> toShapePoints(const std::vector<Vec3d>& points) {
 }
 
 template <typename T, typename AttributeBuilder, typename GeometryBuilder>
-void writeShapes(const std::string& dir,
+bool writeShapes(const std::string& dir,
                  const std::string& name,
                  int shape_type,
                  const std::vector<IsgDbfField>& fields,
@@ -99,7 +102,8 @@ void writeShapes(const std::string& dir,
         records.emplace_back(static_cast<int>(records.size()), shape_type,
                              attributes(items[i], i), points, std::vector<int32_t>{0});
     }
-    ShapefileEngine::write(dir, name, shape_type, fields, records);
+    return ShapefileEngine::write(dir, name, shape_type, fields, records);
+}
 }
 
 template <typename T>

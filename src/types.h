@@ -302,14 +302,14 @@ struct StopLine {
     Vec2d normal_direction{0, 1};
 };
 
-/// 人行横道（面）：调头需跨越此多边形后才能开始拱弧
+/// 人行横道（面）：机动调头需横跨过人行横道面后开始拱弧，非机动需按场景顺向穿行人行横道
 struct Crosswalk {
     std::string id;
     Polygon2d geometry;
     Vec2d crossing_direction{0, 1};  ///< 行人通行方向
 };
 
-/// 安全岛（面）：行人通行区域
+/// 安全岛（面）：机动车道不能穿行，非机动需穿行
 struct SafetyIsland {
     std::string id;
     Polygon2d geometry;
@@ -336,14 +336,14 @@ struct ViolationInfo {
     std::string reason;
 };
 
-/// 连通曲线：连通关系对应的Bezier曲线及违规信息
+/// 连通形态：机动车使用Bezier曲线；非机动车以geometry折线为准，curve仅保留兼容表达。
 struct ConnectivityCurve {
     ConnId id;
     LaneId entry_lane_id;
     LaneId exit_lane_id;
     ConnTurnType turn_type = ConnTurnType::Straight;
-    std::shared_ptr<BezierCurve> curve = nullptr;  ///< 生成的Bezier曲线
-    LineString2d geometry;
+    std::shared_ptr<BezierCurve> curve = nullptr;  ///< 兼容Bezier表达；非机动车不以此验收形态
+    LineString2d geometry;  ///< 输出中心线点列；非机动车的权威polyline
     CurveStatus status = CurveStatus::OK;
     ViolationInfo violation;
 
