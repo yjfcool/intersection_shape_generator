@@ -6,7 +6,10 @@
 #include "preprocessing/uturn_family_builder.h"
 #include "utils.h"
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
+
+#include "nonmotor/nonmotor_utils.h"
 
 namespace isg {
 
@@ -377,44 +380,151 @@ namespace isg {
             }
         }
     };
-    // TODO：需完善按机动挂接处理的非机动车道过滤逻辑:GenNonmotorClassStategys
+    // ─────────────────────────────────────────────────────────────────────────
+    // ConnectivityMotorLogicFilter
+    //
+    // 将输入的连通关系按"机动挂接逻辑"和"非机动挂接逻辑"精确分流。
+    //
+    // is_motorlogic=true  → 保留按机动逻辑处理的连通关系（机动车道 + 符合条件的非机动）
+    // is_motorlogic=false → 保留按非机动逻辑处理的连通关系（其余非机动）
+    //
+    // 分流判据（GenNonmotorClassStategys）：
+    //   机动逻辑：
+    //     A. 所有机动车道（lane_type==MotorLane）
+    //     B. 右转非机动车道（追加 0.9m 净距约束在生成时处理）
+    //     C. 直行非机动：
+    //        C1. 进或出只有一个是非机动车道
+    //        C2. 右侧进入组≥2 OR 退出组≥2（右侧 = 进出组最右侧连线右侧，Q1）
+    //        C3. 无安全岛
+    //        C4. 安全岛距进入端点 > island_max_dist（Q4，默认20m）
+    //        C5. 安全岛不可穿（穿行通道内点到RoadEdge < 0.9m）
+    //     D. 左转非机动：
+    //        D1. 进入组仅2车道（1机+1非机）且路口机动车道往返总数≤2（特殊情况F）
+    //        D2. 进入机动，退出非机动，非提右车道（G）
+    //        D3. 其他左转（进入非机动但安全岛不可穿时）
+    //     E. 掉头非机动：路口无安全岛 且 进入机动退出非机动（H）
+    //
+    //   非机动逻辑（其余非机动连通，交由 NonMotorConnectivityGenerator 处理）
+    // ─────────────────────────────────────────────────────────────────────────
     IntersectionInput ConnectivityMotorLogicFilter(const IntersectionInput& raw_input, bool is_motorlogic) {
         IntersectionInput input = raw_input;
+
+        // 安全岛相关工具（用于直行/左转/掉头分流判断）
+        static constexpr double kIslandMaxDist = 20.0;
+        // TODO: 如何判断安全岛是否可穿（进入方向）
+        auto islandPassable = [&](
+            const SafetyIsland* si, const Vec2d& entry_dir, double clearance) -> bool {
+            if (!si) return false;
+            return true;
+        };
+
         // 是否按机动车道处理逻辑
         auto isMotorProcess = [&](const Connectivity& conn) -> bool {
-            if (conn.lane_type == ConnLaneType::Motorway //机动车道
-                || (conn.lane_type == ConnLaneType::NonMotorway //直行和右转的非机动车道
-                    && (conn.turn_type == ConnTurnType::Straight
-                        || conn.turn_type == ConnTurnType::TurnRight))) {
+            // A. 所有机动车道
+            if (conn.lane_type == MotorLaneType::MotorLane) return true;
+
+            // 以下均为 NonMotorLane
+            bool entry_is_nonmotor = isNonMotorLane(conn.entry_lane_id, input);
+            bool exit_is_nonmotor  = isNonMotorLane(conn.exit_lane_id,  input);
+            Vec2d entry_pt  = input.entryPtDir(conn.entry_lane_id).first;
+            Vec2d entry_dir = input.entryPtDir(conn.entry_lane_id).second;
+
+            // B. 右转非机动：全部按机动逻辑处理（追加 0.9m 净距约束在生成时注入）
+            if (conn.turn_type == ConnTurnType::TurnRight) return true;
+
+            // ── 直行非机动 ──────────────────────────────────────────────────
+            if (conn.turn_type == ConnTurnType::Straight) {
+                // C1. 进或出只有一个是非机动车道
+                if (!entry_is_nonmotor || !exit_is_nonmotor) return true;
+                // C2. 右侧进入组≥2 OR 退出组≥2
+                if (countRightSideGroups(conn, GroupRole::Entry, input) >= 2) return true;
+                if (countRightSideGroups(conn, GroupRole::Exit,  input) >= 2) return true;
+                // C3. 无安全岛
+                const SafetyIsland* si = findNearestSafetyIsland(entry_pt, input.safety_islands);
+                if (!si) return true;
+                // C4. 安全岛距进入端点 > 20m
+                if (distIslandBoundaryToPoint(*si, entry_pt) > kIslandMaxDist) return true;
+                // C5. 安全岛不可穿
+                if (!islandPassable(si, entry_dir, 0.9)) return true;
+                // → 安全岛可穿，非机动逻辑
+                return false;
+            }
+
+            // ── 左转非机动 ──────────────────────────────────────────────────
+            if (conn.turn_type == ConnTurnType::TurnLeft) {
+                bool yield_right = isYieldRightLane(conn, input);
+                const LaneGroup* eg = input.findGroup(conn.enterGroupId);
+
+                // D1. 进入组仅2车道（1机+1非机）且路口机动车往返总数≤2 → 机动（特殊情况F）
+                if (eg && eg->lanes.size() == 2 &&
+                    countNonMotorLanesInGroup(conn.enterGroupId, input) == 1 &&
+                    countMotorLanesTotalIntersection(input) <= 2)
+                    return true;
+
+                // D2. 进入机动，退出非机动，非提右车道 → 机动（G）
+                if (!entry_is_nonmotor && exit_is_nonmotor && !yield_right)
+                    return true;
+
+                // 进入非机动，非提右车道 → J. 非机动L型
+                if (entry_is_nonmotor && !yield_right) return false;
+
+                // 进入非机动，提右车道 → K（安全岛可穿）or 机动（不可穿）
+                if (entry_is_nonmotor && yield_right) {
+                    const SafetyIsland* si = findNearestSafetyIsland(entry_pt, input.safety_islands);
+                    if (si && distIslandBoundaryToPoint(*si, entry_pt) <= kIslandMaxDist
+                           && islandPassable(si, entry_dir, 0.9))
+                        return false;  // K. 非机动穿岛
+                    return true;       // 无岛/不可穿 → 机动
+                }
+
+                // 进入机动，退出非机动，提右车道 → L（安全岛可穿）or 机动（不可穿）
+                if (!entry_is_nonmotor && exit_is_nonmotor && yield_right) {
+                    const SafetyIsland* si = findNearestSafetyIsland(entry_pt, input.safety_islands);
+                    if (si && distIslandBoundaryToPoint(*si, entry_pt) <= kIslandMaxDist
+                           && islandPassable(si, entry_dir, 1.0))
+                        return false;  // L. 非机动处理
+                    return true;       // 机动
+                }
+
+                return true;  // 其他左转 → 机动
+            }
+
+            // ── 掉头非机动 ──────────────────────────────────────────────────
+            if (conn.turn_type == ConnTurnType::UTurnLeft ||
+                conn.turn_type == ConnTurnType::UTurnRight) {
+                // H. 进入机动，退出非机动，路口无安全岛 → 机动
+                if (!entry_is_nonmotor && exit_is_nonmotor && input.safety_islands.empty())
+                    return true;
+
+                // 进入机动，退出非机动，有安全岛：可穿 → 非机动（M），不可穿 → 机动
+                if (!entry_is_nonmotor && exit_is_nonmotor) {
+                    const SafetyIsland* si = findNearestSafetyIsland(entry_pt, input.safety_islands);
+                    if (si && distIslandBoundaryToPoint(*si, entry_pt) <= kIslandMaxDist
+                           && islandPassable(si, entry_dir, 1.0))
+                        return false;  // M. 非机动
+                    return true;       // 机动
+                }
+
+                // 进入非机动 → M. 非机动U型
+                if (entry_is_nonmotor) return false;
+
                 return true;
             }
-            return false;
+
+            // 未知转向类型 → 默认机动
+            return true;
         };
-        auto conns = input.connectivities;
-        for (auto conn : conns) {
-            bool is_motorprocess = isMotorProcess(conn);
-            if (is_motorlogic) { //获取机动逻辑数据
-                if (!is_motorprocess) { //删除非机动逻辑数据
-                    auto it_conn = std::find_if(
-                        input.connectivities.begin(), input.connectivities.end(), [conn](Connectivity& c) {
-                        return conn.id == c.id;
-                    });
-                    if (it_conn != input.connectivities.end()) {
-                        input.connectivities.erase(it_conn);
-                    }
-                }
-            } else {  //获取非机动逻辑数据
-                if (is_motorprocess) { //删除机动逻辑数据
-                    auto it_conn = std::find_if(
-                        input.connectivities.begin(), input.connectivities.end(), [conn](Connectivity& c) {
-                        return conn.id == c.id;
-                    });
-                    if (it_conn != input.connectivities.end()) {
-                        input.connectivities.erase(it_conn);
-                    }
-                }
-            }
-        }
+
+        // 过滤 connectivities
+        auto& conns_ref = input.connectivities;
+        conns_ref.erase(
+            std::remove_if(conns_ref.begin(), conns_ref.end(),
+                [&](const Connectivity& c) {
+                    bool motor = isMotorProcess(c);
+                    return is_motorlogic ? !motor : motor;
+                }),
+            conns_ref.end());
+
         return input;
     };
 };

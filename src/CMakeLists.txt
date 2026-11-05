@@ -48,7 +48,9 @@ add_library(isg_core STATIC
         generator/polygon_builder.cpp
         generator/edge_line_generator.cpp
         io/iodata_json.cpp
-        io/iodata_shapefile.cpp)
+        io/iodata_shapefile.cpp
+        nonmotor/nonmotor_backbone_extractor.cpp
+        nonmotor/nonmotor_connectivity_generator.cpp)
 isg_configure_target(isg_core)
 
 

@@ -2,12 +2,13 @@
 
 #pragma once
 
-#include "types.h"
 #include <string>
+#include "types.h"
+#include "nonmotor/nonmotor_type.h"
 
 namespace isg {
 
-bool save(IntersectionInput& input, std::string out_dir, std::string prefix);
-bool save(IntersectionOutput& output, std::string out_dir, std::string prefix);
-
+bool save(const IntersectionInput& input, std::string out_dir, std::string prefix);
+bool save(const IntersectionOutput& output, std::string out_dir, std::string prefix);
+bool save(const NonMotorBackbone& nonmotor_backbone, std::string dir, std::string prefix);
 }

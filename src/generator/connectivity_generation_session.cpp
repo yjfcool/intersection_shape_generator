@@ -4965,6 +4965,7 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
             done[conn.id] = *cc.curve;
             preserved_fixed_ids.insert(conn.id);
         }
+        cc.logic_type = MotorLogicType::MotorLogic;
         results.push_back(std::move(cc));
     }
 
@@ -4999,10 +5000,16 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
 
             bool phys_risk = false;
             auto conn_t0 = std::chrono::steady_clock::now();
-            const CurveGenerationContext generation_context =
+            CurveGenerationContext generation_context =
                 CurveGenerationContextBuilder().build(
                     scene, *conn, direction_cfg_.uturn_alignment_scope,
                     &cluster_solver_, &familySnapshot(conn->id));
+            // 右转非机动车道：追加 0.9m RoadEdge 净距约束（需求2）
+            if (conn->lane_type == MotorLaneType::NonMotorLane &&
+                conn->turn_type == ConnTurnType::TurnRight) {
+                generation_context.profile.road_edge_clearance =
+                    std::max(generation_context.profile.road_edge_clearance, 0.9);
+            }
             auto cc = generateOne(generation_context, sibs, &phys_risk);
             if (isgProfile()) {
                 double ms = std::chrono::duration<double, std::milli>(
@@ -8034,10 +8041,16 @@ std::vector<ConnectivityCurve> ConnectivityGenerationSession::run(
                 auto sibs = buildSiblings(cid, all_done, cluster_solver_, input.connectivities, false, &preserved_fixed_ids);
                 bool phys_risk = false;
                 auto conn_t0 = std::chrono::steady_clock::now();
-                const CurveGenerationContext generation_context =
+                CurveGenerationContext generation_context =
                     CurveGenerationContextBuilder().build(
                         scene, *conn, direction_cfg_.uturn_alignment_scope,
                         &cluster_solver_, &familySnapshot(conn->id));
+                // 右转非机动车道：追加 0.9m RoadEdge 净距约束（需求2）
+                if (conn->lane_type == MotorLaneType::NonMotorLane &&
+                    conn->turn_type == ConnTurnType::TurnRight) {
+                    generation_context.profile.road_edge_clearance =
+                        std::max(generation_context.profile.road_edge_clearance, 0.9);
+                }
                 auto cc = generateOne(generation_context, sibs, &phys_risk);
                 if (isgProfile()) {
                     double ms = std::chrono::duration<double, std::milli>(

@@ -17,10 +17,10 @@ int main(int argc, char* argv[]) {
         files.emplace_back(argv[1]);
     } else {
         files = {
+            std::string(PROJECT_ROOT_DIR) + "/datas/216863072_100002096.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216863735_100001549.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216784982_110004764.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216798546_110003457.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/216863072_100002096.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216863736_100000844.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216798546_110003449.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216805874_100002465.json",
@@ -71,7 +71,7 @@ int main(int argc, char* argv[]) {
             isg::IntersectionOutput out;
 
             auto start_time = std::chrono::high_resolution_clock::now();
-            bool success = gen.generate(inp, out);
+            bool success = gen.generate(inp, out, "./" + fname + "/output/");
             auto end_time = std::chrono::high_resolution_clock::now();
 
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);

@@ -349,7 +349,7 @@ inline Connectivity connectivityFromJson(const nlohmann::json& j) {
         conn.exitGroupId = j["exitGroupId"].get<std::string>();
     }
     if (j.contains("lane_type")) {
-        conn.lane_type = static_cast<ConnLaneType>(j["lane_type"].get<int>());
+        conn.lane_type = static_cast<MotorLaneType>(j["lane_type"].get<int>());
     }
     if (j.contains("fixed_shape")) {
         conn.fixed_shape = j["fixed_shape"].get<int>();
@@ -568,6 +568,7 @@ inline nlohmann::json connectivityCurveToJson(const ConnectivityCurve& cc) {
     j["exit_lane_id"] = cc.exit_lane_id;
     j["turn_type"] = static_cast<int>(cc.turn_type);
     j["lane_type"] = static_cast<int>(cc.lane_type);
+    j["logic_type"] = static_cast<int>(cc.logic_type);
     j["fixed_shape"] = (cc.fixed_shape ? 1 : 0);
     j["update_shape"] = (cc.update_shape ? 1 : 0);
     LineString2d geometry = cc.geometry;
@@ -732,6 +733,7 @@ inline nlohmann::json intersectionOutputToJson(const IntersectionOutput& io) {
     j["lane_edges"] = edges;
 
     j["area"] = intersectionAreaToJson(io.area);
+
     j["perf"] = perfStatsToJson(io.perf);
 
     return j;

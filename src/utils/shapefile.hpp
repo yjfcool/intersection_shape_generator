@@ -186,9 +186,7 @@ public:
             if (fileCode != 9994)
                 return false; // Shapefile 固定的 Magic Number
 
-            //f.seekg(24, std::ios::beg); // 跳过未使用的 20 字节
-            //int32_t fileLengthInWords = readBE32(f); // 16位字(Word)单位的文件长度
-            fShp.seekg(32, std::ios::beg);
+            fShp.seekg(28, std::ios::beg);
 
             int32_t version = readLE32(fShp);
             if (version != 1000)

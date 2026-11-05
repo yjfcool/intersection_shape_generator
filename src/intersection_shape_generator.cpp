@@ -5,8 +5,12 @@
 #include "generator/polygon_builder.h"
 #include "toolkits/toolkits.h"
 #include "optimizer/sdf_field.h"
+#include "nonmotor/nonmotor_connectivity_generator.h"
+#include "nonmotor/nonmotor_backbone_extractor.h"
+#include "io/iodata_shapefile.h"
 #include <chrono>
 #include <cmath>
+
 
 namespace isg {
 
@@ -59,11 +63,12 @@ static BoundingBox2d getOuterBoundingBox(const IntersectionInput& norm_input) {
     return roi;
 }
 
-bool IntersectionShapeGenerator::generate(const IntersectionInput& input, IntersectionOutput& output) {
+bool IntersectionShapeGenerator::generate(
+    const IntersectionInput& input, IntersectionOutput& output, std::string out_dir) {
     try {
-        /// 处理 机动逻辑 数据
+        /// 处理 机动挂接逻辑 数据
         if (true) {
-            /// 获取机动逻辑数据
+            /// 获取机动挂接逻辑数据
             const IntersectionInput motor_input = ConnectivityMotorLogicFilter(input, true);
             /// 初始化原数据缺失信息
             IntersectionInput norm_input = InputNormalizer(motor_input);
@@ -106,10 +111,26 @@ bool IntersectionShapeGenerator::generate(const IntersectionInput& input, Inters
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
         }
 
-        /// 处理 非机动逻辑 数据
+        /// 处理 非机动挂接逻辑 数据
         if (false) {
+            ///< 路口内非机动骨干图
+            NonMotorBackboneExtractor extractor;
+            NonMotorBackbone nonmotor_backbone = extractor.run(input);
+            extractor.output(nonmotor_backbone, out_dir);
+
             /// 获取非机动车道处理数据
             const IntersectionInput nonmotor_input = ConnectivityMotorLogicFilter(input, false);
+            if (!nonmotor_input.connectivities.empty()) {
+
+                NonMotorConnectivityGenerator nmgen;
+                auto nm_curves = nmgen.generate(
+                    nonmotor_input, output.connectivity_curves, nonmotor_backbone);
+                // 高程插值（复用现有工具）
+                ElevationInterpolator(nm_curves, nonmotor_input);
+                // 合并到输出
+                output.connectivity_curves.insert(
+                    output.connectivity_curves.end(), nm_curves.begin(), nm_curves.end());
+            }
         }
 
         /// 路口面生成

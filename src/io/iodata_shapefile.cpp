@@ -8,7 +8,6 @@
 #include <vector>
 
 namespace isg {
-namespace {
 
 namespace fs = ghc::filesystem;
 
@@ -23,18 +22,19 @@ const std::vector<IsgDbfField> kLaneFields = {
 };
 const std::vector<IsgDbfField> kConnectivityFields = {
         {"ID", 'C', 64, 0},
-        {"TURN_TYPE", 'C', 64, 0},
         {"FLANE", 'C', 64, 0},
         {"TLANE", 'C', 64, 0},
+        {"TURN_TYPE", 'C', 64, 0},
         {"LANE_TYPE", 'C', 64, 0},
         {"FIXED_SHAPE", 'C', 64, 0},
 };
 const std::vector<IsgDbfField> kConnectivityCurveFields = {
         {"ID", 'C', 64, 0},
-        {"TURN_TYPE", 'C', 64, 0},
         {"FLANE", 'C', 64, 0},
         {"TLANE", 'C', 64, 0},
+        {"TURN_TYPE", 'C', 64, 0},
         {"LANE_TYPE", 'C', 64, 0},
+        {"LOGIC_TYPE", 'C', 64, 0},
         {"FIXED_SHAPE", 'C', 64, 0},
         {"UPDATE_SHAPE", 'C', 64, 0},
 };
@@ -104,7 +104,6 @@ bool writeShapes(const std::string& dir,
     }
     return ShapefileEngine::write(dir, name, shape_type, fields, records);
 }
-}
 
 template <typename T>
 bool lineGeometry(const T& value, std::vector<ShapePoint>& points) {
@@ -131,9 +130,59 @@ void writeArea(const std::string& dir, const std::string& name, const Intersecti
         });
 }
 
-}  // namespace
+bool save(const NonMotorBackbone& nonmotor_backbone, std::string dir, std::string prefix) {
+    const std::vector<IsgDbfField> backbone_fields = {
+        {"ID", 'C', 64, 0}, {"TYPE", 'C', 64, 0},
+        {"RING", 'C', 8, 0}, {"BRANCH", 'C', 8, 0},
+        {"FROM_ID", 'C', 64, 0}, {"TO_ID", 'C', 64, 0}
+    };
+    writeShapes(dir, prefix + "_nonmotor_backbone", SHP_POLYLINEZ,
+        backbone_fields, nonmotor_backbone.edges,
+        [](const NonMotorBackboneEdge& edge, std::size_t) {
+            return std::vector<std::string>{edge.id,
+                std::to_string(static_cast<int>(edge.type)),
+                edge.ring ? "1" : "0", edge.branch ? "1" : "0",
+                edge.from, edge.to};
+        }, lineGeometry<NonMotorBackboneEdge>);
 
-bool save(IntersectionInput& input, std::string out_dir, std::string prefix) {
+    // 单独输出完整闭合骨干环，便于 QGIS 以一条线直接检查环的连续性。
+    // `_nonmotor_backbone` 保留逐边图层，用于按 TYPE/RING/BRANCH 分层查看。
+    const std::vector<IsgDbfField> backbone_ring_fields = {
+        {"ID", 'C', 64, 0}, {"CLOSED", 'C', 8, 0},
+        {"NODE_CNT", 'N', 12, 0}, {"EDGE_CNT", 'N', 12, 0}
+    };
+    const std::vector<NonMotorBackbone> backbone_records = {nonmotor_backbone};
+    writeShapes(dir, prefix + "_nonmotor_backbone_ring", SHP_POLYLINEZ,
+        backbone_ring_fields, backbone_records,
+        [](const NonMotorBackbone& backbone, std::size_t) {
+            return std::vector<std::string>{backbone.id,
+                backbone.closed ? "1" : "0",
+                std::to_string(backbone.nodes.size()),
+                std::to_string(backbone.ring_edges.size())};
+        },
+        [](const NonMotorBackbone& backbone, std::vector<ShapePoint>& points) {
+            if (backbone.ring_geometry.points.size() < 2) return false;
+            points = toShapePoints(backbone.ring_geometry.points);
+            return points.size() >= 2;
+        });
+
+    // 分支单独成层，便于在 QGIS 中关闭主环后检查局部挂接。
+    std::vector<NonMotorBackboneEdge> backbone_branches;
+    for (const auto& edge : nonmotor_backbone.edges) {
+        if (edge.branch) backbone_branches.push_back(edge);
+    }
+    writeShapes(dir, prefix + "_nonmotor_backbone_branches", SHP_POLYLINEZ,
+        backbone_fields, backbone_branches,
+        [](const NonMotorBackboneEdge& edge, std::size_t) {
+            return std::vector<std::string>{edge.id,
+                std::to_string(static_cast<int>(edge.type)),
+                edge.ring ? "1" : "0", edge.branch ? "1" : "0",
+                edge.from, edge.to};
+        }, lineGeometry<NonMotorBackboneEdge>);
+    return true;
+}
+
+bool save(const IntersectionInput& input, std::string out_dir, std::string prefix) {
     writeShapes(out_dir, prefix + "_lanes", SHP_POLYLINEZ, kLaneFields, input.lanes,
         [](const Lane& lane, std::size_t) {
             return std::vector<std::string>{lane.id, std::to_string(lane.laneOrder),
@@ -143,9 +192,10 @@ bool save(IntersectionInput& input, std::string out_dir, std::string prefix) {
     writeShapes(out_dir, prefix + "_connectivities", SHP_POLYLINEZ, kConnectivityFields,
         input.connectivities,
         [](const Connectivity& connectivity, std::size_t) {
-            return std::vector<std::string>{connectivity.id,
-                std::to_string(static_cast<int>(connectivity.turn_type)), connectivity.entry_lane_id,
-                connectivity.exit_lane_id, std::to_string(static_cast<int>(connectivity.lane_type)),
+            return std::vector<std::string>{
+                connectivity.id,connectivity.entry_lane_id, connectivity.exit_lane_id,
+                std::to_string(static_cast<int>(connectivity.turn_type)),
+                std::to_string(static_cast<int>(connectivity.lane_type)),
                 connectivity.fixed_shape ? "1" : "0"};
         },
         [](const Connectivity& connectivity, std::vector<ShapePoint>& points) {
@@ -189,7 +239,7 @@ bool save(IntersectionInput& input, std::string out_dir, std::string prefix) {
     return true;
 }
 
-bool save(IntersectionOutput& output, std::string out_dir, std::string prefix) {
+bool save(const IntersectionOutput& output, std::string out_dir, std::string prefix) {
 #ifdef PROJECT_ROOT_DIR
     std::string project_dir = PROJECT_ROOT_DIR;
     const std::string qgis_name = "intersection_gen.qgs";
@@ -231,8 +281,10 @@ bool save(IntersectionOutput& output, std::string out_dir, std::string prefix) {
         output.connectivity_curves,
         [](const ConnectivityCurve& curve, std::size_t) {
             return std::vector<std::string>{curve.id,
-                std::to_string(static_cast<int>(curve.turn_type)), curve.entry_lane_id,
-                curve.exit_lane_id, std::to_string(static_cast<int>(curve.lane_type)),
+                curve.entry_lane_id, curve.exit_lane_id,
+                std::to_string(static_cast<int>(curve.turn_type)),
+                std::to_string(static_cast<int>(curve.lane_type)),
+                std::to_string(static_cast<int>(curve.logic_type)),
                 curve.fixed_shape ? "1" : "0", curve.update_shape ? "1" : "0"};
         },
         [](const ConnectivityCurve& curve, std::vector<ShapePoint>& points) {

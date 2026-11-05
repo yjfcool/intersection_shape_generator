@@ -26,7 +26,7 @@ public:
     explicit IntersectionShapeGenerator(const Config& config);
 
     /// 生成路口形态：输入路口数据，输出连通曲线、车道边线与精细路口面
-    bool generate(const IntersectionInput& input, IntersectionOutput& output);
+    bool generate(const IntersectionInput& input, IntersectionOutput& output, std::string out_dir="");
 
     /// 获取最近一次校验报告
     const ValidationReport& lastReport() const { return report_; }

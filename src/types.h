@@ -229,7 +229,9 @@ enum class GroupRole { Entry, Exit };
 /// Unknown/Straight 才以端点几何方位作为 U-turn 兜底判断。
 enum class ConnTurnType { Unknown = 0, TurnLeft = 1, UTurnLeft = 2, Straight = 3, TurnRight = 4, UTurnRight = 5 };
 
-enum class ConnLaneType { Motorway = 0, NonMotorway = 1 };
+enum class MotorLaneType { MotorLane = 0, NonMotorLane = 1 }; //机动车道、非机动车道
+
+enum class MotorLogicType { MotorLogic = 0, NonMotorLogic = 1 }; //挂接逻辑类型：机动挂接逻辑、非机动挂接逻辑
 
 /// 车道边线：车道左右侧边界线，可被相邻车道共享
 struct LaneEdge {
@@ -276,7 +278,7 @@ struct Connectivity {
 
     LineString2d geometry;  ///< 固有形态（可选）：通常为已生成好的特定形态曲线非空（坐标数>=2）时除穿障必须避障可重新生成外，
                             ///  其他场景不能修改固有形态；同簇非交约束和避障时都需要额外考虑此固有形态影响
-    ConnLaneType lane_type = ConnLaneType::Motorway;
+    MotorLaneType lane_type = MotorLaneType::MotorLane;
     bool fixed_shape = false;
 };
 
@@ -302,14 +304,14 @@ struct StopLine {
     Vec2d normal_direction{0, 1};
 };
 
-/// 人行横道（面）：机动调头需横跨过人行横道面后开始拱弧，非机动需按场景顺向穿行人行横道
+/// 人行横道（面）：机动挂接调头需横跨过人行横道面后开始拱弧，非机动挂接需沿着人行横道方向穿行
 struct Crosswalk {
     std::string id;
     Polygon2d geometry;
     Vec2d crossing_direction{0, 1};  ///< 行人通行方向
 };
 
-/// 安全岛（面）：机动车道不能穿行，非机动需穿行
+/// 安全岛（面）：机动挂接不能穿行需避开，非机动挂接需穿行
 struct SafetyIsland {
     std::string id;
     Polygon2d geometry;
@@ -336,20 +338,21 @@ struct ViolationInfo {
     std::string reason;
 };
 
-/// 连通形态：机动车使用Bezier曲线；非机动车以geometry折线为准，curve仅保留兼容表达。
+/// 连通形态：机动挂接使用Bezier曲线；非机动挂接以geometry折线为准，curve仅保留兼容表达。
 struct ConnectivityCurve {
     ConnId id;
     LaneId entry_lane_id;
     LaneId exit_lane_id;
     ConnTurnType turn_type = ConnTurnType::Straight;
-    std::shared_ptr<BezierCurve> curve = nullptr;  ///< 兼容Bezier表达；非机动车不以此验收形态
-    LineString2d geometry;  ///< 输出中心线点列；非机动车的权威polyline
+    std::shared_ptr<BezierCurve> curve = nullptr;  ///< 兼容Bezier表达；非机动挂接不以此验收形态
+    LineString2d geometry;  ///< 输出中心线点列；非机动挂接的权威polyline
     CurveStatus status = CurveStatus::OK;
     ViolationInfo violation;
 
     LaneEdgeId left_edge_id = "";
     LaneEdgeId right_edge_id = "";
-    ConnLaneType lane_type = ConnLaneType::Motorway;
+    MotorLaneType lane_type = MotorLaneType::MotorLane;
+    MotorLogicType logic_type = MotorLogicType::MotorLogic;//非机动车道可能按机动挂接逻辑处理
     bool fixed_shape = false;
     bool update_shape = true; //形态更新标识
 };
