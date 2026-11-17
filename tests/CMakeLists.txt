@@ -31,6 +31,8 @@ add_ig_test(test_infeasibility)
 add_ig_test(test_integration)
 add_ig_test(test_scenarios)
 add_ig_test(test_refactored_modules)
+add_ig_test(test_nonmotor_backbone_extractor)
+add_ig_test(test_nonmotor_connectivity_generator)
 add_ig_test(test_perf_caches)
 
 # Compile-only public-header self-containment check; no Catch2 dependency needed.

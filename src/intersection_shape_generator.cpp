@@ -8,8 +8,10 @@
 #include "nonmotor/nonmotor_connectivity_generator.h"
 #include "nonmotor/nonmotor_backbone_extractor.h"
 #include "io/iodata_shapefile.h"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 
 
 namespace isg {
@@ -70,6 +72,7 @@ bool IntersectionShapeGenerator::generate(
         if (true) {
             /// 获取机动挂接逻辑数据
             const IntersectionInput motor_input = ConnectivityMotorLogicFilter(input, true);
+            output.perf.motor_count = motor_input.connectivities.size();
             /// 初始化原数据缺失信息
             IntersectionInput norm_input = InputNormalizer(motor_input);
             report_ = validateTopology(norm_input);
@@ -107,38 +110,57 @@ bool IntersectionShapeGenerator::generate(
             output.lane_edges.clear();
             // EdgeLineGenerator elgen;
             // output.lane_edges = elgen.generate(norm_input, output.connectivity_curves);
-            output.perf.edge_gen_ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
+            output.perf.edge_gen_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - te).count();
         }
 
         /// 处理 非机动挂接逻辑 数据
-        if (false) {
-            ///< 路口内非机动骨干图
-            NonMotorBackboneExtractor extractor;
-            NonMotorBackbone nonmotor_backbone = extractor.run(input);
-            extractor.output(nonmotor_backbone, out_dir);
-
+        if (true) {
+            auto ts = std::chrono::steady_clock::now();
             /// 获取非机动车道处理数据
             const IntersectionInput nonmotor_input = ConnectivityMotorLogicFilter(input, false);
-            if (!nonmotor_input.connectivities.empty()) {
+            output.perf.nonmotor_count = nonmotor_input.connectivities.size();
+            // 连通关系可能因直行/右转规则分流到机动车逻辑，但只要原始数据声明了
+            // 非机动车连通，仍需输出骨干图供检查和后续非机动处理复用。
+            const bool has_nonmotor_declaration =
+                std::any_of(input.connectivities.begin(), input.connectivities.end(),
+                    [](const Connectivity& connection) {
+                        return connection.lane_type == MotorLaneType::NonMotorLane;
+                    }) ||
+                std::any_of(input.lanes.begin(), input.lanes.end(),
+                    [](const Lane& lane) { return !lane.motoway; });
+            if (has_nonmotor_declaration) {
+                NonMotorBackboneExtractor extractor(out_dir);
+                NonMotorBackbone nonmotor_backbone = extractor.run(input);
+                extractor.output(nonmotor_backbone, out_dir);
 
-                NonMotorConnectivityGenerator nmgen;
-                auto nm_curves = nmgen.generate(
-                    nonmotor_input, output.connectivity_curves, nonmotor_backbone);
-                // 高程插值（复用现有工具）
-                ElevationInterpolator(nm_curves, nonmotor_input);
-                // 合并到输出
-                output.connectivity_curves.insert(
-                    output.connectivity_curves.end(), nm_curves.begin(), nm_curves.end());
+                if (!nonmotor_input.connectivities.empty()) {
+                    //< 打印非机动逻辑车道
+                    // for (auto ni : nonmotor_input.connectivities)
+                    //     std::cout << "nonmotor-" << ni.id << "," << ni.entry_lane_id << "," << ni.exit_lane_id << std::endl;
+
+                    ///< 生成非机动逻辑曲线
+                    NonMotorConnectivityGenerator nmgen;
+                    auto nm_curves = nmgen.generate(
+                        nonmotor_input, output.connectivity_curves, nonmotor_backbone);
+                    ///< 高程插值
+                    ElevationInterpolator(nm_curves, nonmotor_input);
+                    ///< 合并到输出
+                    output.connectivity_curves.insert(
+                        output.connectivity_curves.end(), nm_curves.begin(), nm_curves.end());
+                }
             }
+
+            output.perf.nonmotor_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - ts).count();
         }
 
         /// 路口面生成
         auto ta = std::chrono::steady_clock::now();
         IntersectionAreaBuilder areabuilder(intersectionAreaExtendDistance(input.mode), 4.0);
         output.area = areabuilder.build(input, output.connectivity_curves, output.lane_edges);
-        output.perf.area_gen_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
+        output.perf.area_gen_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ta).count();
 
     } catch (const std::exception& error) {
         report_.errors.push_back(std::string("generation failed: ") + error.what());

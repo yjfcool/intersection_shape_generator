@@ -29,6 +29,7 @@ enum class NonMotorBackboneEdgeType {
     Gap = 2,
     RoadEdge = 3,
     Branch = 4,
+    Composite = 5,  ///< 删除环上共端点后由多段骨干/连接线合并形成的路径段。
 };
 
 /// 非机动骨干节点。
@@ -46,21 +47,29 @@ struct NonMotorBackboneEdge {
     std::string to;
     NonMotorBackboneEdgeType type = NonMotorBackboneEdgeType::Gap;
     LineString2d geometry;
+    /// 原始横道/安全岛面ID；合并、拆边时保留，Gap不冒充任何来源面。
+    std::vector<std::string> source_surface_ids;
     bool ring = false;
     bool branch = false;
 };
 
 /// 整个路口的非机动骨干图。
-/// ring_edges 表示主环，branch_edges 表示从环接出的少量分支。
+/// ring_edges 表示闭合主环；branch_edges 表示所有未进入主环的骨干边（含局部 Gap）。
+/// 两类边严格互斥，最终分类以 edge.ring 为准。
 struct NonMotorBackbone {
     std::string id;
     std::vector<NonMotorBackboneNode> nodes;
     std::vector<NonMotorBackboneEdge> edges;
+    /// 主环拓扑节点，不包括边内部的RoadEdge形态点；不可用其下标索引ring_geometry。
     std::vector<std::string> ring_nodes;
     std::vector<std::string> ring_edges;
     std::vector<std::string> branch_edges;
     LineString2d ring_geometry;
     bool closed = false;
+    /// 最终无向边图的连通分量数；非空图期望为1，安全约束阻止补连时保留真实计数。
+    size_t connected_components = 0;
+    /// 无法在搜索范围内安全补连时的诊断，不通过越界/穿障伪造连通。
+    std::vector<std::string> diagnostics;
 };
 
 }  // namespace isg

@@ -2,6 +2,7 @@
 
 - 默认使用中文交互
 - 只允许操作当前项目文件夹
+- 新增或修改代码逻辑需同步增加或更新注释，保证代码实现与注释描述完全一致
 - 每次修改完成后需按时间记录更新内容到docs/WORK_LOG.md
 - Any code change that affects curve generation, constraints, ordering, shape preservation, or validation must be verified against all relevant constraints before it is considered complete.
 - A fix is not complete if it only satisfies one failing scenario while breaking shape constraints, same-cluster non-endpoint non-intersection, fixed-shape preservation, Boundary avoidance, fence avoidance, obstacle avoidance, G1 continuity, or documented turn-shape requirements.

@@ -378,7 +378,8 @@ struct IntersectionOutput {
     /// 性能统计（毫秒）
     struct PerfStats {
         double sdf_build_ms = 0, precheck_ms = 0, optimize_ms = 0,
-               smooth_ms = 0, edge_gen_ms = 0, area_gen_ms = 0;
+               smooth_ms = 0, edge_gen_ms = 0, area_gen_ms = 0, nonmotor_ms = 0,
+               motor_count = 0, nonmotor_count = 0;
     } perf;
 };
 

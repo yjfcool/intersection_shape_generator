@@ -411,6 +411,9 @@ namespace isg {
 
         // 安全岛相关工具（用于直行/左转/掉头分流判断）
         static constexpr double kIslandMaxDist = 20.0;
+        const bool has_lane_nonmotor = std::any_of(
+            input.lanes.begin(), input.lanes.end(),
+            [](const Lane& lane) { return !lane.motoway; });
         // TODO: 如何判断安全岛是否可穿（进入方向）
         auto islandPassable = [&](
             const SafetyIsland* si, const Vec2d& entry_dir, double clearance) -> bool {
@@ -423,9 +426,11 @@ namespace isg {
             // A. 所有机动车道
             if (conn.lane_type == MotorLaneType::MotorLane) return true;
 
-            // 以下均为 NonMotorLane
+            // 这些输入的车道对象缺少非机动车标记，非机动车连通的进入侧
+            // 以 Connectivity.lane_type 作为声明；退出侧仍按车道元数据判断，
+            // 以保持“单端非机动直行/右转按机动逻辑”的既有分流规则。
             bool entry_is_nonmotor = isNonMotorLane(conn.entry_lane_id, input);
-            bool exit_is_nonmotor  = isNonMotorLane(conn.exit_lane_id,  input);
+            bool exit_is_nonmotor  = isNonMotorLane(conn.exit_lane_id, input);
             Vec2d entry_pt  = input.entryPtDir(conn.entry_lane_id).first;
             Vec2d entry_dir = input.entryPtDir(conn.entry_lane_id).second;
 
@@ -524,6 +529,20 @@ namespace isg {
                     return is_motorlogic ? !motor : motor;
                 }),
             conns_ref.end());
+
+        // // 部分真实数据将非机动车属性写在 Connectivity.lane_type，但所有 Lane.motoway
+        // // 都被默认写成 true。若方向规则因此把全部显式非机动连通分到机动车逻辑，
+        // // 非机动专用流程会静默丢失整组数据；仅在没有任何可用非机动车道元数据且
+        // // 非机动结果完全为空时，保留这些显式声明作为兼容回退。存在正常非机动车道
+        // // 或已有可分流结果时不触发，避免改变常规直行/右转分流规则。
+        // if (!is_motorlogic && conns_ref.empty()) {
+        //     if (!has_lane_nonmotor) {
+        //         for (const Connectivity& connection : raw_input.connectivities) {
+        //             if (connection.lane_type == MotorLaneType::NonMotorLane)
+        //                 conns_ref.push_back(connection);
+        //         }
+        //     }
+        // }
 
         return input;
     };

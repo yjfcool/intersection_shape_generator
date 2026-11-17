@@ -17,15 +17,15 @@ int main(int argc, char* argv[]) {
         files.emplace_back(argv[1]);
     } else {
         files = {
+            std::string(PROJECT_ROOT_DIR) + "/datas/216798546_110003449.json",
+            std::string(PROJECT_ROOT_DIR) + "/datas/216798546_110003457.json",
+            std::string(PROJECT_ROOT_DIR) + "/datas/216784982_110004764.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216863072_100002096.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216863735_100001549.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/216784982_110004764.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/216798546_110003457.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216863736_100000844.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/216798546_110003449.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216805874_100002465.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/216870130_100000993.json",
-
+/*
             std::string(PROJECT_ROOT_DIR) + "/datas/100000915.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100002465.json",//路口面
             std::string(PROJECT_ROOT_DIR) + "/datas/100000443.json",
@@ -50,7 +50,7 @@ int main(int argc, char* argv[]) {
             std::string(PROJECT_ROOT_DIR) + "/datas/100000643.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100000643-0.json",
             std::string(PROJECT_ROOT_DIR) + "/datas/100000598.json",
-            std::string(PROJECT_ROOT_DIR) + "/datas/100000699.json",
+            std::string(PROJECT_ROOT_DIR) + "/datas/100000699.json",*/
         };
     }
 
@@ -75,12 +75,16 @@ int main(int argc, char* argv[]) {
             auto end_time = std::chrono::high_resolution_clock::now();
 
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-            std::cout << "Generation took: " << duration.count() << " ms" << std::endl;
-            std::cout << "Performance stats:" << std::endl;
-            std::cout << "  SDF build: " << out.perf.sdf_build_ms << " ms" << std::endl;
-            std::cout << "  Optimization: " << out.perf.optimize_ms << " ms" << std::endl;
-            std::cout << "  Edge generation: " << out.perf.edge_gen_ms << " ms" << std::endl;
-            std::cout << "  Area generation: " << out.perf.area_gen_ms << " ms" << std::endl;
+            std::cout << "GenTotal: " << duration.count() << " ms" << std::endl;
+            std::cout << "Performance Stats:" << std::endl;
+            // std::cout << "    SDFBuild: " << out.perf.sdf_build_ms << " ms" << std::endl;
+            // std::cout << "    Optimization: " << out.perf.optimize_ms << " ms" << std::endl;
+            // std::cout << "    GenEdge: " << out.perf.edge_gen_ms << " ms" << std::endl;
+            double motor_ms = out.perf.sdf_build_ms + out.perf.precheck_ms +
+                out.perf.optimize_ms + out.perf.smooth_ms + out.perf.edge_gen_ms;
+            std::cout << "  [Gen-Motor:" << out.perf.motor_count << "] => " << motor_ms << " ms" << std::endl;
+            std::cout << "  [Gen-Nonmotor:" << out.perf.nonmotor_count << "] => " << out.perf.nonmotor_ms << " ms" << std::endl;
+            std::cout << "  [Gen-Area]    : " << out.perf.area_gen_ms << " ms" << std::endl;
 
             if (!success) {
                 std::cout << "Generation failed!" << std::endl;

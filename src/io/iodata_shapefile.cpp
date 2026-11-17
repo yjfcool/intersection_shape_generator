@@ -151,13 +151,18 @@ bool save(const NonMotorBackbone& nonmotor_backbone, std::string dir, std::strin
         {"ID", 'C', 64, 0}, {"CLOSED", 'C', 8, 0},
         {"NODE_CNT", 'N', 12, 0}, {"EDGE_CNT", 'N', 12, 0}
     };
-    const std::vector<NonMotorBackbone> backbone_records = {nonmotor_backbone};
+    // 只有提取器确认存在真实闭合大环时才写入环图层；无闭环时不写空记录，
+    // 避免将分支路径或不连续的排序节点误展示为主环。
+    const std::vector<NonMotorBackbone> backbone_records =
+        nonmotor_backbone.closed && nonmotor_backbone.ring_geometry.points.size() >= 2
+            ? std::vector<NonMotorBackbone>{nonmotor_backbone}
+            : std::vector<NonMotorBackbone>{};
     writeShapes(dir, prefix + "_nonmotor_backbone_ring", SHP_POLYLINEZ,
         backbone_ring_fields, backbone_records,
         [](const NonMotorBackbone& backbone, std::size_t) {
             return std::vector<std::string>{backbone.id,
                 backbone.closed ? "1" : "0",
-                std::to_string(backbone.nodes.size()),
+                std::to_string(backbone.ring_nodes.size()),
                 std::to_string(backbone.ring_edges.size())};
         },
         [](const NonMotorBackbone& backbone, std::vector<ShapePoint>& points) {
@@ -169,7 +174,8 @@ bool save(const NonMotorBackbone& nonmotor_backbone, std::string dir, std::strin
     // 分支单独成层，便于在 QGIS 中关闭主环后检查局部挂接。
     std::vector<NonMotorBackboneEdge> backbone_branches;
     for (const auto& edge : nonmotor_backbone.edges) {
-        if (edge.branch) backbone_branches.push_back(edge);
+        // 分支与主环互斥：最终未进入 ring 的骨干边全部输出到分支图层。
+        if (!edge.ring) backbone_branches.push_back(edge);
     }
     writeShapes(dir, prefix + "_nonmotor_backbone_branches", SHP_POLYLINEZ,
         backbone_fields, backbone_branches,
